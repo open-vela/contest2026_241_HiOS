@@ -23,6 +23,7 @@
 ├── app/metalio/            # 应用层（OpenClaw / MCP / UI / audio / network / i18n）
 ├── docs/porting/           # 移植说明 + 验收清单（acceptance.md）
 ├── scripts/                # sync_metalio_drivers.sh：vendor 驱动同步进 board 包
+├── .claude/skills/         # 自建 skill：openvela-board-porting（适配方法论）、metalio-mcp-device-control（设备控制 MCP）
 ├── logs/                   # AI Coding 日志（另行提交）
 └── contest2026_241_HiOS.xml # manifest：<linkfile> 将上述目录软链进 openvela 编译树
 ```
@@ -39,26 +40,76 @@
 
 前置：openvela dev-ai-contest-2026 工程已 `repo init` + `repo sync`；RISC-V 工具链（`riscv32-esp-elf` 14.2，位于 `~/.espressif`）与 `esptool.py` 已安装。
 
-```bash
-# 工具链
-export PATH="$HOME/.espressif/tools/riscv32-esp-elf/14.2.0_*/riscv32-esp-elf/bin:$PATH"
+### 环境准备
 
-# 编译（board config 路径，四选一，位于 openvela 工作区根目录）
+| 工具 | 用途 |
+|------|------|
+| `make` | NuttX 编译 |
+| `riscv32-esp-elf` 14.2（`~/.espressif`） | RISC-V 交叉编译 |
+| `esptool.py` | 烧录 ESP32-P4 |
+| `python3` + `pyserial` | 抓取串口日志 |
+
+```bash
+pip install esptool pyserial
+export PATH="$HOME/.espressif/tools/riscv32-esp-elf/14.2.0_*/riscv32-esp-elf/bin:$PATH"
+```
+
+将 ESP32-P4 经 USB 连接主机，确认调试串口（通常为 `/dev/ttyACM0`，厂商信息应为 `Espressif` / `USB_JTAG_serial_debug_unit`）：
+
+```bash
+ls /dev/ttyACM* /dev/ttyUSB*
+```
+
+### 编译
+
+```bash
+# 方式一：openvela 统一入口（在 openvela 工作区根目录，board config 四选一）
 ./build.sh nuttx/boards/risc-v/esp32p4/metalio-claw-4/configs/nsh  -j$(nproc)
 ./build.sh nuttx/boards/risc-v/esp32p4/metalio-claw-4/configs/wifi -j$(nproc)
 ./build.sh nuttx/boards/risc-v/esp32p4/metalio-claw-4/configs/lvgl -j$(nproc)
 ./build.sh nuttx/boards/risc-v/esp32p4/metalio-claw-4/configs/ai   -j$(nproc)
 
-# 烧录
+# 方式二：.config 已配置时，进入 nuttx 直接 make
 cd nuttx
-make flash ESPTOOL_PORT=/dev/ttyACM0 ESPTOOL_BINDIR=./
+make -j$(nproc)
 ```
 
-注意：
+编译成功生成 `nuttx/nuttx.bin`，末尾打印内存占用（`irom_seg` / `drom_seg` / `sram_low` 等）。修改生成头文件（如 `i18n_strings_gen.h`）后若 make 未生效，删除对应 `.o` 再编译：
+
+```bash
+rm -f apps/metalio/i18n/i18n.cxx.*.o
+make -j$(nproc)
+```
+
+### 烧录
+
+```bash
+cd nuttx
+
+# 方式一：项目脚本（esp32p4 / 921600 / 32MB / DIO / 40MHz / 偏移 0x2000）
+./flash_espclaw.sh /dev/ttyACM0
+
+# 方式二：手动 esptool（等价命令）
+esptool.py --chip esp32p4 --port /dev/ttyACM0 --baud 921600 \
+    --before default_reset --after hard_reset --no-stub \
+    write_flash --verify -fs 32MB -fm dio -ff 40m 0x2000 nuttx.bin
+```
+
+### 验证
+
+```bash
+python3 capture_acm0.py                 # 抓取 45s 启动日志
+strings nuttx.bin | grep "Hi openvela"  # 校验唤醒词
+```
+
+启动日志应依次出现：`*** Booting NuttX ***` → `Board init done` → `SR_OK` → `NETWIFI dhcp_ret=0` → `HOME_OK` → `Xiaozhi boot ready`。
+
+### 注意
 
 - 默认 defconfig 选择 `RISCV_TOOLCHAIN_GNU_RV64`（`riscv64-unknown-elf`），旧版 10.2 会因 `zifencei`/rv32 原子 helper 报错，请改用 `riscv32-esp-elf` 14.2（或用 `make CROSSDEV=riscv32-esp-elf-`）。
 - 不要执行 `make distclean`（会删掉 build 克隆的 `esp-hal-3rdparty`），用 `make clean`。
 - ESP32-C5 需保持 Espressif/Metalio 的 ESP-Hosted 从机固件；P4 host 复位 GPIO54 为高有效。
+- `flash_espclaw.sh` / `capture_acm0.py` 等辅助脚本位于 openvela 工程 `nuttx/` 目录，未随本仓提交。
 
 完整移植细节与逐项验收见 `docs/porting/acceptance.md`。
 
@@ -69,6 +120,7 @@ make flash ESPTOOL_PORT=/dev/ttyACM0 ESPTOOL_BINDIR=./
 - **方案设计**：梳理 ESP32-P4 回移植与 ESP-Hosted 联网的架构取舍；
 - **编码**：板级 BSP、15+ 驱动、应用层代码的生成与审查；
 - **调试**：nsh 链接阻塞（`nxmutex`/`fb_register_device`/`zifencei`/`__atomic_fetch_or_8`）定位与修复，见 `docs/porting/acceptance.md`；
+- **Skill 化**：将移植方法论沉淀为自建 skill `openvela-board-porting`（见 `.claude/skills/`），供后续新硬件适配复用；
 - **文档**：验收清单与移植说明撰写。
 
 完整对话日志见 `logs/` 目录。
