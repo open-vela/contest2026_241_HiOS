@@ -1,0 +1,6 @@
+menuconfig METALIO_ESP_HOSTED_DRIVER
+	bool "Metalio ESP-Hosted SDIO Wi-Fi host driver"
+	default y if METALIO_ESP_HOSTED
+	depends on NET
+	---help---
+		P4 host netdev talking to ESP32-C5 slave over SDIO Slot1.

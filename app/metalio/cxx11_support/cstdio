@@ -1,0 +1,62 @@
+/*
+ * apps/metalio/cxx11_support/cstdio — bring C stdio names into std::.
+ *
+ * uClibc++ 0.2 ships <cstdio> with printf/scanf/puts/gets (…etc) in
+ * the std namespace, but forgets to add the C99 additions: snprintf,
+ * vsnprintf, vprintf, snscanf and friends.  Metalio uses
+ * std::snprintf in a couple of display modules, so we layer them
+ * on top of the native header by pulling in the global-namespaced
+ * versions from <stdio.h> via using-declarations.
+ */
+#ifndef METALIO_CXX11_CSTDIO_SHIM_H_
+#define METALIO_CXX11_CSTDIO_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include_next <cstdio>      /* uClibc++ native <cstdio> — std::printf etc */
+
+/* The C99 additions are already available at global scope via the
+ * system <stdio.h> (uClibc++ cstdio includes <stdio.h> internally).
+ *
+ * However, on some uClibc++ 0.2.x toolchain configurations the
+ * include order in cstdio is such that the *real* NuttX <stdio.h>
+ * prototypes (snprintf, vsnprintf, …) end up NOT visible at global
+ * scope by the time this shim runs the using-declaration.  The
+ * symptom is the classic error:
+ *     error: 'snprintf' has not been declared in '::'
+ * So we #include <stdio.h> explicitly once (guards make this free) to
+ * guarantee that the global-scope prototypes have been seen. */
+
+#include <stdio.h>
+
+namespace std {
+
+/* Re-declare the C99 <stdio.h> prototypes with proper NuttX FAR/IPTR
+ * macros, then pull each name into the std namespace via a plain
+ * `using` declaration.  We duplicate the prototype (rather than
+ * relying solely on `using ::X`) as a defence-in-depth against any
+ * preprocessor shenanigans with fortify_function/macro wrappers. */
+
+#ifndef FAR
+#  define FAR
+#endif
+#ifndef IPTR
+#  define IPTR
+#endif
+
+using ::snprintf;
+using ::vsnprintf;
+using ::printf;
+using ::fprintf;
+using ::vprintf;
+using ::vfprintf;
+using ::vsprintf;
+using ::sprintf;
+using ::sscanf;
+using ::fscanf;
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_CSTDIO_SHIM_H_ */

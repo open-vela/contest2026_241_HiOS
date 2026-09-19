@@ -1,0 +1,41 @@
+/*
+ * apps/metalio/cxx11_support/cstddef — <cstddef> with std::nullptr_t.
+ *
+ * uClibc++ 0.2.x ships <cstddef> but does NOT provide the C++11 type
+ * std::nullptr_t.  GCC treats `nullptr` as a keyword in C++11 mode,
+ * but the library typedef for it still needs to live in namespace std
+ * for code that uses the type explicitly (e.g. freertos_shim.h does
+ * `void vTaskDelete(std::nullptr_t)` as an overload for
+ * vTaskDelete(NULL)).
+ *
+ * Strategy: include_next the uClibc++ native <cstddef> for its size_t/
+ * ptrdiff_t/max_align_t definitions, then layer nullptr_t on top.
+ */
+#ifndef METALIO_CXX11_CSTDDEF_SHIM_H_
+#define METALIO_CXX11_CSTDDEF_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include_next <cstddef>
+
+namespace std {
+
+/* decltype(nullptr) is the built-in "null pointer" type.  It's a
+ * distinct type from void* and from any integral type; using
+ * decltype() avoids having to guess the underlying ABI type. */
+typedef decltype(nullptr) nullptr_t;
+
+/* — Standard also ships these value-trait helpers in <cstddef> in
+ *   C++17.  Metalio's code doesn't (yet) rely on them, but we ship
+ *   them proactively because they are zero-cost and frequently appear
+ *   alongside nullptr_t usage in modern code. — */
+
+#if !defined(__cplusplus) || (__cplusplus < 201703L)
+typedef decltype(sizeof(0)) size_t;
+#endif
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_CSTDDEF_SHIM_H_ */

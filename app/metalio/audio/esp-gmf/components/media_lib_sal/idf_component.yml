@@ -1,0 +1,16 @@
+dependencies:
+  idf:
+    version: '>=5.1'
+description: Media Library System Abstract layer
+issues: https://github.com/espressif/esp-adf/issues
+repository: git://github.com/espressif/esp-adf-libs.git
+repository_info:
+  commit_sha: d665a07e4bd19a1a9fea8106f0a0fa52db6e2b8c
+  path: media_lib_sal
+tags:
+- Multimedia
+- OSLibrary
+- System
+- Network
+url: https://github.com/espressif/esp-adf-libs/tree/master/media_lib_sal
+version: 1.0.2

@@ -1,0 +1,208 @@
+menuconfig METALIO_APP
+	bool "Metalio Claw4 OpenClaw application"
+	default n
+	---help---
+		POSIX port of Metalio Claw4 / XiaoZhi application stack for openvela.
+
+if METALIO_APP
+
+config METALIO_APP_PRIORITY
+	int "Metalio app task priority"
+	default 100
+
+config METALIO_APP_STACKSIZE
+	int "Metalio app task stack size"
+	default 131072
+
+config METALIO_LOG_LEVEL
+	int "Metalio log verbosity (0=none, 1=error, 2=warn, 3=info, 4=debug, 5=verbose)"
+	default 3
+	---help---
+		Controls ESP_LOGE/W/I/D/V output via the esp_log_shim layer.
+
+config METALIO_OPENCLAW_URL
+	string "OpenClaw HTTP base URL"
+	default "https://api.openclaw.local"
+
+config METALIO_WIFI_SSID
+	string "Default WiFi SSID (empty = no auto-connect)"
+	default ""
+
+config METALIO_WIFI_PASSWORD
+	string "Default WiFi password"
+	default ""
+
+config METALIO_BATCH8
+	bool "Batch 8 screens (weather, music, gps, radio)"
+	default y
+	---help---
+		Enables the four network-aware info screens. Each screen ships
+		with stubbed data sources so the UI is fully exercisable without
+		a live backend; once the corresponding services (WeatherService,
+		GpsService, HLS radio player, music player) are wired through
+		NetworkService / AudioService, only the stubs need replacing.
+
+config METALIO_BATCH9
+        bool "Batch 9 screens (network, openclaw)"
+        default n
+        ---help---
+                Enables the network and openclaw conversation screens. Both
+                require the OpenClaw HTTP client to be fully wired; leave off
+                until that integration is complete.
+
+config METALIO_ESP_GMF
+        bool "Enable ESP-GMF port (HLS audio streaming + FFT)"
+        default n
+        ---help---
+                Enable the ESP-GMF (Espressif Generic Media Framework) port for
+                real HLS audio streaming and FFT spectrum visualization. When
+                disabled, radio_screen keeps its stub player + xorshift32 PRNG.
+
+config METALIO_ESP_SR
+        bool "Enable ESP-SR (WakeNet / AFE)"
+        default y
+        ---help---
+                Vendor espressif/esp-sr 2.2.2 for offline wake word and device
+                AEC. Falls back to EnergyWakeWord / NoAudioProcessor when
+                model load or AFE init fails.
+
+config METALIO_USE_AFE_WAKE_WORD
+        bool "Use AfeWakeWord (ESP-SR WakeNet)"
+        default y
+        depends on METALIO_ESP_SR
+        ---help---
+                Offline "Hi openvela" via Claw4 custom wn9l model. Disable to keep
+                EnergyWakeWord only.
+
+config METALIO_USE_AUDIO_PROCESSOR
+        bool "Use AfeAudioProcessor (device AEC)"
+        default y
+        depends on METALIO_ESP_SR
+        ---help---
+                Device-side AEC for Realtime barge-in / interrupt. Disable to
+                keep NoAudioProcessor half-duplex AutoStop only.
+
+config METALIO_GMF_FFT
+        bool "Enable gmf_fft (real FFT for spectrum visualizer)"
+        default n
+        depends on METALIO_ESP_GMF
+        ---help---
+                Port of espressif/gmf_fft v1.0.0. Provides esp_gmf_fft_init /
+                forward / inverse for Q15 real-input data. Replaces the
+                xorshift32 PRNG in radio_screen SpectrumTask with a real
+                Hann-windowed 256-point FFT. Requires CONFIG_LIBM_TOOLCHAIN
+                (the default) for sin/cos/pow during twiddle-table generation.
+
+config METALIO_GMF_CORE
+        bool "Enable gmf_core (pipeline/pool/element/chunk framework)"
+        default n
+        depends on METALIO_ESP_GMF
+        ---help---
+                Port of espressif/gmf_core — the foundational GMF pipeline
+                framework (elements, pipeline, pool, data bus, ring buffer).
+                Uses NuttX pthread-based OAL replacements (nuttx_oal/) instead
+                of the original FreeRTOS OAL. This is the prerequisite for all
+                higher-level GMF components (gmf_io, gmf_audio, esp_hls_stream,
+                esp_audio_simple_player).
+
+config METALIO_GMF_IO
+        bool "Enable gmf_io (HTTP/file/embed/codec IO elements)"
+        default n
+        depends on METALIO_GMF_CORE
+        ---help---
+                Port of espressif/gmf_io. Provides the GMF I/O elements used
+                by higher layers:
+                  esp_gmf_io_http   – HTTP(S) GET/POST streaming (via BSD
+                                      sockets / NuttX HTTP adapter)
+                  esp_gmf_io_file   – POSIX fopen/fread file IO
+                  esp_gmf_io_embed_flash – flash-baked embedded asset IO
+                  esp_gmf_io_codec_dev – codec device back-end IO
+
+                HLS streaming (esp_hls_stream) requires at least http + file
+                IO.  Requires gmf_core for element/port abstractions.
+
+config METALIO_GMF_IO_CODEC_DEV
+        bool "Enable gmf_io codec_dev element"
+        default n
+        depends on METALIO_GMF_IO
+        ---help---
+                Compiles esp_gmf_io_codec_dev.c.  Requires the esp_codec_dev
+                component to also be ported (adds esp_codec_dev.h to the
+                include path).  Leave off until esp_codec_dev is available.
+
+config METALIO_GMF_IO_I2S_PDM
+        bool "Enable gmf_io I2S/PDM microphone element"
+        default n
+        depends on METALIO_GMF_IO
+        ---help---
+                Compiles esp_gmf_io_i2s_pdm.c (I²S / PDM digital microphone
+                input element).  Left off by default: Metalio Claw4 captures
+                audio via the MetalioAudioCodec service and NuttX character
+                device /dev/audio/pcm_in0, not via GMF's I2S element.
+
+config METALIO_GMF_HLS
+        bool "Enable esp_hls_stream (HLS/m3u8 extractor)"
+        default n
+        depends on METALIO_GMF_IO
+        ---help---
+                Pulls in three components required for HLS audio streaming:
+                  media_lib_sal   — registration-based OS / socket / TLS
+                                    abstraction (uses our NuttX pthread adapter
+                                    nuttx_media_lib_adapter/media_lib_os_nuttx.c)
+                  esp_extractor   — generic demuxer/extractor framework
+                                    (ID3 tag parser, extractor registry)
+                  esp_hls_stream  — m3u8 playlist parser, media-segment
+                                    fetcher + AES-128 decryption. Combines
+                                    three small C bridge files with a
+                                    chip-specific RISC-V prebuilt archive
+                                    libs/esp32p4/libhls_lib.a.
+
+                Turn on this option to enable real HLS playback in
+                radio_screen (next step: also enable esp_codec_dev for
+                MP3/AAC decoding + esp_audio_simple_player as the pipeline
+                wrapper).
+
+config METALIO_GMF_CODEC
+        bool "Enable esp_codec_dev + esp_audio_codec + gmf_audio (decode pipeline)"
+        default n
+        depends on METALIO_GMF_HLS
+        ---help---
+                Enables the three components required for actual audio
+                decode + output on top of the GMF pipeline:
+
+                  esp_audio_codec  — Espressif's MP3 / AAC / AAC-LC /
+                                     FLAC / OPUS / ALAC / AMR / G.711
+                                     / … registry.  The actual RISC-V
+                                     decoder implementations ship in
+                                     two chip-specific prebuilt
+                                     archives (esp32p4/libesp_audio_codec.a
+                                     and esp32p4/libesp_audio_simple_dec.a
+                                     for WAV/M4A/OGG/TS container
+                                     parsing).
+
+                  esp_codec_dev    — Codec-device HAL.  For Metalio
+                                     Claw4 we only compile the core
+                                     plus the "dummy" codec (which
+                                     accepts any rate/ch/bits so the
+                                     player can route PCM out through
+                                     NuttX's /dev/audio/pcm_out0 via
+                                     a custom data_if callback).  The
+                                     16 real codec chips + I²S/I²C
+                                     platform drivers are intentionally
+                                     skipped — they drive ESP-IDF's
+                                     driver/i2s directly, which is not
+                                     available on NuttX.
+
+                  gmf_audio        — The GMF elements that glue the
+                                     extractor output into esp_audio_codec
+                                     (esp_gmf_audio_dec element) and
+                                     back out onto a PCM port.
+
+                Turn this on to produce a firmware that can actually
+                decode audio frames emitted by esp_hls_stream and
+                render them through MetalioAudioCodec's character
+                device.  Combined with METALIO_GMF_HLS this is the
+                last "infrastructure" block required before wiring
+                esp_audio_simple_player into radio_screen.
+
+endif

@@ -1,0 +1,53 @@
+#############################################################################
+# boards/risc-v/esp32p4/metalio-claw-4/src/Make.defs
+#############################################################################
+
+include $(TOPDIR)/Make.defs
+
+CSRCS = esp32p4_boot.c esp32p4_bringup.c
+CSRCS += tca9555.c bq27220.c nu1680.c cx25601n.c
+CSRCS += sc7a20h.c qmc6309.c
+CSRCS += sdcard.c gps.c bt_audio.c
+CSRCS += nt26.c camera.c camera_test.c dual_network.c ota_standby.c
+CSRCS += kvflash.c
+
+ifeq ($(CONFIG_METALIO_TOUCH_GT911),y)
+  CSRCS += gt911.c
+endif
+
+ifeq ($(CONFIG_VIDEO_FB),y)
+ifneq ($(CONFIG_METALIO_DISPLAY_NV3051F)$(CONFIG_METALIO_DISPLAY_FL7707N),)
+  CSRCS += display_nv3051f.c
+endif
+endif
+
+ifeq ($(CONFIG_NET)$(CONFIG_METALIO_ESP_HOSTED),yy)
+  CSRCS += esp_hosted_netdev.c
+endif
+
+ifeq ($(CONFIG_BOARDCTL),y)
+  CSRCS += esp32p4_appinit.c
+  ifeq ($(CONFIG_BOARDCTL_RESET),y)
+    CSRCS += esp32p4_reset.c
+  endif
+endif
+
+ifeq ($(CONFIG_DEV_GPIO),y)
+  CSRCS += esp32p4_gpio.c
+endif
+
+ifeq ($(CONFIG_ARCH_BUTTONS),y)
+  CSRCS += esp32p4_buttons.c
+endif
+
+DEPPATH += --dep-path board
+DEPPATH += --dep-path board/metalio
+DEPPATH += --dep-path board/metalio/esp_hosted
+VPATH += :board
+VPATH += :board/metalio
+VPATH += :board/metalio/esp_hosted
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)arch$(DELIM)$(CONFIG_ARCH)$(DELIM)src$(DELIM)board$(DELIM)board
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)boards$(DELIM)risc-v$(DELIM)esp32p4$(DELIM)metalio-claw-4$(DELIM)include
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)boards$(DELIM)risc-v$(DELIM)esp32p4$(DELIM)metalio-claw-4$(DELIM)src$(DELIM)metalio
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)boards$(DELIM)risc-v$(DELIM)esp32p4$(DELIM)metalio-claw-4$(DELIM)src$(DELIM)metalio$(DELIM)esp_hosted
+CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)$(DELIM)..$(DELIM)apps$(DELIM)include

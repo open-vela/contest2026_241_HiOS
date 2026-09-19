@@ -1,0 +1,139 @@
+/*
+ * <atomic> — minimal C++11 atomic shim.
+ *
+ * Metalio uses std::atomic<bool>, std::atomic<int>, std::atomic<unsigned>,
+ * load/store/compare_exchange_weak and operator++.  On ESP32-P4 (single
+ * shared-address-space, dual-core), plain loads/stores are already
+ * atomic for naturally aligned 32-bit values; we add pthread_mutex
+ * protection around the RMW operations (++/fetch_add/cas) to keep
+ * them correct without pulling in a full libatomic.
+ *
+ * This is NOT wait-free, but Metalio uses atomics only for stop flags
+ * and counters (audio_service, wifi rx thread, etc.) — the mutex is
+ * perfectly fine at those call sites.
+ */
+#ifndef _UCLIBCXX_ATOMIC_SHIM_
+#define _UCLIBCXX_ATOMIC_SHIM_
+
+#include <pthread.h>
+#include <cstdint>
+
+namespace std {
+
+enum memory_order {
+  memory_order_relaxed,
+  memory_order_consume,
+  memory_order_acquire,
+  memory_order_release,
+  memory_order_acq_rel,
+  memory_order_seq_cst
+};
+
+template<class T>
+class atomic
+{
+public:
+  atomic() : val_(T(0)) { pthread_mutex_init(&mu_, 0); }
+  atomic(T v) : val_(v) { pthread_mutex_init(&mu_, 0); }
+  atomic(const atomic&) = delete;
+  atomic& operator=(const atomic&) = delete;
+
+  bool is_lock_free() const { return false; }
+
+  void store(T v, memory_order = memory_order_seq_cst) {
+    pthread_mutex_lock(&mu_);
+    val_ = v;
+    pthread_mutex_unlock(&mu_);
+  }
+  T load(memory_order = memory_order_seq_cst) const {
+    /* We can't return while holding the mutex; snapshot instead. */
+    pthread_mutex_t *mu = const_cast<pthread_mutex_t*>(&mu_);
+    pthread_mutex_lock(mu);
+    T v = val_;
+    pthread_mutex_unlock(mu);
+    return v;
+  }
+  T exchange(T v, memory_order = memory_order_seq_cst) {
+    pthread_mutex_lock(&mu_);
+    T old = val_;
+    val_ = v;
+    pthread_mutex_unlock(&mu_);
+    return old;
+  }
+  bool compare_exchange_weak(T &expected, T desired,
+                             memory_order = memory_order_seq_cst,
+                             memory_order = memory_order_seq_cst) {
+    pthread_mutex_lock(&mu_);
+    if (val_ == expected) {
+      val_ = desired;
+      pthread_mutex_unlock(&mu_);
+      return true;
+    } else {
+      expected = val_;
+      pthread_mutex_unlock(&mu_);
+      return false;
+    }
+  }
+  bool compare_exchange_strong(T &expected, T desired,
+                               memory_order s = memory_order_seq_cst,
+                               memory_order f = memory_order_seq_cst) {
+    return compare_exchange_weak(expected, desired, s, f);
+  }
+
+  T fetch_add(T d, memory_order = memory_order_seq_cst) {
+    pthread_mutex_lock(&mu_);
+    T old = val_;
+    val_  = T(old + d);
+    pthread_mutex_unlock(&mu_);
+    return old;
+  }
+  T fetch_sub(T d, memory_order = memory_order_seq_cst) {
+    pthread_mutex_lock(&mu_);
+    T old = val_;
+    val_  = T(old - d);
+    pthread_mutex_unlock(&mu_);
+    return old;
+  }
+  T fetch_and(T d, memory_order = memory_order_seq_cst) {
+    pthread_mutex_lock(&mu_);
+    T old = val_;
+    val_  = T(old & d);
+    pthread_mutex_unlock(&mu_);
+    return old;
+  }
+  T fetch_or(T d, memory_order = memory_order_seq_cst) {
+    pthread_mutex_lock(&mu_);
+    T old = val_;
+    val_  = T(old | d);
+    pthread_mutex_unlock(&mu_);
+    return old;
+  }
+  T fetch_xor(T d, memory_order = memory_order_seq_cst) {
+    pthread_mutex_lock(&mu_);
+    T old = val_;
+    val_  = T(old ^ d);
+    pthread_mutex_unlock(&mu_);
+    return old;
+  }
+
+  T operator++()    { return fetch_add(T(1)) + T(1); }
+  T operator++(int) { return fetch_add(T(1)); }
+  T operator--()    { return fetch_sub(T(1)) - T(1); }
+  T operator--(int) { return fetch_sub(T(1)); }
+  T operator+= (T d) { return fetch_add(d) + d; }
+  T operator-= (T d) { return fetch_sub(d) - d; }
+  T operator&= (T d) { fetch_and(d); return load(); }
+  T operator|= (T d) { fetch_or(d);  return load(); }
+  T operator^= (T d) { fetch_xor(d); return load(); }
+
+  operator T() const { return load(); }
+  T operator=(T v) { store(v); return v; }
+
+private:
+  mutable pthread_mutex_t mu_;
+  T                       val_;
+};
+
+} /* namespace std */
+
+#endif /* _UCLIBCXX_ATOMIC_SHIM_ */

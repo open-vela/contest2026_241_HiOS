@@ -1,0 +1,346 @@
+/*
+ * apps/metalio/cxx11_support/functional — C++11 <functional> shim (revised)
+ *
+ * See the top-of-file comment in apps/metalio/cxx11_support/memory for the
+ * full design rationale.  This file is intentionally minimal; it only
+ * implements `std::function<R(Args...)>` — that is the only C++11
+ * <functional> API Metalio uses.
+ *
+ * =================== Small Buffer Optimisation (SBO) ===================
+ *
+ * The original implementation heap-allocated a `callable<F>` object for
+ * every std::function instance.  When std::function objects are stored
+ * inside std::vector (as DeviceStateEventManager::callbacks_ does) and
+ * the vector is copied (e.g. via GetCallbacks()), each element copy
+ * triggers a separate heap allocation via clone().  On NuttX's small
+ * heap this causes severe fragmentation and eventual heap corruption,
+ * especially when combined with LVGL's own heap activity.
+ *
+ * The SBO fix: if the concrete callable type fits within an inline
+ * buffer (SBO_SIZE bytes, SBO_ALIGN-aligned), it is constructed in-place
+ * via placement new — no heap allocation occurs.  Copy, move, and
+ * destroy of such an SBO function never touch the heap allocator.
+ *
+ * For callables that exceed SBO_SIZE (rare in this codebase), the
+ * implementation falls back to the original heap-allocated path.
+ */
+
+#ifndef METALIO_CXX11_FUNCTIONAL_SHIM_H_
+#define METALIO_CXX11_FUNCTIONAL_SHIM_H_
+
+/* Make sure the uClibc++ system-config macros are present before
+ * we pull in the uClibc++ native headers.  See system_configuration.h
+ * which refers directly to this symbol. */
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#if __has_include_next(<functional>)
+#  include_next <functional>          /* pull in uClibc++ std::bind1st / mem_fun / swap etc. */
+#endif
+
+#include <cstddef>
+#include <type_traits>   /* shim → integral_constant / enable_if / is_same / decay */
+#include <utility>       /* shim → std::move / std::forward */
+#include <memory>        /* shim → std::nullptr_t */
+#include <cstdlib>
+#include <new>
+
+namespace std
+{
+
+/* ================================================================ */
+/*  invoke_result — deducing return type of F(Args...).               */
+/*  (Metalio's usage patterns only cover direct function/lambda      */
+/*  invocation — we do not implement the full INVOKE protocol.)      */
+/* ================================================================ */
+
+template <typename Fn, typename... Args>
+struct invoke_result
+{
+  typedef decltype( (*(typename std::remove_reference<Fn>::type*)0)(
+                       (*(typename std::remove_reference<Args>::type*)0)... ) ) type;
+};
+
+/* ================================================================ */
+/*  std::function<R(Args...)> — type-erased callable with SBO.      */
+/* ================================================================ */
+
+/* Primary template (never defined). */
+template <typename> class function;
+
+/* Partial specialisation for the call signature. */
+template <typename R, typename... Args>
+class function<R(Args...)>
+{
+public:
+  typedef R result_type;
+
+  /* --- SBO configuration ------------------------------------------- */
+  /* SBO_SIZE must accommodate a callable<F> where F is a typical
+   * lambda capturing 1-3 pointers/values.  On rv32 a callable has:
+   *   vtable ptr (4) + lambda body (4-20)
+   * On rv64:
+   *   vtable ptr (8) + lambda body (8-24)
+   * 32 bytes is sufficient for all Metalio lambdas.  Alignment of
+   * `long long` (8 on both rv32/rv64) covers the strictest member. */
+  static constexpr size_t SBO_SIZE  = 32;
+  static constexpr size_t SBO_ALIGN = alignof(long long);
+
+  /* --- control block base ------------------------------------------- */
+
+  struct callable_base
+  {
+    virtual ~callable_base() {}
+    virtual R invoke(Args... args) = 0;
+    virtual callable_base* clone() const = 0;       /* heap clone           */
+    virtual void clone_to(void* p) const = 0;       /* placement-new clone  */
+    virtual void move_to(void* p) = 0;              /* placement-new move   */
+    virtual size_t size() const = 0;                /* sizeof concrete type */
+  };
+
+  template <typename F>
+  struct callable : public callable_base
+  {
+    typedef typename ::std::decay<F>::type StoredF;
+    StoredF f_;
+    explicit callable(StoredF f) : f_(std::move(f)) {}
+    virtual ~callable() {}
+    virtual R invoke(Args... args) override
+    {
+      return f_(std::forward<Args>(args)...);
+    }
+    virtual callable_base* clone() const override
+    {
+      return new callable<F>(f_);
+    }
+    virtual void clone_to(void* p) const override
+    {
+      new (p) callable<F>(f_);
+    }
+    virtual void move_to(void* p) override
+    {
+      new (p) callable<F>(std::move(f_));
+    }
+    virtual size_t size() const override
+    {
+      return sizeof(callable<F>);
+    }
+  };
+
+  /* --- helper: check if a callable type fits in SBO ---------------- */
+  template <typename CallableT>
+  static constexpr bool fits_in_sbo()
+  {
+    return sizeof(CallableT) <= SBO_SIZE
+           && alignof(CallableT) <= SBO_ALIGN;
+  }
+
+  /* --- internal storage management --------------------------------- */
+
+  void clear() noexcept
+  {
+    if (cb_)
+    {
+      if (heap_alloc_)
+        delete cb_;
+      else
+        cb_->~callable_base();   /* explicit dtor for SBO placement-new  */
+    }
+    cb_         = nullptr;
+    heap_alloc_ = false;
+  }
+
+  template <typename Fdecayed>
+  void store(Fdecayed&& f)
+  {
+    typedef callable<Fdecayed> CallableT;
+    if (fits_in_sbo<CallableT>())
+    {
+      cb_ = new (sbo_buf_) CallableT(std::forward<Fdecayed>(f));
+      heap_alloc_ = false;
+    }
+    else
+    {
+      cb_ = new CallableT(std::forward<Fdecayed>(f));
+      heap_alloc_ = true;
+    }
+  }
+
+  void copy_from(const function& r)
+  {
+    if (!r.cb_)
+    {
+      cb_         = nullptr;
+      heap_alloc_ = false;
+      return;
+    }
+    /* If source is SBO or its callable fits our SBO, clone in-place. */
+    if (!r.heap_alloc_ || r.cb_->size() <= SBO_SIZE)
+    {
+      r.cb_->clone_to(sbo_buf_);
+      cb_         = reinterpret_cast<callable_base*>(sbo_buf_);
+      heap_alloc_ = false;
+    }
+    else
+    {
+      cb_         = r.cb_->clone();
+      heap_alloc_ = true;
+    }
+  }
+
+  void move_from(function&& r) noexcept
+  {
+    if (!r.cb_)
+    {
+      cb_         = nullptr;
+      heap_alloc_ = false;
+      return;
+    }
+    if (!r.heap_alloc_)
+    {
+      /* Source is SBO — move-construct into our buffer, destroy source. */
+      r.cb_->move_to(sbo_buf_);
+      cb_         = reinterpret_cast<callable_base*>(sbo_buf_);
+      heap_alloc_ = false;
+      r.clear();
+    }
+    else
+    {
+      /* Source is heap — steal the pointer. */
+      cb_         = r.cb_;
+      heap_alloc_ = true;
+      r.cb_         = nullptr;
+      r.heap_alloc_ = false;
+    }
+  }
+
+  /* --- ctor / dtor / copy / move ---------------------------------- */
+
+  function() noexcept : cb_(nullptr), heap_alloc_(false) {}
+
+  function(std::nullptr_t) noexcept : cb_(nullptr), heap_alloc_(false) {}
+
+  /*
+   * Universal-copy constructor — accept anything that:
+   *   (a) is NOT the function class itself (to avoid hijacking copy/move),
+   *   (b) is not a member-function pointer (not handled here).
+   */
+  template <typename F,
+            typename = typename std::enable_if<
+                !std::is_same<typename std::decay<F>::type,
+                              function<R(Args...)>>::value>::type>
+  function(F&& f) : cb_(nullptr), heap_alloc_(false)
+  {
+    typedef typename std::decay<F>::type Fdecayed;
+    store(std::forward<F>(f));
+  }
+
+  function(const function& r) : cb_(nullptr), heap_alloc_(false)
+  {
+    copy_from(r);
+  }
+
+  function(function&& r) noexcept : cb_(nullptr), heap_alloc_(false)
+  {
+    move_from(std::move(r));
+  }
+
+  ~function()
+  {
+    clear();
+  }
+
+  function& operator=(const function& r)
+  {
+    if (this != &r)
+    {
+      clear();
+      copy_from(r);
+    }
+    return *this;
+  }
+
+  function& operator=(function&& r) noexcept
+  {
+    if (this != &r)
+    {
+      clear();
+      move_from(std::move(r));
+    }
+    return *this;
+  }
+
+  function& operator=(std::nullptr_t) noexcept
+  {
+    clear();
+    return *this;
+  }
+
+  /* Universal-assignment from callable (convenience). */
+  template <typename F,
+            typename = typename std::enable_if<
+                !std::is_same<typename std::decay<F>::type,
+                              function<R(Args...)>>::value>::type>
+  function& operator=(F&& f)
+  {
+    clear();
+    typedef typename std::decay<F>::type Fdecayed;
+    store(std::forward<F>(f));
+    return *this;
+  }
+
+  /* --- observers ------------------------------------------------- */
+
+  void swap(function& r) noexcept
+  {
+    /* Move-based swap — correct for both SBO and heap. */
+    function tmp(std::move(*this));
+    *this = std::move(r);
+    r     = std::move(tmp);
+  }
+
+  explicit operator bool() const noexcept { return cb_ != nullptr; }
+
+  /* --- invocation ------------------------------------------------ */
+
+  R operator()(Args... args) const
+  {
+    return cb_->invoke(std::forward<Args>(args)...);
+  }
+
+private:
+  alignas(SBO_ALIGN) char sbo_buf_[SBO_SIZE];
+  callable_base* cb_;
+  bool heap_alloc_;
+};
+
+/* --------------- free function operators ---------------------------- */
+
+template <typename R, typename... Args>
+inline bool operator==(const function<R(Args...)>& f, std::nullptr_t) noexcept
+{
+  return !static_cast<bool>(f);
+}
+
+template <typename R, typename... Args>
+inline bool operator==(std::nullptr_t, const function<R(Args...)>& f) noexcept
+{
+  return !static_cast<bool>(f);
+}
+
+template <typename R, typename... Args>
+inline bool operator!=(const function<R(Args...)>& f, std::nullptr_t) noexcept
+{
+  return static_cast<bool>(f);
+}
+
+template <typename R, typename... Args>
+inline bool operator!=(std::nullptr_t, const function<R(Args...)>& f) noexcept
+{
+  return static_cast<bool>(f);
+}
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_FUNCTIONAL_SHIM_H_ */

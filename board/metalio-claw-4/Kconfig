@@ -1,0 +1,54 @@
+#
+# Metalio Claw4 board options
+#
+
+if ARCH_BOARD_METALIO_CLAW_4
+
+config METALIO_DISPLAY_NV3051F
+	bool "Use NV3051F MIPI-DSI panel (default production)"
+	default y
+	select ESPRESSIF_MIPI_DSI
+	select VIDEO_FB
+	select FB_UPDATE
+	---help---
+		Select NV3051F 720x720 panel. Disable to use FL7707N instead.
+
+config METALIO_DISPLAY_FL7707N
+	bool "Use FL7707N MIPI-DSI panel"
+	default n
+	depends on !METALIO_DISPLAY_NV3051F
+	select ESPRESSIF_MIPI_DSI
+	select VIDEO_FB
+	select FB_UPDATE
+
+config METALIO_CAMERA_OV2710
+	bool "OV2710 MIPI-CSI camera (V4L2 /dev/video0)"
+	default y
+	select ESPRESSIF_MIPI_CSI
+	---help---
+		Enable the OV2710 RAW10 image sensor and register a V4L2 capture
+		device at /dev/video0 backed by the ESP32-P4 MIPI-CSI host.  The
+		sensor uses 1 CSI-2 data lane at 800 Mbps/lane (RAW10 1920x1080
+		@ 25 fps) and is controlled over the shared I2C0 SCCB link.
+
+config METALIO_TOUCH_GT911
+	bool "GT911 capacitive touch"
+	default y
+
+config METALIO_ESP_HOSTED
+	bool "ESP-Hosted Wi-Fi host (ESP32-C5 over SDIO)"
+	default n
+	---help---
+		Enable P4 host-side ESP-Hosted netdev over SDIO Slot1.
+
+config METALIO_NT26_4G
+	bool "NT26 4G modem support"
+	default n
+
+config ESP32P4_SELECTS_REV_LESS_V3
+	bool "Allow ESP32-P4 chip revision < v3.0"
+	default y
+	---help---
+		Metalio units may ship with P4 rev < 3.0. Enable to bypass bootloader pin.
+
+endif # ARCH_BOARD_METALIO_CLAW_4

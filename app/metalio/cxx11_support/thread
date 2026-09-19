@@ -1,0 +1,212 @@
+/*
+ * apps/metalio/cxx11_support/thread — minimal C++11 std::thread shim on
+ * NuttX pthreads (rev4).  Simplified considerably from rev3 by removing
+ * all variadic-pack / tuple machinery that GCC's C++17 ADL rules could
+ * not resolve inside decltype returns.  Instead we have:
+ *
+ *   1. A nullary ctor (thread(Callable)) → used everywhere for lambdas.
+ *   2. One explicit 1-arg overload: thread(void (*f)(A1), A1 a1)
+ *       → matches radio_screen.cxx :
+ *           std::thread t(SessionStartWorker, station_id);
+ *       This is the ONLY form Metalio uses with more than 0 args.
+ *   3. 2/3/4-arg generic forwarding constructors as a belt-and-
+ *      suspenders set for any future use.  They wrap their arguments
+ *      through our _BindN class templates (below) that capture by
+ *      value using std::decay (see type_traits shim, which now
+ *      correctly converts function types / array types to pointers).
+ */
+#ifndef METALIO_CXX11_THREAD_SHIM_H_
+#define METALIO_CXX11_THREAD_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include <pthread.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdio.h>
+#include <functional>
+#include <chrono>
+#include <memory>
+
+#if __has_include_next(<thread>)
+#  include_next <thread>
+#endif
+
+namespace std {
+
+class thread
+{
+public:
+  typedef pthread_t id;
+
+  thread() : start_fn_(0), joined_(false) {}
+
+  /* ---- nullary constructor: any callable (lambdas, functors, fp). ---- */
+  template <class Callable>
+  explicit thread(Callable fn)
+    : start_fn_(new _FnWrap<typename decay<Callable>::type>(
+        typename decay<Callable>::type(static_cast<Callable&&>(fn)))),
+      joined_(false)
+  {
+    _Spawn();
+  }
+
+  /* ---- 1-arg: bare function pointer. --------------------------------- */
+  template <class A1>
+  thread(void (*fn)(A1), A1 a1)
+  {
+    typedef void (*FnPtr)(A1);
+    struct _B : _IFn {
+      FnPtr f_; A1 a1_;
+      _B(FnPtr f, A1 a1v) : f_(f), a1_(a1v) {}
+      void call() override { f_(a1_); }
+    };
+    start_fn_ = new _B(fn, a1);
+    _Spawn();
+  }
+
+  /* ---- 2 / 3 / 4 arg generic forwarding constructors. --------------- */
+  template <class Fn, class A1, class A2>
+  thread(Fn&& f, A1&& a1, A2&& a2)
+  {
+    typedef typename decay<Fn>::type  FnD;
+    typedef typename decay<A1>::type  A1D;
+    typedef typename decay<A2>::type  A2D;
+    struct _B : _IFn {
+      FnD f_; A1D a1_; A2D a2_;
+      _B(FnD fv, A1D a1v, A2D a2v) : f_(std::move(fv)), a1_(std::move(a1v)), a2_(std::move(a2v)) {}
+      void call() override { f_(a1_, a2_); }
+    };
+    start_fn_ = new _B(
+      FnD(static_cast<Fn&&>(f)),
+      A1D(static_cast<A1&&>(a1)),
+      A2D(static_cast<A2&&>(a2)));
+    _Spawn();
+  }
+
+  template <class Fn, class A1, class A2, class A3>
+  thread(Fn&& f, A1&& a1, A2&& a2, A3&& a3)
+  {
+    typedef typename decay<Fn>::type  FnD;
+    typedef typename decay<A1>::type  A1D;
+    typedef typename decay<A2>::type  A2D;
+    typedef typename decay<A3>::type  A3D;
+    struct _B : _IFn {
+      FnD f_; A1D a1_; A2D a2_; A3D a3_;
+      _B(FnD fv, A1D a1v, A2D a2v, A3D a3v) : f_(std::move(fv)), a1_(std::move(a1v)), a2_(std::move(a2v)), a3_(std::move(a3v)) {}
+      void call() override { f_(a1_, a2_, a3_); }
+    };
+    start_fn_ = new _B(
+      FnD(static_cast<Fn&&>(f)),
+      A1D(static_cast<A1&&>(a1)),
+      A2D(static_cast<A2&&>(a2)),
+      A3D(static_cast<A3&&>(a3)));
+    _Spawn();
+  }
+
+  thread(const thread&) = delete;
+  thread& operator=(const thread&) = delete;
+
+  thread(thread &&o) noexcept : thr_(o.thr_), start_fn_(o.start_fn_), joined_(o.joined_) {
+    o.joined_    = true;
+    o.start_fn_  = 0;
+  }
+
+  thread& operator=(thread &&o) noexcept
+  {
+    if (this != &o) {
+      if (start_fn_ && !joined_) pthread_detach(thr_);
+      thr_      = o.thr_;
+      start_fn_ = o.start_fn_;
+      joined_   = o.joined_;
+      o.joined_   = true;
+      o.start_fn_ = 0;
+    }
+    return *this;
+  }
+
+  ~thread() {
+    if (start_fn_ && !joined_) pthread_detach(thr_);
+  }
+
+  void join()   { if (!joined_) { pthread_join(thr_, 0);   joined_ = true; } }
+  void detach() { if (!joined_) { pthread_detach(thr_);     joined_ = true; } }
+  bool joinable() const { return !joined_ && start_fn_; }
+  id   get_id()   const { return thr_; }
+
+  static unsigned hardware_concurrency() { return 2; } /* ESP32-P4 dual RISC-V */
+
+private:
+  void _Spawn()
+  {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 98304);
+    int rc = pthread_create(&thr_, &attr, &_Entry, start_fn_);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+      char dbg[64];
+      int n = snprintf(dbg, sizeof(dbg), "THREAD_FAIL rc=%d errno=%d\n", rc, errno);
+      if (n > 0) write(1, dbg, (size_t)n);
+    }
+  }
+
+  struct _IFn {
+    virtual ~_IFn() {}
+    virtual void call() = 0;
+  };
+
+  template <class Callable>
+  struct _FnWrap : _IFn {
+    /* std::decay ensures:
+     *   - function types -> function pointer
+     *   - array types    -> element pointer
+     *   - lvalue refs    -> underlying value type
+     *   The resulting Callable is always a value-storable type,
+     *   so "Callable f_" is always valid (never a bare function type
+     *   with "invalidly declared function type" errors). */
+    Callable f_;
+    _FnWrap(Callable f) : f_(std::move(f)) {}
+    void call() override { f_(); }
+  };
+
+  static void* _Entry(void *p) {
+    _IFn *fn = (_IFn *)p;
+    fn->call();
+    delete fn;
+    return 0;
+  }
+
+  id     thr_;
+  _IFn  *start_fn_;
+  bool   joined_;
+};
+
+namespace this_thread {
+
+  inline thread::id get_id() noexcept { return pthread_self(); }
+  inline void yield() noexcept        { pthread_yield(); }
+
+  template<class Rep, class Period>
+  void sleep_for(const chrono::duration<Rep, Period> &dur)
+  {
+    long long sec_rem_numer   = (long long)dur.count() * (long long)Period::num;
+    long long partial_numer   = sec_rem_numer * 1000000LL;
+    long long us;
+    if (Period::den == 0) us = 0;
+    else                  us = partial_numer / (long long)Period::den;
+    if (us < 0) us = 0;
+    while (us >= 1000000) { ::sleep(1); us -= 1000000; }
+    if (us > 0)           { ::usleep((useconds_t)(unsigned)us); }
+  }
+
+  inline void sleep_until(const chrono::steady_clock::time_point &tp)
+  { sleep_for(tp - chrono::steady_clock::now()); }
+
+} /* namespace this_thread */
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_THREAD_SHIM_H_ */

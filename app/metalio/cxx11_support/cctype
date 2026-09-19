@@ -1,0 +1,47 @@
+/*
+ * apps/metalio/cxx11_support/cctype — wraps the NuttX libc <ctype.h>
+ * character predicates (isascii / isdigit / isspace / tolower / toupper
+ * etc.) with std::-namespaced using-declarations on top of whatever
+ * the uClibc++ 0.2.x native <cctype> header already provides.
+ *
+ * uClibc++ 0.2.x ships only the classic C <ctype.h> wrapper and does
+ * NOT consistently pull is* / to* names into namespace std (some
+ * configurations just do #include_next <ctype.h> without any
+ * using-declarations).  Metalio's openclaw_client.cxx HTTP response
+ * parser does case-insensitive header comparison with std::tolower.
+ */
+#ifndef METALIO_CXX11_CCTYPE_SHIM_H_
+#define METALIO_CXX11_CCTYPE_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include_next <cctype>    /* uClibc++ native */
+
+/* uClibc++'s native cctype may or may not have included <ctype.h>;
+ * force it so the global ::isspace / ::tolower etc. prototypes are
+ * available for the using-declarations below. */
+#include <ctype.h>
+
+namespace std {
+
+using ::isalnum;
+using ::isalpha;
+using ::iscntrl;
+using ::isdigit;
+using ::isgraph;
+using ::islower;
+using ::isprint;
+using ::ispunct;
+using ::isspace;
+using ::isupper;
+using ::isxdigit;
+using ::isblank;
+
+using ::tolower;
+using ::toupper;
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_CCTYPE_SHIM_H_ */

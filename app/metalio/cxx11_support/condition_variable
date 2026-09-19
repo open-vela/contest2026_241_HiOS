@@ -1,0 +1,91 @@
+/*
+ * apps/metalio/cxx11_support/condition_variable — minimal C++11 shim
+ *
+ * uClibc++ 0.2 has no <condition_variable>.  Metalio uses only:
+ *   - condition_variable::wait(unique_lock<mutex>&)
+ *   - condition_variable::wait_for(unique_lock<mutex>&, duration)
+ *   - condition_variable::notify_one / notify_all
+ *
+ * We build it directly on top of NuttX's pthread_cond_t, which is
+ * available via the standard POSIX pthread.h header.
+ */
+#ifndef METALIO_CXX11_CONDITION_VARIABLE_SHIM_H_
+#define METALIO_CXX11_CONDITION_VARIABLE_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include <pthread.h>
+#include <cerrno>
+#include <chrono>       /* our shim → milliseconds / steady_clock */
+#include <mutex>        /* our shim → unique_lock<mutex> */
+
+#if __has_include_next(<condition_variable>)
+#  include_next <condition_variable>
+#endif
+
+namespace std {
+
+enum class cv_status { no_timeout, timeout };
+
+class condition_variable
+{
+public:
+  condition_variable()          { pthread_cond_init(&cv_, 0); }
+  ~condition_variable()         { pthread_cond_destroy(&cv_); }
+  condition_variable(const condition_variable&) = delete;
+  condition_variable& operator=(const condition_variable&) = delete;
+
+  /* ----------------- basic wait / signals ------------------------ */
+
+  void wait(unique_lock<mutex> &lk)
+  {
+    /* pthread_cond_wait requires an *unlocked* callers-after context
+     * (it atomically unlocks the mutex on entry and re-locks on exit).
+     * unique_lock::owns_ is the canonical state so we just peek and
+     * poke via our friend declaration. */
+    pthread_cond_wait(&cv_, lk.mutex()->native_handle());
+  }
+
+  template<class Predicate>
+  void wait(unique_lock<mutex> &lk, Predicate p)
+  {
+    while (!p()) wait(lk);
+  }
+
+  template<class Rep, class Period>
+  cv_status wait_for(unique_lock<mutex> &lk,
+                     const chrono::duration<Rep,Period> &rel_time)
+  {
+    /* Convert to milliseconds — the coarsest metalio-level unit used.
+     * Compute the CLOCK_REALTIME absolute target and call the timed
+     * wait primitive that NuttX implements. */
+    long long ms = (long long)rel_time.count() *
+                   (Period::num * 1000LL / Period::den);
+
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    long long end_ns = (long long)now.tv_sec  * 1000000000LL
+                     + (long long)now.tv_nsec
+                     + ms * 1000000LL;
+
+    struct timespec abstime;
+    abstime.tv_sec  = (time_t)(end_ns / 1000000000LL);
+    abstime.tv_nsec = (long)(end_ns % 1000000000LL);
+
+    int rc = pthread_cond_timedwait(&cv_, lk.mutex()->native_handle(),
+                                    &abstime);
+    return (rc == ETIMEDOUT) ? cv_status::timeout : cv_status::no_timeout;
+  }
+
+  void notify_one()             { pthread_cond_signal(&cv_); }
+  void notify_all()             { pthread_cond_broadcast(&cv_); }
+
+private:
+  pthread_cond_t cv_;
+};
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_CONDITION_VARIABLE_SHIM_H_ */

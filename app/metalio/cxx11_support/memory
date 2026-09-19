@@ -1,0 +1,32 @@
+/*
+ * apps/metalio/cxx11_support/memory — FORWARDING STUB.
+ *
+ * Historically, the Metalio C++11 smart-pointer shim lived here, and
+ * uClibc++'s allocator/auto_ptr declarations lived in a separate
+ * nuttx/include/uClibc++/memory file.  That arrangement broke in
+ * practice because NuttX only provides a SINGLE -I flag for uClibc++
+ * headers, leaving no room for an #include_next to find the "other"
+ * <memory> variant.  See the merged header for details.
+ *
+ * SOLUTION (2025-12):
+ *   1. The COMBINED definitions now live in nuttx/include/uClibc++/memory,
+ *      which is on the default search path (CXXFLAGS passes
+ *      -I$(TOPDIR)/include/uClibc++).
+ *   2. This file is now a TINY forwarding shim that simply re-includes
+ *      the merged header.  It exists purely so that any remaining
+ *      `-Iapps/metalio/cxx11_support` directives in the build flags do
+ *      the RIGHT thing instead of shadowing the allocator definition
+ *      with a half-empty <memory> header.
+ *
+ * Any future modifications to <memory> should go in the merged header:
+ *     nuttx/include/uClibc++/memory
+ */
+
+#ifndef METALIO_CXX11_MEMORY_SHIM_FORWARD_H_
+#define METALIO_CXX11_MEMORY_SHIM_FORWARD_H_
+
+#include_next <memory>     /* → picks up the merged uClibc++ allocator +
+                              smart-pointer header installed in
+                              nuttx/include/uClibc++/memory.           */
+
+#endif /* METALIO_CXX11_MEMORY_SHIM_FORWARD_H_ */
