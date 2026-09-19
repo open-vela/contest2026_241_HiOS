@@ -1,0 +1,133 @@
+/*
+ * apps/metalio/cxx11_support/stdexcept — FULL <stdexcept> replacement
+ * shim.
+ *
+ * Rationale
+ * ---------
+ * uClibc++ 0.2.x provides <stdexcept> with the standard
+ * logic_error/runtime_error hierarchies, but Metalio's build
+ * uses an include path that resolves <exception> (included by
+ * uClibc++'s <stdexcept>) to our own cxx11_support header when it
+ * exists — which can break the native class definitions because the
+ * shim's exception base class has a different mangling/ABI.
+ *
+ * To sidestep that, we provide a SELF-CONTAINED implementation of
+ * the <stdexcept> classes Metalio actually uses:
+ *
+ *     std::logic_error
+ *     std::invalid_argument
+ *     std::runtime_error
+ *     (plus the std::out_of_range / length_error / domain_error etc.
+ *      siblings as inline stubs so any future use of them compiles)
+ *
+ * All classes derive from std::exception (whatever that is resolved
+ * to by the include path).
+ *
+ * Metalio is built with -fno-exceptions; `throw X(...)` is still
+ * accepted by GCC in that mode but behaves like `printf(...); abort();`
+ * — none of these types need to participate in stack unwinding, so a
+ * simple string wrapper per hierarchy is all we need.
+ */
+#ifndef METALIO_CXX11_STDEXCEPT_SHIM_H_
+#define METALIO_CXX11_STDEXCEPT_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include <exception>
+#include <string>
+#include <cstring>
+
+namespace std {
+
+/* ================================================================
+ * logic_error hierarchy (programming errors; preconditions)
+ * ================================================================ */
+
+class logic_error : public exception
+{
+protected:
+  string _m_what;
+public:
+  logic_error() noexcept {}
+  explicit logic_error(const string& what_arg) : _m_what(what_arg) {}
+  virtual ~logic_error() noexcept {}
+
+  virtual const char* what() const noexcept override
+  {
+    return _m_what.empty() ? "logic_error" : _m_what.c_str();
+  }
+};
+
+class domain_error : public logic_error
+{
+public:
+  domain_error() : logic_error() {}
+  explicit domain_error(const string& s) : logic_error(s) {}
+};
+
+class invalid_argument : public logic_error
+{
+public:
+  invalid_argument() : logic_error() {}
+  explicit invalid_argument(const string& s) : logic_error(s) {}
+};
+
+class length_error : public logic_error
+{
+public:
+  length_error() : logic_error() {}
+  explicit length_error(const string& s) : logic_error(s) {}
+};
+
+class out_of_range : public logic_error
+{
+public:
+  out_of_range() : logic_error() {}
+  explicit out_of_range(const string& s) : logic_error(s) {}
+};
+
+/* ================================================================
+ * runtime_error hierarchy (runtime conditions)
+ * ================================================================ */
+
+class runtime_error : public exception
+{
+protected:
+  string _m_what;
+public:
+  runtime_error() noexcept {}
+  explicit runtime_error(const string& what_arg) : _m_what(what_arg) {}
+  virtual ~runtime_error() noexcept {}
+
+  virtual const char* what() const noexcept override
+  {
+    return _m_what.empty() ? "runtime_error" : _m_what.c_str();
+  }
+};
+
+class range_error : public runtime_error
+{
+public:
+  range_error() : runtime_error() {}
+  explicit range_error(const string& s) : runtime_error(s) {}
+};
+
+class overflow_error : public runtime_error
+{
+public:
+  overflow_error() : runtime_error() {}
+  explicit overflow_error(const string& s) : runtime_error(s) {}
+};
+
+class underflow_error : public runtime_error
+{
+public:
+  underflow_error() : runtime_error() {}
+  explicit underflow_error(const string& s) : runtime_error(s) {}
+};
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_STDEXCEPT_SHIM_H_ */

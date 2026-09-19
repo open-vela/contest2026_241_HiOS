@@ -1,0 +1,184 @@
+/*
+ * apps/metalio/cxx11_support/mutex — C++11 <mutex> shim on NuttX pthreads.
+ *
+ * uClibc++ 0.2 has no <mutex> / <condition_variable> / <thread> at all.
+ * We need the basics: mutex / recursive_mutex / lock_guard / unique_lock
+ * plus the three tag types (adopt_lock / defer_lock / try_to_lock).
+ */
+#ifndef METALIO_CXX11_MUTEX_SHIM_H_
+#define METALIO_CXX11_MUTEX_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include <pthread.h>
+#include <cerrno>
+#include <utility>       /* std::move */
+
+#if __has_include_next(<mutex>)
+#  include_next <mutex>   /* defensive — uClibc++ has none */
+#endif
+
+namespace std {
+
+/* ================================================================ */
+/*  mutexes                                                          */
+/* ================================================================ */
+
+class mutex
+{
+public:
+  mutex()           { pthread_mutex_init(&m_, 0); }
+  ~mutex()          { pthread_mutex_destroy(&m_); }
+  mutex(const mutex&) = delete;
+  mutex& operator=(const mutex&) = delete;
+
+  void lock()      { pthread_mutex_lock(&m_); }
+  void unlock()    { pthread_mutex_unlock(&m_); }
+  bool try_lock()  { return pthread_mutex_trylock(&m_) == 0; }
+
+  pthread_mutex_t* native_handle() { return &m_; }
+private:
+  pthread_mutex_t m_;
+};
+
+class recursive_mutex
+{
+public:
+  recursive_mutex() {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&m_, &attr);
+    pthread_mutexattr_destroy(&attr);
+  }
+  ~recursive_mutex() { pthread_mutex_destroy(&m_); }
+  recursive_mutex(const recursive_mutex&) = delete;
+  recursive_mutex& operator=(const recursive_mutex&) = delete;
+  void lock()      { pthread_mutex_lock(&m_); }
+  void unlock()    { pthread_mutex_unlock(&m_); }
+  bool try_lock()  { return pthread_mutex_trylock(&m_) == 0; }
+  pthread_mutex_t* native_handle() { return &m_; }
+private:
+  pthread_mutex_t m_;
+};
+
+/* ================================================================ */
+/*  tag types                                                        */
+/* ================================================================ */
+
+struct adopt_lock_t  { constexpr explicit adopt_lock_t()  = default; };
+struct defer_lock_t  { constexpr explicit defer_lock_t()  = default; };
+struct try_to_lock_t { constexpr explicit try_to_lock_t() = default; };
+
+constexpr adopt_lock_t  adopt_lock{};
+constexpr defer_lock_t  defer_lock{};
+constexpr try_to_lock_t try_to_lock{};
+
+/* ================================================================ */
+/*  lock_guard  (strict C++03 form, still works for C++11 usage)    */
+/* ================================================================ */
+
+template<class Mutex>
+class lock_guard
+{
+public:
+  typedef Mutex mutex_type;
+  explicit lock_guard(Mutex &m) : m_(m)              { m_.lock(); }
+  lock_guard(Mutex &m, adopt_lock_t) : m_(m)         { /* already locked */ }
+  ~lock_guard()                                      { m_.unlock(); }
+  lock_guard(const lock_guard&) = delete;
+  lock_guard& operator=(const lock_guard&) = delete;
+private:
+  Mutex &m_;
+};
+
+/* ================================================================ */
+/*  unique_lock  (minimal API surface Metalio uses)                 */
+/* ================================================================ */
+
+template<class Mutex>
+class unique_lock
+{
+public:
+  typedef Mutex mutex_type;
+
+  /* -------- constructors -------- */
+  unique_lock() noexcept : m_(0), owns_(false) {}
+
+  explicit unique_lock(Mutex &m)
+    : m_(&m), owns_(false) { lock(); }
+
+  unique_lock(Mutex &m, adopt_lock_t)
+    : m_(&m), owns_(true) { /* caller has already locked */ }
+
+  unique_lock(Mutex &m, defer_lock_t) noexcept
+    : m_(&m), owns_(false) {}
+
+  unique_lock(Mutex &m, try_to_lock_t)
+    : m_(&m), owns_(m.try_lock()) {}
+
+  ~unique_lock() { if (owns_) m_->unlock(); }
+
+  unique_lock(const unique_lock&) = delete;
+  unique_lock& operator=(const unique_lock&) = delete;
+
+  unique_lock(unique_lock &&o) noexcept
+    : m_(o.m_), owns_(o.owns_)
+  { o.m_ = 0; o.owns_ = false; }
+
+  unique_lock& operator=(unique_lock &&o) noexcept
+  {
+    if (this != &o) {
+      if (owns_) m_->unlock();
+      m_       = o.m_;
+      owns_    = o.owns_;
+      o.m_     = 0;
+      o.owns_  = false;
+    }
+    return *this;
+  }
+
+  /* -------- locking API -------- */
+  void lock()    { if (m_) { m_->lock();    owns_ = true; } }
+  bool try_lock(){ return m_ ? (owns_ = m_->try_lock()) : false; }
+  void unlock()  { if (m_ && owns_) { m_->unlock(); owns_ = false; } }
+
+  /* -------- observers -------- */
+  void swap(unique_lock &o) noexcept
+  {
+    Mutex *mm = m_;    m_ = o.m_;    o.m_ = mm;
+    bool    oo = owns_; owns_ = o.owns_; o.owns_ = oo;
+  }
+
+  Mutex* release() noexcept
+  {
+    Mutex *r = m_;
+    m_ = 0; owns_ = false;
+    return r;
+  }
+
+  bool owns_lock() const noexcept        { return owns_; }
+  explicit operator bool() const noexcept{ return owns_; }
+  Mutex* mutex() const noexcept          { return m_; }
+
+private:
+  Mutex *m_;
+  bool   owns_;
+
+  /* condition_variable::wait / wait_for / wait_until take unique_lock
+   * by reference and need to temporarily (un)lock the underlying mutex
+   * through the wrapper.  We expose the pair via friends. */
+  friend class condition_variable;
+};
+
+template<class Mutex>
+void swap(unique_lock<Mutex> &a, unique_lock<Mutex> &b) noexcept
+{
+  a.swap(b);
+}
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_MUTEX_SHIM_H_ */

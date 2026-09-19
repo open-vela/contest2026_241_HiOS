@@ -1,0 +1,14 @@
+/*
+ * cinttypes — C++ wrapper for <inttypes.h>
+ *
+ * uClibc++ 0.2.5 does not ship <cinttypes>.  This shim includes
+ * the system <inttypes.h> and brings the format macros (PRId64,
+ * PRIu64, etc.) into scope.  The types themselves (int64_t, etc.)
+ * come from <cstdint> which uClibc++ does provide.
+ */
+#ifndef METALIO_CXX11_CINTTYPES_SHIM_H_
+#define METALIO_CXX11_CINTTYPES_SHIM_H_
+
+#include <inttypes.h>
+
+#endif /* METALIO_CXX11_CINTTYPES_SHIM_H_ */

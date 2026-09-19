@@ -1,0 +1,21 @@
+dependencies:
+  espressif/esp_extractor:
+    version: ^1.0.0
+  espressif/gmf_io:
+    version: ~0.8
+  espressif/media_lib_sal:
+    version: '*'
+description: Espressif HLS stream extractor
+documentation: https://github.com/espressif/esp-adf-libs/tree/master/esp_hls_stream/README.md
+issues: https://github.com/espressif/esp-gmf/issues
+repository: git://github.com/espressif/esp-adf-libs.git
+repository_info:
+  commit_sha: 093cf4e9fcb09ea0ee877ee8bba8e33209a67638
+  path: esp_hls_stream
+tags:
+- multimedia
+- extractor
+- HLS
+- gmf
+url: https://github.com/espressif/esp-adf-libs/tree/master/esp_hls_stream
+version: 1.0.2

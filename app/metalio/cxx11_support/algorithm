@@ -1,0 +1,45 @@
+/*
+ * apps/metalio/cxx11_support/algorithm — adds C++17 algorithms on top
+ * of the uClibc++ 0.2.x native <algorithm> header.
+ *
+ * uClibc++ ships std::sort, std::find, std::min, std::max,
+ * std::copy and the rest of the classic STL algorithm set — but does
+ * NOT provide std::clamp (C++17).  Metalio uses std::clamp in the
+ * sensor display screens (magnet_screen for axis calibration).
+ *
+ * NOTE: We intentionally do NOT re-define std::min / std::max
+ * overloads here — uClibc++ already declares them and any re-definition
+ * would clash on the return type (T vs const T&).
+ */
+#ifndef METALIO_CXX11_ALGORITHM_SHIM_H_
+#define METALIO_CXX11_ALGORITHM_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include_next <algorithm>    /* uClibc++ native <algorithm> */
+
+namespace std {
+
+/* ---- std::clamp (C++17, <algorithm>) — Metalio sensor screens use
+ *       three-arg clamp(val, lo, hi) to bring raw sensor readings
+ *       into an integer LVGL label range. -------------------------------- */
+
+template <typename T, typename Compare>
+constexpr const T& clamp(const T& value, const T& lo, const T& hi, Compare comp)
+{
+  return comp(value, lo) ? lo
+       : comp(hi, value) ? hi
+       : value;
+}
+
+template <typename T>
+constexpr const T& clamp(const T& value, const T& lo, const T& hi)
+{
+  return clamp(value, lo, hi, less<T>());
+}
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_ALGORITHM_SHIM_H_ */

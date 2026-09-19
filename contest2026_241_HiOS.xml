@@ -9,8 +9,8 @@
   <include name="openvela.xml"/>
 
   <project path="contest2026_241_HiOS" name="contest2026_241_HiOS">
-    <linkfile src="app/hello_app" dest="packages/demos/contest2026_241_hello_app"/>
-    <linkfile src="quickapp/hello_quickapp" dest="packages/apps/contest2026_241_hello_quickapp"/>
-    <linkfile src="board/contest_board" dest="vendor/openvela/boards/contest2026_241_board"/>
+    <linkfile src="board/metalio-claw-4" dest="nuttx/boards/risc-v/esp32p4/metalio-claw-4"/>
+    <linkfile src="vendor/metalio" dest="vendor/metalio"/>
+    <linkfile src="app/metalio" dest="apps/metalio"/>
   </project>
 </manifest>

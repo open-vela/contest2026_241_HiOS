@@ -1,0 +1,123 @@
+/*
+ * apps/metalio/cxx11_support/optional — minimal C++17 std::optional shim.
+ *
+ * Metalio actually uses:
+ *    • optional<T> (default ctor = empty, ctor from const T&)
+ *    • optional<T>& operator=(const T&)
+ *    • has_value() / operator bool / value() / value_or(U)
+ *    • operator-> / operator*
+ * That's a small subset so hand-rolled storage with aligned char buf is
+ * plenty — no full Standard API needed.
+ */
+
+#ifndef METALIO_CXX17_OPTIONAL_SHIM_H_
+#define METALIO_CXX17_OPTIONAL_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include <new>
+#include <utility>
+#include <type_traits>
+#include <cstddef>
+
+#if __has_include_next(<optional>)
+#  include_next <optional>     /* defensive — nothing expected */
+#endif
+
+namespace std {
+
+struct nullopt_t { constexpr explicit nullopt_t() = default; };
+constexpr nullopt_t nullopt{};
+
+template <typename T>
+class optional
+{
+public:
+  typedef T value_type;
+
+  constexpr optional() noexcept : has_(false) {}
+  constexpr optional(nullopt_t) noexcept : has_(false) {}
+
+  optional(const T& v) : has_(false) { construct(v); }
+  optional(T&& v)      : has_(false) { construct(static_cast<T&&>(v)); }
+
+  optional(const optional& o) : has_(false)
+  { if (o.has_) construct(*o.ptr()); }
+
+  optional(optional&& o) noexcept : has_(false)
+  { if (o.has_) construct(static_cast<T&&>(*o.ptr())); }
+
+  ~optional() { reset(); }
+
+  optional& operator=(const optional& o)
+  {
+    if (this != &o) {
+      reset();
+      if (o.has_) construct(*o.ptr());
+    }
+    return *this;
+  }
+
+  optional& operator=(optional&& o) noexcept
+  {
+    if (this != &o) {
+      reset();
+      if (o.has_) construct(static_cast<T&&>(*o.ptr()));
+    }
+    return *this;
+  }
+
+  optional& operator=(const T& v) { reset(); construct(v); return *this; }
+  optional& operator=(T&& v)      { reset(); construct(static_cast<T&&>(v)); return *this; }
+  optional& operator=(nullopt_t)  { reset(); return *this; }
+
+  bool has_value() const noexcept { return has_; }
+  explicit operator bool() const noexcept { return has_; }
+
+  const T* operator->() const { return ptr(); }
+  T*       operator->()       { return ptr(); }
+  const T& operator*()  const { return *ptr(); }
+  T&       operator*()        { return *ptr(); }
+
+  T& value() { return *ptr(); }
+  const T& value() const { return *ptr(); }
+
+  template <typename U>
+  T value_or(U&& def) const
+  { return has_ ? *ptr() : static_cast<T>(static_cast<U&&>(def)); }
+
+  void reset() noexcept
+  { if (has_) { ptr()->~T(); has_ = false; } }
+
+  template <typename... Args>
+  T& emplace(Args&&... args)
+  {
+    reset();
+    construct(static_cast<Args&&>(args)...);
+    return *ptr();
+  }
+
+private:
+  alignas(T) unsigned char buf_[sizeof(T)];
+  bool has_;
+
+  T*       ptr()       { return reinterpret_cast<T*>(&buf_[0]); }
+  const T* ptr() const { return reinterpret_cast<const T*>(&buf_[0]); }
+
+  template <typename... Args>
+  void construct(Args&&... args)
+  {
+    ::new (static_cast<void*>(ptr())) T(static_cast<Args&&>(args)...);
+    has_ = true;
+  }
+};
+
+template <typename T>
+optional<typename decay<T>::type> make_optional(T&& v)
+{ return optional<typename decay<T>::type>(static_cast<T&&>(v)); }
+
+} /* namespace std */
+
+#endif /* METALIO_CXX17_OPTIONAL_SHIM_H_ */

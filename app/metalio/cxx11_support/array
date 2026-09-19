@@ -1,0 +1,142 @@
+/*
+ * apps/metalio/cxx11_support/array — minimal std::array shim for C++11.
+ *
+ * uClibc++ 0.2.x predates the C++11 <array> header.  Metalio uses
+ * std::array for small compile-time-sized buffers (e.g. a 4-element
+ * list of BLE service UUIDs).  The shim below is a drop-in replacement
+ * that implements the subset of the Standard that Metalio actually
+ * uses: aggregate-initialiseable []-indexable fixed-size container
+ * with begin()/end()/size()/data()/fill()/front()/back().
+ *
+ * Deliberately NOT implemented:
+ *   • tuple-like interface (get<N>, tuple_size, tuple_element)
+ *   • std::swap specialisation (member swap is not provided either;
+ *     the default std::swap works element-by-element which is fine
+ *     for Metalio's small arrays of scalar/POD types).
+ */
+#ifndef METALIO_CXX11_ARRAY_SHIM_H_
+#define METALIO_CXX11_ARRAY_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include <cstddef>      /* size_t */
+
+namespace std {
+
+template <typename T, size_t N>
+class array
+{
+public:
+  /* — STL-style typedefs — */
+  typedef T                 value_type;
+  typedef T&                reference;
+  typedef const T&          const_reference;
+  typedef T*                iterator;
+  typedef const T*          const_iterator;
+  typedef T*                pointer;
+  typedef const T*          const_pointer;
+  typedef size_t            size_type;
+  typedef ptrdiff_t         difference_type;
+
+  /* — Storage: public so the class is an aggregate (brace-init works). */
+  T _elems[N ? N : 1];
+
+  /* — Element access — */
+
+  reference       operator[](size_type i)       { return _elems[i]; }
+  const_reference operator[](size_type i) const { return _elems[i]; }
+
+  reference       front()       { return _elems[0]; }
+  const_reference front() const { return _elems[0]; }
+  reference       back()        { return _elems[N - 1]; }
+  const_reference back()  const { return _elems[N - 1]; }
+
+  pointer       data()       { return _elems; }
+  const_pointer data() const { return _elems; }
+
+  /* — Iterators — */
+
+  iterator               begin()        { return _elems; }
+  const_iterator         begin()  const { return _elems; }
+  const_iterator         cbegin() const { return _elems; }
+  iterator               end()          { return _elems + N; }
+  const_iterator         end()    const { return _elems + N; }
+  const_iterator         cend()   const { return _elems + N; }
+
+  /* — Capacity — */
+
+  constexpr size_type size()     const { return N; }
+  constexpr bool      empty()    const { return N == 0; }
+  constexpr size_type max_size() const { return N; }
+
+  /* — Operations — */
+
+  void fill(const T& value)
+  {
+    for (size_type i = 0; i < N; ++i) _elems[i] = value;
+  }
+
+  void swap(array& other)
+  {
+    for (size_type i = 0; i < N; ++i) {
+      T tmp = _elems[i];
+      _elems[i]     = other._elems[i];
+      other._elems[i] = tmp;
+    }
+  }
+};
+
+/* — Free-function relational operators (lexicographic compare via ==/!=
+ *   then <).  Metalio only appears to use == and != on small arrays of
+ *   built-in types so the implementations are deliberately simple. — */
+
+template <typename T, size_t N>
+inline bool operator==(const array<T,N>& a, const array<T,N>& b)
+{
+  for (size_t i = 0; i < N; ++i) if (!(a[i] == b[i])) return false;
+  return true;
+}
+
+template <typename T, size_t N>
+inline bool operator!=(const array<T,N>& a, const array<T,N>& b)
+{ return !(a == b); }
+
+template <typename T, size_t N>
+inline bool operator<(const array<T,N>& a, const array<T,N>& b)
+{
+  for (size_t i = 0; i < N; ++i) {
+    if (a[i] < b[i]) return true;
+    if (b[i] < a[i]) return false;
+  }
+  return false;
+}
+
+template <typename T, size_t N>
+inline bool operator>=(const array<T,N>& a, const array<T,N>& b)
+{ return !(a < b); }
+
+template <typename T, size_t N>
+inline bool operator>(const array<T,N>& a, const array<T,N>& b)
+{ return b < a; }
+
+template <typename T, size_t N>
+inline bool operator<=(const array<T,N>& a, const array<T,N>& b)
+{ return !(b < a); }
+
+/* — std::get<N>(array) — frequently used in Metalio code alongside
+ *   structured-style accessors; provide the most basic overload. — */
+
+template <size_t I, typename T, size_t N>
+inline T& get(array<T,N>& a)             { return a[I]; }
+
+template <size_t I, typename T, size_t N>
+inline const T& get(const array<T,N>& a) { return a[I]; }
+
+template <size_t I, typename T, size_t N>
+inline T&& get(array<T,N>&& a)           { return static_cast<T&&>(a[I]); }
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_ARRAY_SHIM_H_ */

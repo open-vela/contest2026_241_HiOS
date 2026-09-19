@@ -1,0 +1,242 @@
+/*
+ * apps/metalio/cxx11_support/chrono — minimal C++11 <chrono> shim (rev2)
+ *
+ * Metalio uses: duration literals (ms / s / m / us / ns),
+ * steady_clock::now() / system_clock::now() time deltas,
+ * condition_variable::wait_for(milliseconds) and
+ * this_thread::sleep_for(milliseconds).  A small subset of the full
+ * <chrono> suffices.  We deliberately do NOT use int[N] for periods
+ * (that would be a VLA-of-int of size N bytes, which overflows for
+ * nanoseconds = int[1e9] = 4 GiB); instead we follow the Standard:
+ * `period` is a std::ratio template (num/den static members).
+ */
+
+#ifndef METALIO_CXX11_CHRONO_SHIM_H_
+#define METALIO_CXX11_CHRONO_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include <time.h>
+#include <stdint.h>
+#include <sys/time.h>
+
+#if __has_include_next(<chrono>)
+/* If there is a native <chrono> we pick it up *after* we've defined our
+ * own wrappers via include_next.  But uClibc++ 0.2 has no <chrono> so
+ * the __has_include_next check is defensive — we just go on. */
+#  include_next <chrono>
+#endif
+
+namespace std {
+
+/* ================================================================ */
+/*  std::ratio (just the tiny subset actually used by this shim)    */
+/* ================================================================ */
+
+template <intmax_t Num, intmax_t Den = 1>
+struct ratio
+{
+  static constexpr const intmax_t num = Num;
+  static constexpr const intmax_t den = Den;
+  typedef ratio<num, den> type;
+};
+
+/* ================================================================ */
+/*  std::chrono::duration<Rep, Period>                              */
+/* ================================================================ */
+
+namespace chrono {
+
+template<class Rep, class Period = ratio<1> >
+class duration
+{
+  Rep r_;
+public:
+  typedef Rep    rep;
+  typedef Period period;
+
+  constexpr duration() : r_(0) {}
+  constexpr explicit duration(Rep v) : r_(v) {}
+
+  template<class R2, class P2>
+  constexpr duration(const duration<R2,P2>& o)
+    : r_(static_cast<Rep>(
+        o.count() * (P2::num * period::den) / (P2::den * period::num)))
+  {
+  }
+
+  constexpr rep count() const { return r_; }
+
+  static constexpr duration zero()     { return duration(Rep(0)); }
+  static constexpr duration min()      { return duration(repr_min()); }
+  static constexpr duration max()      { return duration(repr_max()); }
+
+  constexpr duration  operator+(const duration &o) const { return duration(r_ + o.r_); }
+  constexpr duration  operator-(const duration &o) const { return duration(r_ - o.r_); }
+  constexpr bool      operator< (const duration &o) const { return r_ <  o.r_; }
+  constexpr bool      operator<=(const duration &o) const { return r_ <= o.r_; }
+  constexpr bool      operator> (const duration &o) const { return r_ >  o.r_; }
+  constexpr bool      operator>=(const duration &o) const { return r_ >= o.r_; }
+  constexpr bool      operator==(const duration &o) const { return r_ == o.r_; }
+  constexpr bool      operator!=(const duration &o) const { return r_ != o.r_; }
+
+private:
+  /* Small helpers to compute numeric limits of the underlying integer
+   * representation at compile time without including <limits> (which
+   * is also missing a specialization in uClibc++ 0.2 for some
+   * fundamental types).  Rep is always a signed integer type in our
+   * shim (long long, long, int). */
+  static constexpr Rep repr_min() noexcept { return Rep(1) << ((sizeof(Rep)*8)-1); }
+  static constexpr Rep repr_max() noexcept { return ~repr_min(); }
+};
+
+/* duration_cast — approximate implementation for Metalio (all
+ * durations we cast to are milliseconds; we scale by the ratio
+ * product).  The result is truncated towards zero per Standard. */
+
+template <typename ToDur, typename Rep, typename Period>
+constexpr ToDur duration_cast(const duration<Rep, Period>& d)
+{
+  typedef typename ToDur::rep                        to_rep;
+  typedef typename ToDur::period                     to_period;
+  typedef long long                                  wide;
+  const wide num = (wide)Period::num * (wide)to_period::den;
+  const wide den = (wide)Period::den * (wide)to_period::num;
+  /* integer arithmetic, no rounding */
+  return ToDur(static_cast<to_rep>(
+            (wide)d.count() * num / den));
+}
+
+} /* namespace chrono */
+
+/* Export the two shortcut aliases std::nano / std::milli used by other
+ * headers (most notably our <mutex> for its try_lock_for timing param). */
+typedef ratio<1, 1000000000> nano;
+typedef ratio<1, 1000000>    micro;
+typedef ratio<1, 1000>       milli;
+
+/* ================================================================ */
+/*  Convenience duration typedefs                                   */
+/* ================================================================ */
+namespace chrono {
+
+typedef duration<long long, ::std::nano>  nanoseconds;
+typedef duration<long long, ::std::micro> microseconds;
+typedef duration<long long, ::std::milli> milliseconds;
+typedef duration<long long>               seconds;
+typedef duration<long long, ratio<60> >   minutes;
+typedef duration<long long, ratio<3600> > hours;
+
+/* ================================================================ */
+/*  time_point<Clock, Duration> — free template                     */
+/* ================================================================ */
+
+/* The Standard defines `time_point` as a free class template:
+ *   template <class Clock, class Duration = typename Clock::duration>
+ *   class time_point;
+ * Metalio code (see protocols/protocol.h) writes things like:
+ *   std::chrono::time_point<std::chrono::steady_clock> last_incoming_time_;
+ * which requires the free template, not a Clock-nested class.  We
+ * therefore implement the free template below, and typedef each
+ * Clock::time_point to be an alias of time_point<Clock>. */
+
+template <class Clock, class Dur = typename Clock::duration>
+class time_point
+{
+public:
+  typedef Clock                                clock;
+  typedef Dur                                  duration;
+  typedef typename duration::rep               rep;
+  typedef typename duration::period            period;
+
+  constexpr time_point() : d_() {}
+  explicit constexpr time_point(const duration& d) : d_(d) {}
+
+  template <class Dur2>
+  constexpr time_point(const time_point<Clock, Dur2>& t)
+    : d_(t.time_since_epoch()) {}
+
+  constexpr duration time_since_epoch() const { return d_; }
+
+  time_point& operator+=(const duration& d) { d_ = duration(d_.count() + d.count()); return *this; }
+  time_point& operator-=(const duration& d) { d_ = duration(d_.count() - d.count()); return *this; }
+
+  time_point operator+(const duration& d) const { return time_point(d_ + d); }
+  time_point operator-(const duration& d) const { return time_point(d_ - d); }
+
+  template <class D2>
+  duration operator-(const time_point<Clock, D2>& o) const
+  { return duration(d_.count() - o.time_since_epoch().count()); }
+
+  constexpr bool operator< (const time_point& o) const { return d_ <  o.d_; }
+  constexpr bool operator<=(const time_point& o) const { return d_ <= o.d_; }
+  constexpr bool operator> (const time_point& o) const { return d_ >  o.d_; }
+  constexpr bool operator>=(const time_point& o) const { return d_ >= o.d_; }
+  constexpr bool operator==(const time_point& o) const { return d_ == o.d_; }
+  constexpr bool operator!=(const time_point& o) const { return d_ != o.d_; }
+
+  static constexpr time_point min() { return time_point(duration::min()); }
+  static constexpr time_point max() { return time_point(duration::max()); }
+
+private:
+  duration d_;
+};
+
+/* ================================================================ */
+/*  clocks                                                           */
+/* ================================================================ */
+
+struct steady_clock
+{
+  typedef long long                             rep;
+  typedef ::std::milli                          period;
+  typedef ::std::chrono::duration<rep, period>  duration;
+  typedef ::std::chrono::time_point<steady_clock> time_point;
+
+  static constexpr bool is_steady = true;
+
+  static time_point now()
+  {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long ms = (long long)ts.tv_sec * 1000LL
+                 + (long long)(ts.tv_nsec) / 1000000LL;
+    return time_point(duration(ms));
+  }
+};
+
+struct system_clock
+{
+  typedef long long                             rep;
+  typedef ::std::milli                          period;
+  typedef ::std::chrono::duration<rep, period>  duration;
+  typedef ::std::chrono::time_point<system_clock> time_point;
+
+  static constexpr bool is_steady = false;
+
+  static time_point now()
+  {
+    struct timeval tv;
+    gettimeofday(&tv, 0);
+    long long ms = (long long)tv.tv_sec * 1000LL
+                 + (long long)(tv.tv_usec) / 1000LL;
+    return time_point(duration(ms));
+  }
+
+  static time_t to_time_t(const time_point &t)
+  {
+    return (time_t)(t.time_since_epoch().count() / 1000LL);
+  }
+
+  static time_point from_time_t(time_t t)
+  {
+    return time_point(duration((long long)t * 1000LL));
+  }
+};
+
+} /* namespace chrono */
+} /* namespace std */
+
+#endif /* METALIO_CXX11_CHRONO_SHIM_H_ */

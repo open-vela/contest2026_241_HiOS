@@ -1,0 +1,407 @@
+/*
+ * apps/metalio/cxx11_support/variant — minimal C++17 std::variant shim.
+ *
+ * Metalio's usages are limited:
+ *
+ *   using ReturnValue  = variant<bool, int, std::string, cJSON*, ImageContent*>;
+ *   Property value field = variant<bool, int, std::string>
+ *
+ * and operations are: holds_alternative<T>(v) / get<T>(v), and
+ * construction from an alternative value (converting ctor).  We do
+ * NOT implement std::visit — Metalio does not use it.
+ *
+ * Implementation: inline-aligned char buffer sized for the largest
+ * alternative; an unsigned index stores which alternative (0-based
+ * declaration order) is currently active; a "destroy + copy/move"
+ * per-type vtable pointer allows correct copy/move/destruction
+ * without RTTI.  Type identity for holds_alternative/get is checked
+ * by comparing the static address returned by the per-type
+ * alternative_id<T>() helper.
+ */
+
+#ifndef METALIO_CXX17_VARIANT_SHIM_H_
+#define METALIO_CXX17_VARIANT_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include <new>
+#include <cstddef>
+#include <utility>
+#include <type_traits>
+#include <cstdlib>     /* abort for bad_variant_access */
+#include <cstring>     /* memcpy */
+
+#if __has_include_next(<variant>)
+#  include_next <variant>
+#endif
+
+namespace std {
+
+/* -------------------------------- bad_variant_access ---------------- */
+struct bad_variant_access : public std::exception
+{
+  bad_variant_access() = default;
+  const char* what() const noexcept override { return "bad_variant_access"; }
+};
+
+[[noreturn]] inline void __throw_bad_variant_access()
+{
+#if __cpp_exceptions >= 199711L
+  throw bad_variant_access();
+#else
+  abort();
+#endif
+}
+
+/* -------------------------------- max_align helper ----------------- */
+template <typename...> struct __var_max_size  { static const size_t value = 0; };
+template <typename H, typename... T>
+struct __var_max_size<H, T...> {
+  static const size_t value = sizeof(H) > __var_max_size<T...>::value
+                            ? sizeof(H) : __var_max_size<T...>::value;
+};
+
+template <typename...> struct __var_max_align { static const size_t value = 1; };
+template <typename H, typename... T>
+struct __var_max_align<H, T...> {
+  static const size_t value = alignof(H) > __var_max_align<T...>::value
+                            ? alignof(H) : __var_max_align<T...>::value;
+};
+
+/* -------------------------------- alt-type id registry -----------
+ * Each alternative type T gets its own unique static char object
+ * whose address is its "type id".  No RTTI needed. */
+
+template <typename T>
+struct __var_type_id { static const char id_; };
+template <typename T>
+const char __var_type_id<T>::id_ = '\0';
+
+template <typename T> inline const void* __variant_alt_id()
+{ return static_cast<const void*>(&__var_type_id<typename remove_cv<T>::type>::id_); }
+
+/* -------------------------------- index-of-type trait -------------
+ * IW < Ts...>::value = first index of T in Ts, or sizeof...(Ts). */
+
+template <typename T, typename...> struct __var_index_of;
+template <typename T> struct __var_index_of<T>
+{ static const unsigned value = 0; };
+template <typename T, typename H, typename... Ts>
+struct __var_index_of<T, H, Ts...>
+{
+  static const unsigned value =
+    is_same<typename remove_cv<T>::type,
+            typename remove_cv<H>::type>::value
+      ? 0u : 1u + __var_index_of<T, Ts...>::value;
+};
+
+/* ----------------------------- coercion trait ---------------------
+ * The converting constructor of variant<bool, int, string> that
+ * Metalio uses in McpServer Property receives input types that are
+ * not *exactly* the alternatives:
+ *
+ *   - `"foo"` literal (const char[4]) / `const char*` variable →
+ *     std::string alternative.
+ *   - `(unsigned short)n` / `uint8_t` etc. → int alternative.
+ *   - `true` / `false` are already bool (exact match).
+ *
+ * We therefore apply a single pass of `__var_coerce<T, Ts...>` before
+ * looking up the alternative index.  The trait defaults to identity
+ * (T → T) so types that are already exact alternatives pass through
+ * unchanged.  For types NOT in the alternative set we try the small
+ * set of "common, safe-to-coerce" rules for the Property alt set. */
+
+template <typename T, typename... Ts> struct __var_coerce_defaults
+{ typedef T type; };
+
+template <typename... Ts>
+struct __var_coerce_defaults<const char*, Ts...>
+{
+  /* String-literal / const-char* → std::string if present. */
+  typedef typename conditional<
+    (__var_index_of<std::string, Ts...>::value < sizeof...(Ts)),
+    std::string,
+    const char*
+  >::type type;
+};
+
+template <typename... Ts>
+struct __var_coerce_defaults<char*, Ts...>
+{
+  typedef typename conditional<
+    (__var_index_of<std::string, Ts...>::value < sizeof...(Ts)),
+    std::string,
+    char*
+  >::type type;
+};
+
+/* Narrow small-integer types into int when int is present in the
+ * alternative set.  This covers the Property(uint32_t range-check)
+ * and the `unsigned short` bitfield cases used by the audio screen. */
+#define __VC_PROMOTE(Tname, T)                                        \
+  template <typename... Ts>                                           \
+  struct __var_coerce_defaults<T, Ts...> {                            \
+    typedef typename conditional<                                     \
+      (__var_index_of<int, Ts...>::value < sizeof...(Ts)),            \
+      int,                                                            \
+      T                                                               \
+    >::type type;                                                     \
+  }
+__VC_PROMOTE(uchar, unsigned char);
+__VC_PROMOTE(schar, signed char);
+__VC_PROMOTE(ushort, unsigned short);
+__VC_PROMOTE(sshort, short);
+__VC_PROMOTE(uint, unsigned int);
+__VC_PROMOTE(ulong, unsigned long);
+__VC_PROMOTE(slong, long);
+__VC_PROMOTE(ll, long long);
+__VC_PROMOTE(ull, unsigned long long);
+#undef __VC_PROMOTE
+
+template <typename T, typename... Ts>
+struct __var_coerce
+{
+  /* If the exact type T is already an alternative, skip coercion. */
+  static const bool _is_alt = (__var_index_of<typename remove_cv<T>::type, Ts...>::value < sizeof...(Ts));
+  typedef typename conditional<
+    _is_alt,
+    T,
+    typename __var_coerce_defaults<T, Ts...>::type
+  >::type type;
+};
+
+/* -------------------------------- per-alternative vtable ----------
+ * A small virtual table lets a variant instance destroy / copy /
+ * move / return type-id without knowing which alternative is live. */
+
+struct __var_vtable
+{
+  const void* type_id;
+  void (*destroy)(void*);
+  void (*copy)(const void* src, void* dst);
+  void (*move)(void* src, void* dst);
+};
+
+template <typename A> struct __var_vtable_for {
+  static void dtor(void* p) { static_cast<A*>(p)->~A(); }
+  static void ctor(const void* s, void* d)
+  { ::new (d) A(*static_cast<const A*>(s)); }
+  static void mvtor(void* s, void* d)
+  { ::new (d) A(static_cast<A&&>(*static_cast<A*>(s))); }
+
+  static const __var_vtable vtable;
+};
+
+template <typename A>
+const __var_vtable __var_vtable_for<A>::vtable = {
+  __variant_alt_id<A>(),
+  &__var_vtable_for<A>::dtor,
+  &__var_vtable_for<A>::ctor,
+  &__var_vtable_for<A>::mvtor,
+};
+
+/* vtable lookup by index: use a recursive constexpr array — instead
+ * we simply do a parameter-pack iteration at construction time. */
+
+template <typename... Ts>
+const __var_vtable* __var_vtable_at(unsigned idx);
+
+template <>
+inline const __var_vtable* __var_vtable_at<>(unsigned) { return 0; }
+
+template <typename H, typename... Ts>
+inline const __var_vtable* __var_vtable_at_helper(unsigned idx)
+{
+  return (idx == 0) ? &__var_vtable_for<H>::vtable
+                    : __var_vtable_at<Ts...>(idx - 1);
+}
+
+template <typename... Ts>
+inline const __var_vtable* __var_vtable_at(unsigned idx)
+{ return __var_vtable_at_helper<Ts...>(idx); }
+
+/* ================================================================== */
+/*  variant<Ts...>                                                     */
+/* ================================================================== */
+
+template <typename... Ts>
+class variant
+{
+public:
+  static constexpr unsigned npos = sizeof...(Ts);
+
+  /* Default-construct: hold alternative #0 value-constructed. */
+  variant() : idx_(npos), vt_(0)
+  {
+    construct_from_idx<0, Ts...>();
+  }
+
+  ~variant() { do_destroy(); }
+
+  /* Converting constructor from a single alternative value. */
+  template <typename T>
+  variant(T&& v) : idx_(npos), vt_(0)
+  {
+    typedef typename decay<T>::type DecayedT;
+    /* Apply __var_coerce so e.g. const char* becomes std::string in a
+     * variant<bool,int,string>, unsigned char/short become int, etc.
+     * See the large comment block in __var_coerce trait (above). */
+    typedef typename __var_coerce<DecayedT, Ts...>::type CoercedT;
+    static const unsigned I = __var_index_of<CoercedT, Ts...>::value;
+    static_assert(I < npos, "Type is not an alternative of this variant");
+    /* NOTE: both template args MUST be explicit for construct<>().  If
+     * we only pass <I>, then the second type param `A` of construct
+     * cannot be deduced from the argument list and SFINAE fails.  See
+     * construct() below for its three-template-param signature.  We
+     * instantiate construct with the COERCED type as the second
+     * explicit param so that construct() placement-news a
+     * std::string, int, etc. inside the variant buffer — never a
+     * const char* / unsigned short even though those were the types
+     * provided by the caller.  The actual argument `v` is passed as
+     * the original (potentially reference-collapsed) T&&, which is
+     * fine because construct's Args&& are forwarded. */
+    construct<I, CoercedT>(static_cast<T&&>(v));
+  }
+
+  variant(const variant& o) : idx_(npos), vt_(0)
+  { if (o.vt_) { o.vt_->copy(&o.buf_[0], &buf_[0]); idx_ = o.idx_; vt_ = o.vt_; } }
+
+  variant(variant&& o) noexcept : idx_(npos), vt_(0)
+  { if (o.vt_) { o.vt_->move(&o.buf_[0], &buf_[0]); idx_ = o.idx_; vt_ = o.vt_; o.do_destroy(); } }
+
+  variant& operator=(const variant& o)
+  {
+    if (this != &o) {
+      do_destroy();
+      if (o.vt_) { o.vt_->copy(&o.buf_[0], &buf_[0]); idx_ = o.idx_; vt_ = o.vt_; }
+    }
+    return *this;
+  }
+
+  variant& operator=(variant&& o) noexcept
+  {
+    if (this != &o) {
+      do_destroy();
+      if (o.vt_) { o.vt_->move(&o.buf_[0], &buf_[0]); idx_ = o.idx_; vt_ = o.vt_; o.do_destroy(); }
+    }
+    return *this;
+  }
+
+  unsigned index() const noexcept { return idx_; }
+
+  template <typename T, typename... Args>
+  T& emplace(Args&&... args)
+  {
+    do_destroy();
+    static const unsigned I = __var_index_of<T, Ts...>::value;
+    static_assert(I < npos, "Type is not an alternative of this variant");
+    ::new (&buf_[0]) T(static_cast<Args&&>(args)...);
+    idx_ = I;
+    vt_  = &__var_vtable_for<T>::vtable;
+    return *static_cast<T*>(static_cast<void*>(&buf_[0]));
+  }
+
+  /* Expose internals so the free-function get<T>/holds_alternative can
+   * reach the raw buffer and vtable without having to be friends of
+   * every single template instantiation. */
+  const void*        __type_id() const noexcept { return vt_ ? vt_->type_id : 0; }
+  void*              __raw()       noexcept { return &buf_[0]; }
+  const void*        __raw() const noexcept { return &buf_[0]; }
+
+private:
+  alignas(__var_max_align<Ts...>::value)
+    unsigned char buf_[__var_max_size<Ts...>::value];
+  unsigned       idx_;
+  const __var_vtable* vt_;
+
+  void do_destroy()
+  { if (vt_) { vt_->destroy(&buf_[0]); vt_ = 0; idx_ = npos; } }
+
+  template <unsigned I, typename A, typename... Rest>
+  void construct_from_idx()
+  {
+    static_assert(I < npos, "variant default-construct: I out of range");
+    (void)sizeof...(Rest);
+    /* Always supply both template params explicitly (see note in the
+     * converting constructor above for why this is required). */
+    if constexpr (I == 0) {
+      construct<0, A>(A());
+    } else {
+      /* NOTE: `if constexpr` is REQUIRED here (not plain `if`).  With
+       * plain `if`, even the non-taken `else` branch is fully
+       * instantiated during template instantiation.  That would force
+       * `construct_from_idx<I - 1, Rest...>` to be compiled for I=0
+       * with I-1 wrapping unsigned arithmetic to UINT_MAX, which in
+       * turn triggers the static_assert above (I < npos).  C++17
+       * if constexpr discards the non-taken branch entirely for the
+       * current instantiation, avoiding that false positive. */
+      construct_from_idx<I - 1, Rest...>();
+    }
+  }
+  template <unsigned I>
+  void construct_from_idx()
+  {
+    static_assert(I < npos, "variant: empty alternative pack");
+  }
+
+  template <unsigned I, typename A, typename... Args>
+  void construct(Args&&... args)
+  {
+    ::new (&buf_[0]) A(static_cast<Args&&>(args)...);
+    idx_ = I;
+    vt_  = &__var_vtable_for<A>::vtable;
+  }
+};
+
+/* ================================================================== */
+/*  holds_alternative<T> / get<T> free functions                      */
+/* ================================================================== */
+
+template <typename T, typename... Ts>
+bool holds_alternative(const variant<Ts...>& v) noexcept
+{
+  return v.__type_id() == __variant_alt_id<T>();
+}
+
+template <typename T, typename... Ts>
+T& get(variant<Ts...>& v)
+{
+  if (!holds_alternative<T>(v)) __throw_bad_variant_access();
+  return *static_cast<T*>(v.__raw());
+}
+
+template <typename T, typename... Ts>
+const T& get(const variant<Ts...>& v)
+{
+  if (!holds_alternative<T>(v)) __throw_bad_variant_access();
+  return *static_cast<const T*>(v.__raw());
+}
+
+template <typename T, typename... Ts>
+T&& get(variant<Ts...>&& v)
+{
+  if (!holds_alternative<T>(v)) __throw_bad_variant_access();
+  return static_cast<T&&>(*static_cast<T*>(v.__raw()));
+}
+
+/* get_if — Metalio doesn't use it yet, but it's cheap to provide. */
+template <typename T, typename... Ts>
+T* get_if(variant<Ts...>* v) noexcept
+{
+  return (v && holds_alternative<T>(*v))
+           ? static_cast<T*>(v->__raw())
+           : 0;
+}
+template <typename T, typename... Ts>
+const T* get_if(const variant<Ts...>* v) noexcept
+{
+  return (v && holds_alternative<T>(*v))
+           ? static_cast<const T*>(v->__raw())
+           : 0;
+}
+
+} /* namespace std */
+
+#endif /* METALIO_CXX17_VARIANT_SHIM_H_ */

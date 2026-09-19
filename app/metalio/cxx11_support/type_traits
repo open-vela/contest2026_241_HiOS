@@ -1,0 +1,230 @@
+/*
+ * apps/metalio/cxx11_support/type_traits — C++11 <type_traits> shim
+ *
+ * uClibc++ 0.2 ships a partial <type_traits> but without the C++11
+ * additions (std::is_same / std::enable_if / std::decay /
+ * std::integral_constant / …).  Metalio uses a small subset of the
+ * trait API; we pull in the native header if available and layer
+ * the missing bits on top.
+ */
+
+#ifndef METALIO_CXX11_TYPE_TRAITS_SHIM_H_
+#define METALIO_CXX11_TYPE_TRAITS_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#if __has_include_next(<type_traits>)
+#  include_next <type_traits>
+#endif
+
+namespace std
+{
+
+/* ---------------------- base traits -------------------------------- */
+
+template <typename T, T V>
+struct integral_constant
+{
+  static constexpr const T value = V;
+  typedef T value_type;
+  typedef integral_constant type;
+  constexpr operator value_type() const noexcept { return value; }
+  constexpr value_type operator()() const noexcept { return value; }
+};
+
+typedef integral_constant<bool, true>  true_type;
+typedef integral_constant<bool, false> false_type;
+
+template <bool B, typename T = void> struct enable_if {};
+template <typename T>               struct enable_if<true, T> { typedef T type; };
+
+template <bool B, typename T, typename F>
+struct conditional { typedef T type; };
+template <typename T, typename F>
+struct conditional<false, T, F> { typedef F type; };
+
+template <typename A, typename B> struct is_same          : public false_type {};
+template <typename A>               struct is_same<A, A>    : public true_type  {};
+
+/* ------------------- cv / reference modifiers ---------------------- */
+
+template <typename T> struct remove_const                { typedef T type; };
+template <typename T> struct remove_const<const T>       { typedef T type; };
+template <typename T> struct remove_volatile             { typedef T type; };
+template <typename T> struct remove_volatile<volatile T> { typedef T type; };
+template <typename T>
+struct remove_cv
+{
+  typedef typename remove_volatile<typename remove_const<T>::type>::type type;
+};
+
+template <typename T> struct add_const           { typedef const T type; };
+template <typename T> struct add_volatile        { typedef volatile T type; };
+template <typename T> struct add_cv
+{
+  typedef const volatile T type;
+};
+
+template <typename T> struct remove_reference           { typedef T type; };
+template <typename T> struct remove_reference<T&>       { typedef T type; };
+template <typename T> struct remove_reference<T&&>      { typedef T type; };
+
+/* C++11 remove_extent: strips one level of array bounds.  Needed so
+ * make_unique<T[]>(n) can write `new remove_extent<T>::type[n]`. */
+
+template <typename T> struct remove_extent              { typedef T type; };
+template <typename T> struct remove_extent<T[]>         { typedef T type; };
+template <typename T, unsigned long N> struct remove_extent<T[N]> { typedef T type; };
+
+template <typename T> struct add_lvalue_reference       { typedef T& type; };
+template <typename T> struct add_rvalue_reference       { typedef T&& type; };
+
+template <typename T> struct remove_pointer             { typedef T type; };
+template <typename T> struct remove_pointer<T*>         { typedef T type; };
+template <typename T> struct remove_pointer<T* const>   { typedef T type; };
+
+template <typename T> struct add_pointer
+{
+  typedef typename remove_reference<T>::type* type;
+};
+
+/* ---------------- is_function / is_array (helpers for decay) -------- */
+
+/* is_function: true for any "R(Args...)" or "R(Args...) cv-qual &/&&"
+ * function or function-reference type.  NOTE: pointers-to-functions
+ * are NOT function types.  We do a minimal detection: anything that
+ * isn't void, isn't a reference, and isn't an object (we approximate
+ * with a negative set: !is_void && !is_reference && sizeof pattern) —
+ * actually the cleanest way is a partial-specialization set covering
+ * the function types we actually hit.  Metalio uses R() and R(A1)
+ * almost exclusively; we therefore cover the common signatures. */
+
+template <typename>   struct is_function                    : public false_type {};
+template <typename R> struct is_function<R()>               : public true_type  {};
+template <typename R> struct is_function<R(...)>            : public true_type  {};
+template <typename R, typename A1> struct is_function<R(A1)>                   : public true_type {};
+template <typename R, typename A1> struct is_function<R(A1, ...)>              : public true_type {};
+template <typename R, typename A1, typename A2> struct is_function<R(A1,A2)>   : public true_type {};
+template <typename R, typename A1, typename A2, typename A3> struct is_function<R(A1,A2,A3)> : public true_type {};
+template <typename R, typename A1, typename A2, typename A3, typename A4> struct is_function<R(A1,A2,A3,A4)> : public true_type {};
+/* function references (Fn(&)(Args)) are also "function types" for
+ * the purposes of std::decay — they need to become pointers. */
+template <typename R> struct is_function<R(&)()>            : public true_type {};
+template <typename R, typename A1> struct is_function<R(&)(A1)>              : public true_type {};
+template <typename R, typename A1, typename A2> struct is_function<R(&)(A1,A2)>          : public true_type {};
+template <typename R> struct is_function<R(&)(...)>         : public true_type {};
+
+/* is_array for [N] / [] forms. */
+template <typename>     struct is_array                      : public false_type {};
+template <typename T>   struct is_array<T[]>                 : public true_type  {};
+template <typename T, unsigned long N> struct is_array<T[N]> : public true_type  {};
+
+template <typename T>
+struct decay
+{
+private:
+  typedef typename remove_reference<T>::type U;
+  /* Match the C++14 [meta.trans.other] decay spec step-by-step:
+   *   (a) If U is "array of unknown bound of V" or "array of known bound
+   *       of V of length N" -> result is "V*".
+   *   (b) Else if U is a function type -> result is "add_pointer<U>::type".
+   *   (c) Else result is remove_cv<U>::type.
+   *
+   * The outer `conditional` returns a metafunction class (one of the
+   * three branches above).  We pull `::type` once on that result to
+   * get the final decayed type.  NOTE: the branches deliberately do
+   * NOT already unwrap their ::type — that way the single outer
+   * unwrap is uniform for all three cases. */
+  typedef typename conditional<
+            is_array<U>::value,
+            add_pointer<typename remove_extent<U>::type>,
+            typename conditional<
+              is_function<U>::value,
+              add_pointer<U>,
+              remove_cv<U>
+            >::type
+          >::type Step;
+public:
+  typedef typename Step::type type;
+};
+
+/* ------------------- category predicates --------------------------- */
+
+template <typename T> struct is_void              : public false_type {};
+template <>           struct is_void<void>        : public true_type  {};
+template <typename T> struct is_null_pointer      : public false_type {};
+template <typename T> struct is_integral          : public false_type {};
+template <>           struct is_integral<bool>    : public true_type {};
+template <>           struct is_integral<char>    : public true_type {};
+template <>           struct is_integral<signed char>   : public true_type {};
+template <>           struct is_integral<unsigned char> : public true_type {};
+template <>           struct is_integral<short>   : public true_type {};
+template <>           struct is_integral<unsigned short> : public true_type {};
+template <>           struct is_integral<int>     : public true_type {};
+template <>           struct is_integral<unsigned int>   : public true_type {};
+template <>           struct is_integral<long>    : public true_type {};
+template <>           struct is_integral<unsigned long>  : public true_type {};
+template <>           struct is_integral<long long>       : public true_type {};
+template <>           struct is_integral<unsigned long long> : public true_type {};
+template <typename T> struct is_floating_point    : public false_type {};
+template <>           struct is_floating_point<float>  : public true_type {};
+template <>           struct is_floating_point<double> : public true_type {};
+template <>           struct is_floating_point<long double> : public true_type {};
+template <typename T> struct is_pointer           : public false_type {};
+template <typename T> struct is_pointer<T*>       : public true_type  {};
+template <typename T> struct is_lvalue_reference  : public false_type {};
+template <typename T> struct is_lvalue_reference<T&> : public true_type {};
+template <typename T> struct is_rvalue_reference  : public false_type {};
+template <typename T> struct is_rvalue_reference<T&&> : public true_type {};
+template <typename T> struct is_reference
+  : public integral_constant<bool,
+      is_lvalue_reference<T>::value || is_rvalue_reference<T>::value> {};
+template <typename T> struct is_const             : public false_type {};
+template <typename T> struct is_const<const T>    : public true_type  {};
+template <typename T> struct is_volatile          : public false_type {};
+template <typename T> struct is_volatile<volatile T> : public true_type {};
+
+template <typename T> struct is_arithmetic
+  : public integral_constant<bool,
+      is_integral<T>::value || is_floating_point<T>::value> {};
+template <typename T> struct is_fundamental
+  : public integral_constant<bool,
+      is_arithmetic<T>::value || is_void<T>::value> {};
+
+/* C++17 variable template shortcuts — Metalio mcp_server uses
+ * `if constexpr (std::is_same_v<T,int>)` style checks.  Must live
+ * below the actual trait definitions (above) since they refer to
+ * Trait<T>::value. */
+
+template <typename A, typename B>
+constexpr bool is_same_v = is_same<A,B>::value;
+
+template <typename T>
+constexpr bool is_integral_v = is_integral<T>::value;
+
+template <typename T>
+constexpr bool is_floating_point_v = is_floating_point<T>::value;
+
+template <typename T>
+constexpr bool is_arithmetic_v = is_arithmetic<T>::value;
+
+/* NOTE: is_signed / is_unsigned are not currently implemented in the
+ * shim because Metalio doesn't use the trait structs; only the _v
+ * shortcuts are provided via the generic arithmetic-int branch (we
+ * approximate signed-ness as `(T(-1) < T(0))`, which is standard and
+ * works for every integer/fp type Metalio uses). */
+
+template <typename T>
+constexpr bool is_signed_v = (T(1) > T(-1));
+
+template <typename T>
+constexpr bool is_unsigned_v = !is_signed_v<T>;
+
+template <bool B>
+constexpr bool enable_if_v = B;
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_TYPE_TRAITS_SHIM_H_ */

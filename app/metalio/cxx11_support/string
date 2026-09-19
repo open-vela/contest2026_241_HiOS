@@ -1,0 +1,108 @@
+/*
+ * apps/metalio/cxx11_support/string — adds std::to_string overloads
+ * (and eventually other missing <string> helpers) on top of the
+ * uClibc++ 0.2.x native <string> header.
+ *
+ * uClibc++'s <string> ships the std::basic_string template and the
+ * usual comparison/operator+/swap API, but it predates the C++11
+ * additions — most notably std::to_string(int/long long/unsigned/
+ * float/double) which Metalio uses in mcp_server and HTTP response
+ * builders.
+ */
+#ifndef METALIO_CXX11_STRING_SHIM_H_
+#define METALIO_CXX11_STRING_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include_next <string>       /* uClibc++ native <string> */
+
+#include <cstdio>    /* snprintf */
+#include <cstddef>   /* size_t */
+#include <cstdint>
+
+namespace std {
+
+/* Internal helper: format into a char buffer via snprintf-style fmt,
+ * then append to the resulting std::string.  Max 64 chars is enough
+ * for every integer/FP type we convert (even long long is only ~20
+ * digits). */
+template <typename... Args>
+inline string __format_to_string(const char* fmt, Args... args)
+{
+  char buf[96];
+  int n = snprintf(buf, sizeof(buf), fmt, args...);
+  if (n <= 0)       return string();
+  if ((size_t)n < sizeof(buf)) return string(buf, (size_t)n);
+  /* snprintf tells us the exact size needed; allocate exact buffer. */
+  string s;
+  s.resize((size_t)n);
+  snprintf(&s[0], (size_t)n + 1, fmt, args...);
+  return s;
+}
+
+inline string to_string(int value)                  { return __format_to_string("%d", value); }
+inline string to_string(long value)                 { return __format_to_string("%ld", value); }
+inline string to_string(long long value)            { return __format_to_string("%lld", value); }
+inline string to_string(unsigned value)             { return __format_to_string("%u", value); }
+inline string to_string(unsigned long value)        { return __format_to_string("%lu", value); }
+inline string to_string(unsigned long long value)   { return __format_to_string("%llu", value); }
+inline string to_string(float value)                { return __format_to_string("%f", (double)value); }
+inline string to_string(double value)               { return __format_to_string("%f", value); }
+inline string to_string(long double value)          { return __format_to_string("%Lf", (double)value); }
+
+/* ---- std::stoi / stol / stoll / stoul / stoull (C++11, <string>). ----
+ * uClibc++ provides no strtoll -> std::string converter; we wrap
+ * strtol/strtoul/strtoll/strtoull from <cstdlib>.  The two-argument
+ * forms (pos, base) are implemented; callers that use stoi(s) alone
+ * pass NULL for pos_ptr and default base=10.  Overflow is clamped to
+ * INT_MIN/INT_MAX rather than throwing (Metalio is -fno-exceptions);
+ * in practice this only happens when a HTTP response line is
+ * malformed, and we'd rather carry on than abort the HTTP request
+ * that is reading a chunked Content-Length or header int value. */
+#include <cstdlib>
+#include <climits>
+
+inline int stoi(const string& str, size_t* pos_ptr = 0, int base = 10)
+{
+  const char* s = str.c_str();
+  char* endp = 0;
+  long v = ::strtol(s, &endp, base);
+  if (pos_ptr) *pos_ptr = (size_t)(endp - s);
+  if (v < INT_MIN) v = INT_MIN;
+  if (v > INT_MAX) v = INT_MAX;
+  return (int)v;
+}
+inline long stol(const string& str, size_t* pos_ptr = 0, int base = 10)
+{
+  char* endp = 0;
+  long v = ::strtol(str.c_str(), &endp, base);
+  if (pos_ptr) *pos_ptr = (size_t)(endp - str.c_str());
+  return v;
+}
+inline long long stoll(const string& str, size_t* pos_ptr = 0, int base = 10)
+{
+  char* endp = 0;
+  long long v = (long long)::strtoll(str.c_str(), &endp, base);
+  if (pos_ptr) *pos_ptr = (size_t)(endp - str.c_str());
+  return v;
+}
+inline unsigned long stoul(const string& str, size_t* pos_ptr = 0, int base = 10)
+{
+  char* endp = 0;
+  unsigned long v = ::strtoul(str.c_str(), &endp, base);
+  if (pos_ptr) *pos_ptr = (size_t)(endp - str.c_str());
+  return v;
+}
+inline unsigned long long stoull(const string& str, size_t* pos_ptr = 0, int base = 10)
+{
+  char* endp = 0;
+  unsigned long long v = (unsigned long long)::strtoull(str.c_str(), &endp, base);
+  if (pos_ptr) *pos_ptr = (size_t)(endp - str.c_str());
+  return v;
+}
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_STRING_SHIM_H_ */

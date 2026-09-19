@@ -1,0 +1,18 @@
+dependencies:
+  espressif/esp_codec_dev:
+    require: public
+    version: ^1.4
+  espressif/gmf_core:
+    require: public
+    version: ^0.8
+description: Espressif GMF IO Module
+documentation: https://github.com/espressif/esp-gmf/blob/main/elements/gmf_io/README.md
+issues: https://github.com/espressif/esp-gmf/issues
+repository: git://github.com/espressif/esp-gmf.git
+repository_info:
+  commit_sha: 8cfc830248ba2c5e74381b883282a7b1afd92715
+  path: ./elements/gmf_io
+tags:
+- gmf
+url: https://github.com/espressif/esp-gmf/tree/main/elements/gmf_io
+version: 0.8.1

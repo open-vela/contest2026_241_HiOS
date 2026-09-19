@@ -1,0 +1,14 @@
+#
+# Metalio vendor overlay (sourced via apps/vendor symlink)
+#
+
+menu "Metalio Claw4 Drivers"
+
+config METALIO_VENDOR
+	bool
+	default y
+	---help---
+		Metalio Claw4 driver sources live under vendor/metalio and are
+		built through the metalio-claw-4 board package.
+
+endmenu

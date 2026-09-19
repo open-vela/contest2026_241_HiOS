@@ -1,0 +1,71 @@
+/*
+ * apps/metalio/cxx11_support/utility — C++11 <utility> extras shim
+ *
+ * uClibc++ 0.2 ships <utility> with std::pair / make_pair and the
+ * rel_ops comparison helpers, but does NOT provide:
+ *   - std::move              (C++11)
+ *   - std::forward           (C++11)
+ *
+ * We intentionally do NOT add std::swap here: uClibc++'s <algorithm>
+ * header (which is a very common transitive include on this codebase)
+ * already provides a `template <typename T> void swap(T&,T&)` in the
+ * std namespace.  Adding another definition here would cause a
+ * redefinition hard error for every TU that includes both <utility>
+ * and <algorithm> — which is the common case for Metalio's CXX code.
+ * Instead callers that need swap get it from the same header as
+ * uClibc++'s containers (i.e. <algorithm>) and the two overloads
+ * peacefully coexist as a single canonical template.
+ */
+
+#ifndef METALIO_CXX11_UTILITY_SHIM_H_
+#define METALIO_CXX11_UTILITY_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#if __has_include_next(<utility>)
+#  include_next <utility>          /* pull in uClibc++ std::pair / make_pair */
+#endif
+
+#include <type_traits>   /* shim → remove_reference plus full trait suite */
+
+namespace std
+{
+
+/* The only C++11 additions this shim adds over uClibc++'s native
+ * <utility> are std::move and std::forward.  The type-trait primitives
+ * they depend on (remove_reference) come from <type_traits>.           */
+
+/* -------------------------------------------------------------------- */
+/*  std::move                                                            */
+/* -------------------------------------------------------------------- */
+
+template <typename T>
+constexpr typename remove_reference<T>::type&&
+move(T&& t) noexcept
+{
+  return static_cast<typename remove_reference<T>::type&&>(t);
+}
+
+/* -------------------------------------------------------------------- */
+/*  std::forward (lvalue and rvalue overloads)                          */
+/* -------------------------------------------------------------------- */
+
+template <typename T>
+constexpr T&&
+forward(typename remove_reference<T>::type& t) noexcept
+{
+  return static_cast<T&&>(t);
+}
+
+template <typename T>
+constexpr T&&
+forward(typename remove_reference<T>::type&& t) noexcept
+{
+  return static_cast<T&&>(t);
+}
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_UTILITY_SHIM_H_ */

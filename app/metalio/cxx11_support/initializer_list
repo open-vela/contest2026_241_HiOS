@@ -1,0 +1,67 @@
+/*
+ * apps/metalio/cxx11_support/initializer_list — minimal C++11
+ * std::initializer_list<T> header.  The exact definition here MUST
+ * match what GCC's libstdc++ uses because brace-init-list lowering in
+ * the compiler is hard-coded to construct a struct with exactly two
+ * fields: a pointer to the backing array and a length.
+ *
+ * The layout below (first field = T const*, second = size_t) is the
+ * same as GCC's upstream <initializer_list> (and required for correct
+ * lowering in the frontend).  Any other ordering or type size causes
+ * list-initialization to misread the length / array pointer.
+ */
+#ifndef METALIO_CXX11_INITIALIZER_LIST_SHIM_H_
+#define METALIO_CXX11_INITIALIZER_LIST_SHIM_H_
+
+#ifndef CONFIG_UCLIBCXX_BUFSIZE
+#  define CONFIG_UCLIBCXX_BUFSIZE 32
+#endif
+
+#include <cstddef>      /* size_t */
+
+namespace std {
+
+  template<class _E>
+  class initializer_list
+  {
+  public:
+    typedef _E         value_type;
+    typedef const _E&  reference;
+    typedef const _E&  const_reference;
+    typedef size_t     size_type;
+    typedef const _E*  iterator;
+    typedef const _E*  const_iterator;
+
+  private:
+    iterator          _M_array;
+    size_type         _M_len;
+
+    /* The compiler calls this private constructor directly when
+     * lowering a {a, b, c} braced-init-list.  It must be a constexpr
+     * constructor with exactly these two parameters, in this order. */
+    constexpr initializer_list(const_iterator __a, size_type __l)
+      : _M_array(__a), _M_len(__l) {}
+
+  public:
+    /* Default constructor: empty list.  GCC's frontend also relies on
+     * this being constexpr in certain contexts. */
+    constexpr initializer_list() noexcept
+      : _M_array(0), _M_len(0) {}
+
+    constexpr size_type size()  const noexcept { return _M_len; }
+    constexpr const_iterator begin() const noexcept { return _M_array; }
+    constexpr const_iterator end()   const noexcept { return _M_array + _M_len; }
+  };
+
+  /* std::begin / std::end free function overloads for initializer_list.
+   * Metalio's PropertyList(vector<Property> init) won't need these,
+   * but they are cheap enough to include for correctness. */
+  template<class _Tp>
+  constexpr const _Tp* begin(initializer_list<_Tp> __il) noexcept { return __il.begin(); }
+
+  template<class _Tp>
+  constexpr const _Tp* end(initializer_list<_Tp> __il) noexcept { return __il.end(); }
+
+} /* namespace std */
+
+#endif /* METALIO_CXX11_INITIALIZER_LIST_SHIM_H_ */

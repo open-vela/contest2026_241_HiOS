@@ -1,0 +1,658 @@
+############################################################################
+# apps/metalio/audio/esp-gmf/Make.defs
+#
+# Build wiring for the ESP-GMF component port to NuttX/openvela.
+# Included by apps/metalio/Makefile when CONFIG_METALIO_ESP_GMF is enabled.
+############################################################################
+
+# ---------------------------------------------------------------------------
+# C++ standard-library include path fixup.
+#
+# On this Metalio Claw4 board the UCLIBCXX build step creates the real
+# uClibc++ headers (std::string / vector / map / functional …) and
+# installs a directory symlink at $(TOPDIR)/include/uClibc++.  NuttX's
+# central tools/Config.mk is *supposed* to inject that same path via
+# ARCHXXINCLUDES when CONFIG_UCLIBCXX=y (see tools/Config.mk line 755),
+# but on this custom configuration the UCLIBCXX path sometimes comes
+# through *after* the Metalio application's .depend scan has already
+# received ARCHXXINCLUDES with only the empty fallback wrapper at
+# include/cxx — which ships only the <cstdlib>/<cmath>/… wrappers and
+# nothing else.  The result is that Metalio's CXX sources fail at the
+# #include <string>/<functional>/<mutex>/<chrono>/<thread>/<atomic>/
+# <condition_variable>/<cstdint> stage of the MKDEP pass.
+#
+# We resolve this by prepending the UCLIBCXX include directory *as a
+# regular -I path* (which is always searched before -isystem) from
+# right here in the GMF Make.defs.  That keeps the change local to
+# the Metalio app — which is exactly the only consumer that needs
+# full C++ STL access in this configuration — and avoids tampering
+# with board-level Toolchain.defs.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CXX11 polyfills (apps/metalio/cxx11_support)
+#
+# uClibc++ 0.2.x has solid C++03 coverage (std::string / vector / map /
+# list / streams / locale) but ships ZERO of the C++11 library additions
+# Metalio depends on:
+#
+#   <type_traits>   — integral_constant / enable_if / is_same / decay / …
+#   <utility>      — std::move / std::forward / std::swap
+#   <memory>       — std::shared_ptr / std::unique_ptr / std::weak_ptr
+#                    and std::make_shared / std::default_delete
+#   <functional>   — std::function<R(Args...)> (with move/assign support)
+#
+# Our cxx11_support/ directory contains small, self-contained shims that
+# `#include_next` into the real uClibc++ headers (which live under
+# $(TOPDIR)/include/uClibc++ — see below) and then extend them with
+# exactly the C++11 surface Metalio uses.  Put this directory FIRST in
+# the -I search list so that `#include <memory>` / `#include <functional>`
+# pick up our wrappers instead of the bare uClibc++ originals.
+# ---------------------------------------------------------------------------
+CXXFLAGS += -I$(APPDIR)/metalio/cxx11_support
+
+# ---------------------------------------------------------------------------
+# uClibc++ config-macro injection.
+#
+# uClibc++'s system_configuration.h (pulled in by every container header
+# such as <vector>/<string>/<list>/<map>/<deque>/…) uses the preprocessor
+# symbol CONFIG_UCLIBCXX_BUFSIZE to size an internal scratch buffer.
+# On ESP-IDF builds this comes from Kconfig's .config; since we build
+# Metalio without pulling nuttx/.config into the metalio app makefile
+# namespace, we define it both here (for the build system) and in each
+# shim header as a fallback for hand-compiled TUs.
+# ---------------------------------------------------------------------------
+CXXFLAGS += -DCONFIG_UCLIBCXX_BUFSIZE=32
+CFLAGS   += -DCONFIG_UCLIBCXX_BUFSIZE=32
+
+# ---------------------------------------------------------------------------
+# C++ standard-library include path fixup (see block comment above).
+#
+# NOTE: we don't guard on ifeq ($(CONFIG_UCLIBCXX),y) — at the point
+# apps/metalio/audio/esp-gmf/Make.defs is pulled in by the Metalio
+# application's Makefile the CONFIG_UCLIBCXX symbol from nuttx/.config
+# is not yet propagated into this sub-Make's variable namespace on
+# some build-order paths.  Adding a nonexistent -I directory is a
+# no-op, so it is safe to always prepend.  tools/Config.mk *also*
+# tries to inject the same path via ARCHXXINCLUDES when UCLIBCXX is
+# selected — the two paths simply coexist with identical content.
+# ---------------------------------------------------------------------------
+CXXFLAGS += -I$(TOPDIR)/include/uClibc++
+CXXFLAGS += -I$(TOPDIR)/include
+
+# gmf_fft — self-contained Q15 fixed-point real FFT.
+ifeq ($(CONFIG_METALIO_GMF_FFT),y)
+CSRCS += audio/esp-gmf/components/gmf_fft/src/common/fft_heap.c
+CSRCS += audio/esp-gmf/components/gmf_fft/src/common/fft_power2_q15.c
+CSRCS += audio/esp-gmf/components/gmf_fft/src/esp_c/gmf_fft_radix2_dit_s16.c
+
+CFLAGS += -I$(APPDIR)/metalio/audio/esp-gmf/components/gmf_fft/include
+CXXFLAGS += -I$(APPDIR)/metalio/audio/esp-gmf/components/gmf_fft/include
+endif
+
+# ---------------------------------------------------------------------------
+# gmf_io — I/O element implementations on top of gmf_core.
+#
+# The HTTP I/O element (esp_gmf_io_http.c) was designed around ESP-IDF's
+# esp_http_client.  On OpenVela we substitute a small, self-contained
+# BSD-sockets-based adapter living under nuttx_http_adapter/ and expose it
+# via the shim header esp_http_client.h under nuttx_shims/.
+#
+# The file I/O (esp_gmf_io_file.c) and embedded-flash I/O
+# (esp_gmf_io_embed_flash.c) elements are compiled verbatim — they only use
+# fopen/fread/fwrite/fflush/fclose/stat (NuttX libc) and the gmf_core
+# include/source helpers.
+#
+# The gzip helper (http_lib/gzip/gzip_miniz.c) uses tinfl/tdefl from the
+# ESP-ROM miniz.h (forwarded via nuttx_shims/miniz.h) to inflate response
+# bodies encoded with Content-Encoding: gzip.
+# ---------------------------------------------------------------------------
+ifeq ($(CONFIG_METALIO_GMF_IO),y)
+
+GMF_IO_ROOT        = audio/esp-gmf/components/gmf_io
+GMF_HTTP_ADAPTER   = audio/esp-gmf/nuttx_http_adapter
+GMF_SHIMS_ROOT     = audio/esp-gmf/nuttx_shims
+
+# ------ include paths ------
+#
+#   Shims first, then gmf_io public headers, then http_lib/gzip (for
+#   gzip_miniz.h) and finally the include paths required by the upstream
+#   gmf_io sources (gmf_core headers are added by the GMF_CORE block above).
+#
+#   The ESP-ROM miniz.h header references "esp_rom_caps.h", which lives in
+#   a chip-specific subdirectory under components/esp_rom/. The nuttx_shims
+#   miniz.h forwards to the ESP32-P4 ROM miniz.h, so include that chip's
+#   esp_rom_caps.h directory on the build path.
+
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_SHIMS_ROOT)
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_IO_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_IO_ROOT)/http_lib/gzip/include
+CFLAGS   += -I$(TOPDIR)/arch/risc-v/src/esp32p4/esp-hal-3rdparty/components/esp_rom/esp32p4
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_SHIMS_ROOT)
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_IO_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_IO_ROOT)/http_lib/gzip/include
+CXXFLAGS += -I$(TOPDIR)/arch/risc-v/src/esp32p4/esp-hal-3rdparty/components/esp_rom/esp32p4
+
+# ------ NuttX HTTP adapter -------------------------------------------------
+CSRCS += $(GMF_HTTP_ADAPTER)/nuttx_http_adapter.c
+
+# ------ gmf_io core elements ----------------------------------------------
+# HTTP + file + embedded-flash IO elements are all required for HLS
+# streaming (esp_hls_stream reads media segments over HTTP via
+# esp_gmf_io_http and writes temporary files / in-memory blobs).  The
+# codec_dev element requires esp_codec_dev headers that ship with the
+# esp_codec_dev component (ported separately), so guard it behind its
+# own Kconfig knob and leave off by default.
+CSRCS += $(GMF_IO_ROOT)/esp_gmf_io_http.c
+CSRCS += $(GMF_IO_ROOT)/esp_gmf_io_file.c
+CSRCS += $(GMF_IO_ROOT)/esp_gmf_io_embed_flash.c
+ifeq ($(CONFIG_METALIO_GMF_IO_CODEC_DEV),y)
+CSRCS += $(GMF_IO_ROOT)/codec_dev_io/esp_gmf_io_codec_dev.c
+endif
+ifeq ($(CONFIG_METALIO_GMF_IO_I2S_PDM),y)
+CSRCS += $(GMF_IO_ROOT)/esp_gmf_io_i2s_pdm.c
+endif
+
+# ------ http_lib helper libraries -----------------------------------------
+# gzip decompression helper used by esp_gmf_io_http.c.
+CSRCS += $(GMF_IO_ROOT)/http_lib/gzip/gzip_miniz.c
+
+# ------ VPATH entries ------------------------------------------------------
+VPATH += :audio/esp-gmf/nuttx_http_adapter
+VPATH += :audio/esp-gmf/components/gmf_io
+VPATH += :audio/esp-gmf/components/gmf_io/http_lib/gzip
+VPATH += :audio/esp-gmf/components/gmf_io/codec_dev_io
+
+# ------ warning suppression for upstream code -----------------------------
+CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
+CFLAGS += -Wno-format -Wno-incompatible-pointer-types -Wno-int-conversion
+
+endif
+
+# ---------------------------------------------------------------------------
+# gmf_core — the foundational GMF pipeline framework.
+#
+# Source files are compiled verbatim from the upstream component (data_bus/,
+# src/, helpers/). The original FreeRTOS-based OAL (oal/*.c) is NOT compiled;
+# instead, NuttX pthread-based replacements from nuttx_oal/ are used.
+#
+# The nuttx_shims/ directory provides redirect headers that map ESP-IDF and
+# FreeRTOS includes to the project's existing shim headers.
+# ---------------------------------------------------------------------------
+ifeq ($(CONFIG_METALIO_GMF_CORE),y)
+
+GMF_CORE_ROOT = audio/esp-gmf/components/gmf_core
+GMF_SHIMS_ROOT = audio/esp-gmf/nuttx_shims
+GMF_NUTTX_OAL = audio/esp-gmf/nuttx_oal
+
+# Include paths (shims FIRST so redirect headers take priority)
+CFLAGS += -I$(APPDIR)/metalio/$(GMF_SHIMS_ROOT)
+CFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_ROOT)/include
+CFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_ROOT)/data_bus/include
+CFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_ROOT)/helpers/include
+CFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_ROOT)/oal/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_SHIMS_ROOT)
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_ROOT)/data_bus/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_ROOT)/helpers/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_ROOT)/oal/include
+
+# NuttX OAL replacements (pthread-based, replaces FreeRTOS OAL)
+CSRCS += $(GMF_NUTTX_OAL)/esp_gmf_oal_thread.c
+CSRCS += $(GMF_NUTTX_OAL)/esp_gmf_oal_mutex.c
+CSRCS += $(GMF_NUTTX_OAL)/esp_gmf_oal_sys.c
+CSRCS += $(GMF_NUTTX_OAL)/esp_gmf_oal_mem.c
+
+# gmf_core data_bus sources
+CSRCS += $(GMF_CORE_ROOT)/data_bus/esp_gmf_block.c
+CSRCS += $(GMF_CORE_ROOT)/data_bus/esp_gmf_data_bus.c
+CSRCS += $(GMF_CORE_ROOT)/data_bus/esp_gmf_fifo.c
+CSRCS += $(GMF_CORE_ROOT)/data_bus/esp_gmf_new_databus.c
+CSRCS += $(GMF_CORE_ROOT)/data_bus/esp_gmf_pbuf.c
+CSRCS += $(GMF_CORE_ROOT)/data_bus/esp_gmf_ringbuffer.c
+
+# gmf_core src sources
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_audio_element.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_cap.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_element.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_event.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_io.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_node.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_obj.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_payload.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_pic_element.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_pipeline.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_pool.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_port.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_task.c
+CSRCS += $(GMF_CORE_ROOT)/src/esp_gmf_video_element.c
+
+# gmf_core helpers sources
+CSRCS += $(GMF_CORE_ROOT)/helpers/esp_gmf_uri_parser.c
+
+# VPATH for source directories
+VPATH += :audio/esp-gmf/nuttx_oal
+VPATH += :audio/esp-gmf/components/gmf_core/data_bus
+VPATH += :audio/esp-gmf/components/gmf_core/src
+VPATH += :audio/esp-gmf/components/gmf_core/helpers
+
+# Suppress warnings in upstream gmf_core code
+CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
+CFLAGS += -Wno-format -Wno-incompatible-pointer-types -Wno-int-conversion
+
+endif
+
+# ---------------------------------------------------------------------------
+# media_lib_sal — OS/socket/TLS abstraction used by esp_extractor and
+# esp_hls_stream.  The upstream component ships a registration-based
+# dispatcher (media_lib_os.c / media_lib_socket.c / media_lib_tls.c /
+# media_lib_crypt.c / media_lib_netif.c / media_lib_adapter.c /
+# media_lib_common.c) and a FreeRTOS ESP-IDF adapter (port/).
+# On OpenVela we compile the dispatcher sources verbatim, but instead of
+# the FreeRTOS adapter we install a custom pthread/sem_t/nxevent-based
+# adapter from nuttx_media_lib_adapter/media_lib_os_nuttx.c.
+#
+# The mem_trace/ sources are optional heap-tracing helpers; leave them
+# off to save size (no code in esp_hls_stream depends on them).
+# ---------------------------------------------------------------------------
+ifeq ($(CONFIG_METALIO_GMF_HLS),y)
+
+MLS_ROOT    = audio/esp-gmf/components/media_lib_sal
+MLS_NUTTX   = audio/esp-gmf/nuttx_media_lib_adapter
+GMF_SHIMS   = audio/esp-gmf/nuttx_shims
+
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CFLAGS   += -I$(APPDIR)/metalio/$(MLS_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(MLS_ROOT)/include/port
+CFLAGS   += -I$(APPDIR)/metalio/$(MLS_NUTTX)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CXXFLAGS += -I$(APPDIR)/metalio/$(MLS_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(MLS_ROOT)/include/port
+CXXFLAGS += -I$(APPDIR)/metalio/$(MLS_NUTTX)/include
+
+# Dispatcher (registration) sources — these are the function tables that
+# higher-level code calls through (e.g. media_lib_malloc → registered malloc).
+# The HLS path only touches the OS vtable (malloc/free/threads/…) via
+# media_lib_os.c; the socket/TLS/crypt/netif subsystems are NOT used by
+# esp_hls_stream (it reads HTTP via gmf_io, not media_lib_socket; AES-128
+# decryption lives inside libhls_lib.a and uses its own AES impl).
+# Leave socket/tls/crypt/netif dispatchers and their default adapters off
+# to avoid pulling in mbedtls/lwip/psa deps we don't ship yet.  They can
+# be added later when another component (e.g. RTSP) actually needs them.
+CSRCS += $(MLS_ROOT)/media_lib_adapter.c
+CSRCS += $(MLS_ROOT)/media_lib_common.c
+CSRCS += $(MLS_ROOT)/media_lib_os.c
+
+# (Not compiled until needed:
+#   CSRCS += $(MLS_ROOT)/media_lib_socket.c
+#   CSRCS += $(MLS_ROOT)/media_lib_tls.c
+#   CSRCS += $(MLS_ROOT)/media_lib_crypt.c
+#   CSRCS += $(MLS_ROOT)/media_lib_netif.c
+#   CSRCS += $(MLS_ROOT)/port/media_lib_crypt_default.c
+#   CSRCS += $(MLS_ROOT)/port/media_lib_netif_default.c
+#   CSRCS += $(MLS_ROOT)/port/media_lib_socket_default.c
+#   CSRCS += $(MLS_ROOT)/port/media_lib_tls_default.c
+# )
+
+# Our NuttX pthread-based OS adapter — overrides the OS vtable via
+# media_lib_os_nuttx_install() which callers run at startup.
+CSRCS += $(MLS_NUTTX)/media_lib_os_nuttx.c
+
+# AES stub adapter — libhls_lib.a references the media_lib_aes_* dispatcher
+# symbols unconditionally; provide explicit not-supported stubs so plain
+# HTTP / unencrypted HLS links without pulling in an ESP-IDF crypto stack.
+CSRCS += $(MLS_NUTTX)/media_lib_crypt_nuttx.c
+
+VPATH += :audio/esp-gmf/components/media_lib_sal
+VPATH += :audio/esp-gmf/components/media_lib_sal/port
+VPATH += :audio/esp-gmf/nuttx_media_lib_adapter
+
+CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
+CFLAGS += -Wno-format -Wno-incompatible-pointer-types -Wno-int-conversion
+
+endif
+
+# ---------------------------------------------------------------------------
+# esp_extractor — the generic extractor / demuxer framework that HLS
+# extractor (and later MP3/AAC/MP4/WAV extractors) plug into.  Provides
+# esp_extractor_register() / open() / read() / close() and the stream-
+# info / ctrl abstractions.
+# ---------------------------------------------------------------------------
+ifeq ($(CONFIG_METALIO_GMF_HLS),y)
+
+EXP_ROOT = audio/esp-gmf/components/esp_extractor
+GMF_SHIMS = audio/esp-gmf/nuttx_shims
+
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CFLAGS   += -I$(APPDIR)/metalio/$(EXP_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(EXP_ROOT)/include/reg
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CXXFLAGS += -I$(APPDIR)/metalio/$(EXP_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(EXP_ROOT)/include/reg
+
+CSRCS += $(EXP_ROOT)/src/esp_extractor_reg.c
+CSRCS += $(EXP_ROOT)/src/esp_extractor_id3_parser.c
+CSRCS += $(EXP_ROOT)/src/extractor_sys.c
+CSRCS += $(EXP_ROOT)/src/data_cache.c
+
+VPATH += :audio/esp-gmf/components/esp_extractor/src
+
+CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
+CFLAGS += -Wno-format -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-undef
+
+endif
+
+# ---------------------------------------------------------------------------
+# esp_hls_stream — Espressif's HLS (HTTP Live Streaming) demuxer /
+# playlist fetcher.  The component combines:
+#   (a) three small C sources under src/ (hls_io.c / hls_helper.c /
+#       hls_io_helper.c) which bridge the GMF pipeline / extractor
+#       abstractions to
+#   (b) a prebuilt, chip-specific static library
+#       libs/esp32p4/libhls_lib.a containing the m3u8 parser, playlist
+#       manager, media-segment fetcher, and AES-128 decryption logic.
+#
+# To link the prebuilt .a we add its directory via EXTRA_LIBPATHS and
+# pull in the archive with EXTRA_LIBS.  Because the NuttX link step
+# collects EXTRA_LIBS last we also add -lhls to LDFLAGS explicitly via
+# the metalio Makefile's EXTRAFLAGS mechanism.
+# ---------------------------------------------------------------------------
+ifeq ($(CONFIG_METALIO_GMF_HLS),y)
+
+HLS_ROOT   = audio/esp-gmf/components/esp_hls_stream
+GMF_SHIMS  = audio/esp-gmf/nuttx_shims
+GMF_CORE_R = audio/esp-gmf/components/gmf_core
+MLS_R      = audio/esp-gmf/components/media_lib_sal
+EXP_R      = audio/esp-gmf/components/esp_extractor
+
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CFLAGS   += -I$(APPDIR)/metalio/$(HLS_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(HLS_ROOT)/private_inc
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_CORE_R)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_CORE_R)/data_bus/include
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_CORE_R)/helpers/include
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_CORE_R)/oal/include
+CFLAGS   += -I$(APPDIR)/metalio/$(MLS_R)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(EXP_R)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CXXFLAGS += -I$(APPDIR)/metalio/$(HLS_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(HLS_ROOT)/private_inc
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_R)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_R)/data_bus/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_R)/helpers/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_CORE_R)/oal/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(MLS_R)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(EXP_R)/include
+
+# (a) three source files
+CSRCS += $(HLS_ROOT)/src/hls_io.c
+CSRCS += $(HLS_ROOT)/src/hls_helper.c
+CSRCS += $(HLS_ROOT)/src/hls_io_helper.c
+
+# (b) chip-specific prebuilt library — final nuttx link only auto-picks
+#     apps/staging/*.a (see arch/.../Makefile). Symlink + keep -l for modules.
+HLS_LIBDIR = $(APPDIR)/metalio/$(HLS_ROOT)/libs/esp32p4
+$(shell mkdir -p $(APPDIR)/staging; \
+  ln -sfn ../metalio/$(HLS_ROOT)/libs/esp32p4/libhls_lib.a $(APPDIR)/staging/libhls_lib.a)
+EXTRA_LIBPATHS += -L$(HLS_LIBDIR)
+EXTRA_LIBS     += -lhls_lib
+
+VPATH += :audio/esp-gmf/components/esp_hls_stream/src
+
+CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
+CFLAGS += -Wno-format -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-undef
+
+endif
+
+# ---------------------------------------------------------------------------
+# esp_audio_codec — the Espressif audio codec registry + prebuilt decoder
+# and simple-decoder libraries.  This is where the actual MP3/AAC/FLAC/OPUS
+# soft-decoder RISC-V implementations live:
+#
+#   libesp_audio_codec.a        — per-codec decoders (MP3 / AAC-LC / ADPCM
+#                                 / ALAC / AMR-NB / AMR-WB / FLAC / G711 /
+#                                 G722 / LC3 / Opus / PCM / SBC / Vorbis)
+#                                 + encoder variants
+#   libesp_audio_simple_dec.a   — container parsers (WAV / M4A / OGG / TS)
+#
+# The three small sources under src/ implement the plugin registry:
+# audio_decoder_reg.c registers every decoder type in the prebuilt
+# library, simple_decoder_reg.c registers the container parsers, and
+# audio_encoder_reg.c registers the encoders.  They are all tiny glue
+# C files around the plugin-registry mechanism exposed by the public
+# headers under include/decoder and include/simple_dec.
+# ---------------------------------------------------------------------------
+ifeq ($(CONFIG_METALIO_GMF_CODEC),y)
+
+EAC_ROOT = audio/esp-gmf/components/esp_audio_codec
+GMF_SHIMS = audio/esp-gmf/nuttx_shims
+
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/decoder
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/decoder/impl
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/encoder
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/encoder/impl
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/simple_dec
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/decoder
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/decoder/impl
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/encoder
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/encoder/impl
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/simple_dec
+
+CSRCS += $(EAC_ROOT)/src/audio_decoder_reg.c
+CSRCS += $(EAC_ROOT)/src/audio_encoder_reg.c
+CSRCS += $(EAC_ROOT)/src/simple_decoder_reg.c
+
+# Prebuilt chip-specific archives (RV32 IMAC). Final nuttx link only
+# auto-picks apps/staging/*.a — symlink required archives there.
+EAC_LIBDIR = $(APPDIR)/metalio/$(EAC_ROOT)/lib/esp32p4
+EAC_STAGED = libesp_audio_codec.a libesp_audio_simple_dec.a
+$(shell mkdir -p $(APPDIR)/staging; \
+  for f in $(EAC_STAGED); do \
+    ln -sfn ../metalio/$(EAC_ROOT)/lib/esp32p4/$$f $(APPDIR)/staging/$$f; \
+  done)
+EXTRA_LIBPATHS += -L$(EAC_LIBDIR)
+EXTRA_LIBS     += -lesp_audio_codec -lesp_audio_simple_dec
+
+VPATH += :audio/esp-gmf/components/esp_audio_codec/src
+
+CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
+CFLAGS += -Wno-format -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-undef
+
+endif
+
+# ---------------------------------------------------------------------------
+# esp_codec_dev — codec device HAL (chip-level I²C/I²S/gpio drivers +
+# OS primitives + software volume control).
+#
+# For Metalio Claw4 we compile a minimal subset: the four core files
+# (esp_codec_dev.c / esp_codec_dev_if.c / esp_codec_dev_vol.c /
+# audio_codec_sw_vol.c), the OS-primitive helper (esp_codec_dev_os.c
+# — vTaskDelay / mutex wrappers, portable thanks to our FreeRTOS shim)
+# AND the "dummy" codec driver (device/dummy/dummy_codec.c) which acts
+# as a no-op sink/source that simply accepts the sample rate / channel
+# / bits configuration and trusts that whoever opens the corresponding
+# data interface already knows how to move PCM samples around.
+#
+# The reason we do NOT compile platform/audio_codec_data_i2s.c or
+# platform/audio_codec_ctrl_i2c.c (or any of the 16 real codec chip
+# drivers) is that Metalio routes all PCM via NuttX's
+# /dev/audio/pcm_out0 / /dev/audio/pcm_in0 character devices through
+# the MetalioAudioCodec service — NOT via ESP-IDF's driver/i2s + a
+# specific ES8311/ES8388 codec wired over I²C/gpio.  Higher layers
+# (esp_audio_simple_player, radio_screen) will register custom
+# audio_codec_data_if_t callbacks that read/write /dev/audio/pcm*.
+# ---------------------------------------------------------------------------
+ifeq ($(CONFIG_METALIO_GMF_CODEC),y)
+
+ECD_ROOT    = audio/esp-gmf/components/esp_codec_dev
+GMF_SHIMS   = audio/esp-gmf/nuttx_shims
+
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CFLAGS   += -I$(APPDIR)/metalio/$(ECD_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(ECD_ROOT)/interface
+CFLAGS   += -I$(APPDIR)/metalio/$(ECD_ROOT)/device/include
+CFLAGS   += -I$(APPDIR)/metalio/$(ECD_ROOT)/device/priv_include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CXXFLAGS += -I$(APPDIR)/metalio/$(ECD_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(ECD_ROOT)/interface
+CXXFLAGS += -I$(APPDIR)/metalio/$(ECD_ROOT)/device/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(ECD_ROOT)/device/priv_include
+
+# — core
+CSRCS += $(ECD_ROOT)/esp_codec_dev.c
+CSRCS += $(ECD_ROOT)/esp_codec_dev_if.c
+CSRCS += $(ECD_ROOT)/esp_codec_dev_vol.c
+CSRCS += $(ECD_ROOT)/audio_codec_sw_vol.c
+# — OS primitives (FreeRTOS shim based)
+CSRCS += $(ECD_ROOT)/platform/esp_codec_dev_os.c
+# — dummy codec chip driver (no-op, accepts any rate/ch/bits)
+CSRCS += $(ECD_ROOT)/device/dummy/dummy_codec.c
+
+VPATH += :audio/esp-gmf/components/esp_codec_dev
+VPATH += :audio/esp-gmf/components/esp_codec_dev/platform
+VPATH += :audio/esp-gmf/components/esp_codec_dev/device/dummy
+
+CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
+CFLAGS += -Wno-format -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-undef
+
+endif
+
+# ---------------------------------------------------------------------------
+# gmf_audio — the GMF audio processing elements that bridge
+# esp_extractor / esp_audio_codec / esp_audio_effects onto the shared
+# GMF pipeline (esp_gmf_audio_dec reads demuxed frames via the
+# extractor, runs them through esp_audio_codec, and writes PCM out
+# its output port; effects/bit-cvt/channel-cvt/fade/eq/… elements
+# provide DSP).  Currently we only compile the core four (decode /
+# encode / helper / param setup) because they're the required
+# plumbing for esp_audio_simple_player; DSP effects can be enabled
+# individually later if equalization / DRC is desired on the Claw4
+# speaker path.
+# ---------------------------------------------------------------------------
+ifeq ($(CONFIG_METALIO_GMF_CODEC),y)
+
+GMA_ROOT  = audio/esp-gmf/components/gmf_audio
+GMF_SHIMS = audio/esp-gmf/nuttx_shims
+EAC_ROOT2 = audio/esp-gmf/components/esp_audio_codec
+ECD_ROOT2 = audio/esp-gmf/components/esp_codec_dev
+CORE_ROOT = audio/esp-gmf/components/gmf_core
+
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CFLAGS   += -I$(APPDIR)/metalio/$(GMA_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(GMA_ROOT)/private_include
+CFLAGS   += -I$(APPDIR)/metalio/$(CORE_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(CORE_ROOT)/data_bus/include
+CFLAGS   += -I$(APPDIR)/metalio/$(CORE_ROOT)/helpers/include
+CFLAGS   += -I$(APPDIR)/metalio/$(CORE_ROOT)/oal/include
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT2)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT2)/include/decoder
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT2)/include/decoder/impl
+CFLAGS   += -I$(APPDIR)/metalio/$(ECD_ROOT2)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(ECD_ROOT2)/interface
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMA_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMA_ROOT)/private_include
+CXXFLAGS += -I$(APPDIR)/metalio/$(CORE_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(CORE_ROOT)/data_bus/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(CORE_ROOT)/helpers/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(CORE_ROOT)/oal/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT2)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT2)/include/decoder
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT2)/include/decoder/impl
+CXXFLAGS += -I$(APPDIR)/metalio/$(ECD_ROOT2)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(ECD_ROOT2)/interface
+
+# Minimal subset: decode + encode (element glue for player/recorder
+# round-tripping) + audio helper + audio param setup.  The rest
+# (EQ/DRC/RateCvt/… DSP) is skipped for size until needed.
+CSRCS += $(GMA_ROOT)/esp_gmf_audio_dec.c
+CSRCS += $(GMA_ROOT)/esp_gmf_audio_enc.c
+CSRCS += $(GMA_ROOT)/esp_gmf_audio_helper.c
+CSRCS += $(GMA_ROOT)/esp_gmf_audio_param.c
+
+VPATH += :audio/esp-gmf/components/gmf_audio
+
+CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
+CFLAGS += -Wno-format -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-undef
+
+endif
+
+# ---------------------------------------------------------------------------
+# esp_audio_simple_player — the high-level "give me a URL and play it"
+# wrapper that builds a GMF pipeline (IO -> audio_dec -> output) under
+# the hood.  It depends on gmf_core (pool / pipeline / element / databus),
+# gmf_audio (audio_dec element + helper), esp_audio_codec (decoder
+# registry + default decoders) and esp_codec_dev (codec device HAL).
+# All of those are pulled in by CONFIG_METALIO_GMF_CODEC above, so we
+# reuse the same guard.  The three upstream sources are compiled
+# verbatim — they only use the public GMF / codec APIs already on the
+# include path.
+#
+# radio_screen wires this component into the real HLS playback path:
+#   esp_audio_simple_player_run(handle, "https://.../stream.m3u8", NULL)
+# sets up the HLS -> AAC/MP3 decode -> PCM pipeline, and the cfg.out.cb
+# callback receives decoded PCM frames which feed the FFT spectrum
+# visualizer (see SpectrumTask in radio_screen.cxx).
+# ---------------------------------------------------------------------------
+ifeq ($(CONFIG_METALIO_GMF_CODEC),y)
+
+ASP_ROOT  = audio/esp-gmf/components/esp_audio_simple_player
+GMF_SHIMS = audio/esp-gmf/nuttx_shims
+CORE_ROOT = audio/esp-gmf/components/gmf_core
+GMA_ROOT  = audio/esp-gmf/components/gmf_audio
+EAC_ROOT  = audio/esp-gmf/components/esp_audio_codec
+ECD_ROOT  = audio/esp-gmf/components/esp_codec_dev
+
+# Include paths (shims FIRST so redirect headers take priority).  The
+# src/ directory is on the path because esp_audio_simple_player.c
+# includes its private headers (esp_audio_simple_player_private.h and
+# audio_simple_player_pool.h) co-located in src/.
+CFLAGS   += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CFLAGS   += -I$(APPDIR)/metalio/$(ASP_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(ASP_ROOT)/src
+CFLAGS   += -I$(APPDIR)/metalio/$(CORE_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(CORE_ROOT)/data_bus/include
+CFLAGS   += -I$(APPDIR)/metalio/$(CORE_ROOT)/helpers/include
+CFLAGS   += -I$(APPDIR)/metalio/$(CORE_ROOT)/oal/include
+CFLAGS   += -I$(APPDIR)/metalio/$(GMA_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(GMA_ROOT)/private_include
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/decoder
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/decoder/impl
+CFLAGS   += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/simple_dec
+CFLAGS   += -I$(APPDIR)/metalio/$(ECD_ROOT)/include
+CFLAGS   += -I$(APPDIR)/metalio/$(ECD_ROOT)/interface
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_SHIMS)
+CXXFLAGS += -I$(APPDIR)/metalio/$(ASP_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(ASP_ROOT)/src
+CXXFLAGS += -I$(APPDIR)/metalio/$(CORE_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(CORE_ROOT)/data_bus/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(CORE_ROOT)/helpers/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(CORE_ROOT)/oal/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMA_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(GMA_ROOT)/private_include
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/decoder
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/decoder/impl
+CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/simple_dec
+CXXFLAGS += -I$(APPDIR)/metalio/$(ECD_ROOT)/include
+CXXFLAGS += -I$(APPDIR)/metalio/$(ECD_ROOT)/interface
+
+# Upstream sources — compiled verbatim.
+CSRCS += $(ASP_ROOT)/src/esp_audio_simple_player.c
+CSRCS += $(ASP_ROOT)/src/esp_audio_simple_player_advance.c
+CSRCS += $(ASP_ROOT)/src/audio_simple_player_pool.c
+
+# VPATH + DEPPATH for the source directory (so the build can locate the
+# .c files referenced above by relative path, and so the .depend scan
+# picks up the private headers co-located in src/).
+VPATH   += :audio/esp-gmf/components/esp_audio_simple_player/src
+DEPPATH += --dep-path audio/esp-gmf/components/esp_audio_simple_player/src
+
+CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
+CFLAGS += -Wno-format -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-undef
+
+endif
