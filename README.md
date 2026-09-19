@@ -2,14 +2,14 @@
 
 ## 一、作品简介
 
-将 **Metalio Claw4**（ESP32-P4 主控 + ESP32-C5 协处理器）AI 硬件完整移植到 **openvela**（dev-ai-contest-2026）操作系统，交付一套从底层 BSP、驱动到上层应用的端到端适配：
+将 **Metalio Claw4**（ESP32-P4 主控 + ESP32-C5 协处理器）AI 硬件完整移植到 **openvela**（trunk-5.5）操作系统，交付一套从底层 BSP、驱动到上层应用的端到端适配：
 
 - **板级 BSP**：在 openvela / NuttX 上新增 `metalio-claw-4` 板卡，提供 5 套配置（`nsh` / `wifi` / `lvgl` / `ai` / `i2c`）与完整 pin-map。
 - **设备驱动**：TCA9555（GPIO 扩展）、BQ27220（电量计）、NU1680、NV3051F（720×720 显示）、GT911（触摸）、SD、GPS、I2S / BT 音频、摄像头、双网络切换、OTA/待机等 15+ 驱动。
 - **应用层**：`apps/metalio` POSIX 应用 —— OpenClaw 客户端、本地对话、网络服务、MCP、UI、音频、i18n 等。
 - **联网方案**：ESP-Hosted Wi-Fi（P4↔C5 SDIO），实现 host 侧 `wlan0` 网络栈。
 
-亮点：ESP32-P4 芯片/板卡支持从 Apache NuttX master 回移植；针对 openvela dev-ai-contest-2026 的 HAL API 漂移（`nxtask_init`→posix_spawn 化、rv32 无 64 位原子等）做了源码级修复并记录于 `docs/porting/acceptance.md`。
+亮点：ESP32-P4 芯片/板卡支持从 Apache NuttX master 回移植；针对 openvela trunk-5.5 的 HAL API 漂移（`nxtask_init`→posix_spawn 化、rv32 无 64 位原子等）做了源码级修复并记录于 `docs/porting/acceptance.md`。
 
 ## 二、选题方向
 
@@ -37,7 +37,7 @@
 
 ## 四、运行方式
 
-前置：openvela dev-ai-contest-2026 工程已 `repo init` + `repo sync`；RISC-V 工具链（`riscv32-esp-elf` 14.2，位于 `~/.espressif`）与 `esptool.py` 已安装。
+前置：openvela trunk-5.5 工程已 `repo init` + `repo sync`；RISC-V 工具链（`riscv32-esp-elf` 14.2，位于 `~/.espressif`）与 `esptool.py` 已安装。
 
 ```bash
 # 工具链
