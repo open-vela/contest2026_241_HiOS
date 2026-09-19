@@ -11,7 +11,7 @@
 
 ## Baseline
 
-- openvela manifests: `tags/trunk-5.5.xml` (Gitee)
+- openvela manifests: `tags/dev-ai-contest-2026.xml` (Gitee)
 - ESP32-P4 chip/board support backported from Apache NuttX master
 - Networking priority: ESP-Hosted Wi-Fi (P4↔C5 SDIO)
 

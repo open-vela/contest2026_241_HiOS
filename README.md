@@ -30,11 +30,11 @@
 
 软链映射（见 `contest2026_241_HiOS.xml`）：
 
-| 本仓目录 | 映射到 openvela 编译树 |
-| --- | --- |
+| 本仓目录               | 映射到 openvela 编译树                       |
+| ---------------------- | -------------------------------------------- |
 | `board/metalio-claw-4` | `nuttx/boards/risc-v/esp32p4/metalio-claw-4` |
-| `vendor/metalio` | `vendor/metalio` |
-| `app/metalio` | `apps/metalio` |
+| `vendor/metalio`       | `vendor/metalio`                             |
+| `app/metalio`          | `apps/metalio`                               |
 
 ## 四、运行方式
 
@@ -42,12 +42,12 @@
 
 ### 环境准备
 
-| 工具 | 用途 |
-|------|------|
-| `make` | NuttX 编译 |
+| 工具                                     | 用途            |
+| ---------------------------------------- | --------------- |
+| `make`                                   | NuttX 编译      |
 | `riscv32-esp-elf` 14.2（`~/.espressif`） | RISC-V 交叉编译 |
-| `esptool.py` | 烧录 ESP32-P4 |
-| `python3` + `pyserial` | 抓取串口日志 |
+| `esptool.py`                             | 烧录 ESP32-P4   |
+| `python3` + `pyserial`                   | 抓取串口日志    |
 
 ```bash
 pip install esptool pyserial
