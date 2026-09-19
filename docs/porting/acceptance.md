@@ -1,7 +1,7 @@
 # Metalio Claw4 openvela Port — Acceptance Checklist
 
 ## Phase 0 — Tree / Toolchain
-- [x] openvela trunk-5.5 synced (nuttx/apps/build/docs/vendor)
+- [x] openvela dev-ai-contest-2026 synced (nuttx/apps/build/docs/vendor)
 - [x] ESP32-P4 backported from apache/nuttx
 - [x] `third_party/MetalioClaw4` reference tree present
 - [x] RISC-V toolchain + esptool installed (riscv32-esp-elf 14.2.0 @ `~/.espressif`; `esptool.py`)
@@ -28,7 +28,7 @@ Four link blockers found during first full build; three fixed in-tree:
 - [x] CMake build path (`build.sh --cmake`) omitted all Metalio vendor drivers from
       `src/CMakeLists.txt` → would fail to link `metalio_*_initialize`. Fixed by mirroring
       `src/Make.defs` in `src/CMakeLists.txt`.
-- [x] **HAL API drift vs openvela trunk-5.5** (surfaced once the right toolchain + HAL clone
+- [x] **HAL API drift vs openvela dev-ai-contest-2026** (surfaced once the right toolchain + HAL clone
       were in place): `nxtask_init()` migrated to posix_spawn-based signature; `O_NONBLOCK` /
       `F_SETFL` not visible without `<fcntl.h>`; `__atomic_fetch_or_8` undefined because
       riscv32-esp-elf ships no libatomic.a and rv32imac has no 64-bit atomics. Fixed in
