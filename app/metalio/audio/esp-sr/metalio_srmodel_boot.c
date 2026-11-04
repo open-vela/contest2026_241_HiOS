@@ -1,6 +1,7 @@
 /*
  * Boot-time srmodels.bin loader for Metalio / NuttX.
- * Embeds Claw4 wakeword/srmodels.bin and exposes LoadMetalioSrModels().
+ * Embeds the offline Hi openvela MN7 English command package and exposes
+ * LoadMetalioSrModels(). The original Claw4 WakeNet package is kept separately.
  */
 
 #include "model_path.h"

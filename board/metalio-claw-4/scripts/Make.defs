@@ -78,5 +78,12 @@ EXTRALINKCMDS += --wrap=dl_nn_bzero
 EXTRALINKCMDS += --wrap=bzero
 # P4 SR memcpy hard-locks on SPIRAM destinations (sigmoid_table fallback).
 EXTRALINKCMDS += --wrap=dl_nn_memcpy
+# MN7 activation tables use this P4 entry point directly.
+EXTRALINKCMDS += --wrap=dl_esp32p4_sr_memcpy
 # ROM mem* hang on SPIRAM; memset is SPIRAM-aware (see metalio_psram_memcpy.ld).
 EXTRALINKCMDS += -T$(TOPDIR)/boards/risc-v/esp32p4/metalio-claw-4/scripts/metalio_psram_memcpy.ld
+
+ifeq ($(CONFIG_SMP),y)
+# App-process defaults; explicit system/I/O/neural affinity is preserved.
+EXTRALINKCMDS += --wrap=pthread_create
+endif

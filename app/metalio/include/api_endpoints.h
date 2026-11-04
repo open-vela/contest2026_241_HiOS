@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <cstdlib>
+#include "settings.h"
 
 /* Set to 1 to print HTTP request URL, body and response at the OpenClaw
  * call sites. */
@@ -161,6 +163,21 @@ constexpr const char *kGpsStaticMap =
 /* URL builders                                                        */
 /* ------------------------------------------------------------------ */
 
+// Feature adapter is independent of OpenClaw/OTA hosts. The default matches
+// the user's existing AI Horde LAN setup; a persisted override is supported.
+#ifndef CONFIG_METALIO_SERVICES_HOST
+#define CONFIG_METALIO_SERVICES_HOST "http://192.168.31.31:8766"
+#endif
+inline std::string Host() {
+    Settings config("services");
+    std::string host=config.GetString("url",CONFIG_METALIO_SERVICES_HOST);
+    while(!host.empty() && host.back()=='/') host.pop_back();
+    if((host.compare(0,7,"http://") && host.compare(0,8,"https://")) || host.find_first_of("\r\n ")!=std::string::npos)
+        return CONFIG_METALIO_SERVICES_HOST;
+    return host;
+}
+inline std::string ServiceUrl(const char* path) { return Host()+path; }
+
 inline std::string Url(const char *path)
 {
     return std::string(kHost) + path;
@@ -168,7 +185,7 @@ inline std::string Url(const char *path)
 
 inline std::string WeatherDistrictUrl(const std::string &district_id)
 {
-    return Url(kWeatherDistrictPath) + district_id;
+    return ServiceUrl(kWeatherDistrictPath) + district_id;
 }
 
 inline std::string OpenClawMessagesUrl(const std::string &conversation_id)
@@ -201,7 +218,7 @@ inline std::string Text2ImageTaskUrl(const std::string &task_id)
 {
     char path[192];
     std::snprintf(path, sizeof(path), kText2ImageTaskFmt, task_id.c_str());
-    return Url(path);
+    return ServiceUrl(path);
 }
 
 /* ------------------------------------------------------------------ */

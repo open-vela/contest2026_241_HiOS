@@ -1,3 +1,4 @@
+#include "hi_task_cpp.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -12,6 +13,7 @@
  */
 
 #include "websocket_protocol.h"
+#include "app_dns.h"
 #include "board_shim.h"
 #include "system_info.h"
 #include "settings.h"
@@ -165,6 +167,15 @@ bool WebSocket::Connect(const std::string &url)
         return false;
     }
 
+    if (metalio_app_bind_active_interface(sock_) < 0)
+    {
+        last_error_ = errno ? errno : ENODEV;
+        close(sock_);
+        sock_ = -1;
+        freeaddrinfo(res);
+        return false;
+    }
+
     if (connect(sock_, res->ai_addr, res->ai_addrlen) < 0)
     {
         ESP_LOGE(TAG, "ws: connect(%s:%d) failed: %s", host.c_str(), port, strerror(errno));
@@ -238,7 +249,7 @@ bool WebSocket::Connect(const std::string &url)
 
     connected_ = true;
     running_ = true;
-    rx_thread_ = std::thread([this]() { this->RxLoop(); });
+    rx_thread_ = HiTask::LegacyThread([this]() { this->RxLoop(); });
     return true;
 }
 

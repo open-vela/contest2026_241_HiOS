@@ -5,6 +5,7 @@
 #include <nuttx/config.h>
 #include <nuttx/i2c/i2c_master.h>
 #include <nuttx/kmalloc.h>
+#include <nuttx/mutex.h>
 #include <syslog.h>
 #include <string.h>
 #include <errno.h>
@@ -25,6 +26,8 @@ struct tca9555_dev_s
 };
 
 static FAR struct tca9555_dev_s *g_tca;
+static volatile bool g_pwr_off;
+static mutex_t g_output_lock = NXMUTEX_INITIALIZER;
 
 static int tca_write_regs(FAR struct tca9555_dev_s *dev, uint8_t reg,
                           uint16_t value)
@@ -98,25 +101,28 @@ int metalio_tca9555_initialize(FAR struct i2c_master_s *i2c)
         (1u << BOARD_IOEXP_USB_INSERT) |
         (1u << BOARD_IOEXP_WIRELESS_CHG);
 
-  /* P1.6 is the GT911 reset (active-low).  Release it at power-up so the
-   * touch controller leaves reset; everything else stays off until the
-   * board explicitly powers it. */
-  out = (1u << BOARD_IOEXP_TOUCH_RST);
-
-  /* Default power domains off except keep safe defaults */
-
-  ret = tca_write_regs(dev, 0x06, dir); /* config */
-  if (ret < 0)
-    {
-      syslog(LOG_ERR, "TCA9555: config write failed %d\n", ret);
-      kmm_free(dev);
-      return ret;
-    }
+  /* Program the output latch before enabling outputs. In particular, do not
+   * briefly cut the Bluetooth rail on a CPU reset: that also resets the
+   * external I2S clock master. Match the board's normal boot levels, keeping
+   * the amplifier off and camera powered down until their owners start. */
+  out = (1u << BOARD_IOEXP_TOUCH_RST) |
+        (1u << BOARD_IOEXP_BT_POWER) |
+        (1u << BOARD_IOEXP_CAM_PWDN) |
+        (1u << BOARD_IOEXP_RST_4G) |
+        (1u << BOARD_IOEXP_PA_SWITCH);
 
   ret = tca_write_regs(dev, 0x02, out); /* output */
   if (ret < 0)
     {
       syslog(LOG_ERR, "TCA9555: output write failed %d\n", ret);
+      kmm_free(dev);
+      return ret;
+    }
+
+  ret = tca_write_regs(dev, 0x06, dir); /* config */
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "TCA9555: config write failed %d\n", ret);
       kmm_free(dev);
       return ret;
     }
@@ -130,21 +136,28 @@ int metalio_tca9555_initialize(FAR struct i2c_master_s *i2c)
 
 int metalio_tca9555_write_pin(int pin, bool level)
 {
+  uint16_t next;
+  int ret;
   if (g_tca == NULL || pin < 0 || pin > 15)
     {
       return -ENODEV;
     }
 
+  nxmutex_lock(&g_output_lock);
+  next = g_tca->out;
   if (level)
     {
-      g_tca->out |= (1u << pin);
+      next |= (1u << pin);
     }
   else
     {
-      g_tca->out &= ~(1u << pin);
+      next &= ~(1u << pin);
     }
 
-  return tca_write_regs(g_tca, 0x02, g_tca->out);
+  ret = tca_write_regs(g_tca, 0x02, next);
+  if (ret >= 0) g_tca->out = next;
+  nxmutex_unlock(&g_output_lock);
+  return ret;
 }
 
 int metalio_tca9555_read_pin(int pin, FAR bool *level)
@@ -169,15 +182,23 @@ int metalio_tca9555_read_pin(int pin, FAR bool *level)
 
 int metalio_pwr_shutdown_pulse(void)
 {
-  /* Continuous 100ms high / 100ms low on PWR_KEY_PULSE until power cuts.
-   * Matches MetalioClaw4 PwrShutdownPulseTask (home_screen.cc). */
+  /* Hold 4 s first so the PMIC sees a long-press off, then keep the
+   * reference 100 ms train until the rail drops. Stop the PWR_KEY
+   * poller so it cannot steal the I2C bus mid-pulse. */
 
   if (g_tca == NULL)
     {
       return -ENODEV;
     }
 
+  g_pwr_off = true;
   syslog(LOG_WARNING, "Metalio: starting power-off pulse train\n");
+
+  metalio_tca9555_write_pin(BOARD_IOEXP_PWR_KEY_PULSE, true);
+  usleep(4000 * 1000);
+  metalio_tca9555_write_pin(BOARD_IOEXP_PWR_KEY_PULSE, false);
+  usleep(100 * 1000);
+
   for (;;)
     {
       metalio_tca9555_write_pin(BOARD_IOEXP_PWR_KEY_PULSE, true);
@@ -207,6 +228,7 @@ int metalio_pwr_shutdown_pulse(void)
 
 static metalio_pwr_key_cb_t g_pwr_key_short_cb;
 static metalio_pwr_key_cb_t g_pwr_key_long_cb;
+static metalio_pwr_key_cb_t g_pwr_key_press_cb;
 static pthread_t            g_pwr_key_thread;
 static bool                 g_pwr_key_running;
 
@@ -222,21 +244,46 @@ static FAR void *metalio_pwr_key_monitor(FAR void *arg)
   bool    was_pressed = false;
   int64_t press_start_ms = 0;
   bool    long_fired = false;
+  bool    seeded = false;
 
   (void)arg;
 
   while (true)
     {
       bool level = false;
+
+      if (g_pwr_off)
+        {
+          usleep(PWR_KEY_POLL_MS * 1000);
+          continue;
+        }
+
       if (metalio_tca9555_read_pin(BOARD_IOEXP_PWR_KEY, &level) == OK)
         {
           bool is_pressed = !level; /* PWR_KEY is active-low */
           int64_t now_ms = metalio_pwr_key_now_ms();
 
+          /* Seed from the current pin state so a power-button that is still
+           * held across boot does not look like a fresh press edge (that
+           * caused a second haptic after the intentional boot buzz). */
+          if (!seeded)
+            {
+              was_pressed = is_pressed;
+              press_start_ms = now_ms;
+              long_fired = true; /* ignore long-press for a hold that began pre-boot */
+              seeded = true;
+              usleep(PWR_KEY_POLL_MS * 1000);
+              continue;
+            }
+
           if (is_pressed && !was_pressed)
             {
               press_start_ms = now_ms;
               long_fired = false;
+              if (g_pwr_key_press_cb)
+                {
+                  g_pwr_key_press_cb();
+                }
             }
           else if (!is_pressed && was_pressed)
             {
@@ -266,7 +313,8 @@ static FAR void *metalio_pwr_key_monitor(FAR void *arg)
 }
 
 int metalio_pwr_key_init(metalio_pwr_key_cb_t short_cb,
-                         metalio_pwr_key_cb_t long_cb)
+                         metalio_pwr_key_cb_t long_cb,
+                         metalio_pwr_key_cb_t press_cb)
 {
   int ret;
 
@@ -277,6 +325,7 @@ int metalio_pwr_key_init(metalio_pwr_key_cb_t short_cb,
 
   g_pwr_key_short_cb = short_cb;
   g_pwr_key_long_cb = long_cb;
+  g_pwr_key_press_cb = press_cb;
 
   if (g_pwr_key_running)
     {
@@ -292,7 +341,7 @@ int metalio_pwr_key_init(metalio_pwr_key_cb_t short_cb,
     }
 
   g_pwr_key_running = true;
-  syslog(LOG_INFO, "TCA9555: PWR_KEY monitor armed (short=%p long=%p)\n",
-         (void *)short_cb, (void *)long_cb);
+  syslog(LOG_INFO, "TCA9555: PWR_KEY monitor armed (short=%p long=%p press=%p)\n",
+         (void *)short_cb, (void *)long_cb, (void *)press_cb);
   return OK;
 }

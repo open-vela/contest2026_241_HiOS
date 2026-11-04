@@ -124,7 +124,8 @@ public:
     }
 };
 
-using ReturnValue = std::variant<bool, int, std::string, cJSON *, ImageContent *>;
+struct ToolError {std::string message;};
+using ReturnValue = std::variant<bool, int, std::string, cJSON *, ImageContent *, ToolError>;
 
 enum PropertyType
 {
@@ -383,7 +384,11 @@ public:
         {
             cJSON *text = cJSON_CreateObject();
             cJSON_AddStringToObject(text, "type", "text");
-            if (std::holds_alternative<std::string>(return_value))
+            if (std::holds_alternative<ToolError>(return_value))
+            {
+                cJSON_AddStringToObject(text, "text", std::get<ToolError>(return_value).message.c_str());
+            }
+            else if (std::holds_alternative<std::string>(return_value))
             {
                 cJSON_AddStringToObject(text, "text", std::get<std::string>(return_value).c_str());
             }
@@ -406,7 +411,7 @@ public:
             cJSON_AddItemToArray(content, text);
         }
         cJSON_AddItemToObject(result, "content", content);
-        cJSON_AddBoolToObject(result, "isError", false);
+        cJSON_AddBoolToObject(result, "isError", std::holds_alternative<ToolError>(return_value));
 
         auto json_str = cJSON_PrintUnformatted(result);
         std::string result_str(json_str);
@@ -436,6 +441,7 @@ public:
                          std::function<ReturnValue(const PropertyList &)> callback);
     void ParseMessage(const cJSON *json);
     void ParseMessage(const std::string &message);
+    bool IsVisionAnalysisPending() const { return vision_busy_.load(); }
 
     /* Optional: start a TCP server for external MCP clients. */
     int StartTcpServer(uint16_t port = 2024);
@@ -456,6 +462,7 @@ private:
 
     std::vector<McpTool *> tools_;
     std::atomic<bool> tcp_running_{false};
+    std::atomic<bool> vision_busy_{false};
     std::thread tcp_thread_;
     int tcp_sock_ = -1;
 };

@@ -29,7 +29,7 @@ LvglRawImage::LvglRawImage(void *data, size_t size)
 bool LvglRawImage::IsGif() const
 {
     auto ptr = (const uint8_t *)image_dsc_.data;
-    return ptr && ptr[0] == 'G' && ptr[1] == 'I' && ptr[2] == 'F';
+    return ptr && image_dsc_.data_size >= 3 && ptr[0] == 'G' && ptr[1] == 'I' && ptr[2] == 'F';
 }
 
 LvglCBinImage::LvglCBinImage(void *data)
@@ -48,6 +48,8 @@ LvglCBinImage::~LvglCBinImage()
 LvglAllocatedImage::LvglAllocatedImage(void *data, size_t size)
 {
     memset(&image_dsc_, 0, sizeof(image_dsc_));
+    image_dsc_.header.magic = LV_IMAGE_HEADER_MAGIC;
+    image_dsc_.header.cf = LV_COLOR_FORMAT_RAW;
     image_dsc_.data_size = size;
     image_dsc_.data = static_cast<uint8_t *>(data);
 

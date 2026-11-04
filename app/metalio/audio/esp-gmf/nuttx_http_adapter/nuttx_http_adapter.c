@@ -4,7 +4,8 @@
  *
  * Implementation notes
  * --------------------
- *  - Uses raw POSIX sockets.  Only http:// URLs are supported.
+ *  - Uses raw POSIX sockets.  http:// and https:// (mbedTLS client, verify
+ *    none — same as Metalio OTA/MQTT until a trust store is wired).
  *  - Supports HTTP/1.1 GET and POST with explicit Content-Length.
  *  - Supports "Range: bytes=N-" requests (used by gmf_io_http.c after seek).
  *  - Emits HTTP_EVENT_ON_HEADER for every response header before the body
@@ -15,9 +16,6 @@
  *    esp_http_client_open() again, so we don't auto-follow redirects here.
  *  - The NuttX DNS client (CONFIG_NETDB_DNSCLIENT=y) is used via getaddrinfo().
  *
- * The file is deliberately small and self-contained.  Future TLS support can
- * be layered on by wrapping connect/read/write with a tls_ops struct (similar
- * to how NuttX's netutils/webclient does it).
  */
 
 #include <ctype.h>
@@ -30,21 +28,37 @@
 #include <strings.h>
 #include <unistd.h>
 #include <poll.h>
+#include <fcntl.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
 #include "esp_err.h"
+#include "app_dns.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_gmf_err.h"
+
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+
+/* This NuttX mbedTLS build has no net_sockets.h. Values match mbedTLS 2.x. */
+#ifndef MBEDTLS_ERR_NET_SEND_FAILED
+#define MBEDTLS_ERR_NET_SEND_FAILED (-0x004E)
+#endif
+#ifndef MBEDTLS_ERR_NET_RECV_FAILED
+#define MBEDTLS_ERR_NET_RECV_FAILED (-0x004C)
+#endif
 
 /* -------------------------------------------------------------------------- */
 /*  Constants                                                                 */
 /* -------------------------------------------------------------------------- */
 
 #define NHA_HTTP_PORT            80
+#define NHA_HTTPS_PORT           443
 #define NHA_HEADER_MAX_LINE      1024   /* one response-header line */
 #define NHA_REQUEST_MIN_SEND     16     /* keep send() spinning while small */
 
@@ -83,11 +97,17 @@ typedef struct nha_header_s {
 /* -------------------------------------------------------------------------- */
 
 typedef struct {
-    bool         is_https;   /* only http:// is implemented */
+    bool         is_https;
     char        *host;       /* owned */
     int          port;
     char        *path_query; /* owned, includes leading '/' plus optional '?...' */
 } nha_url_t;
+
+typedef struct {
+    mbedtls_ssl_context      ssl;
+    mbedtls_ssl_config       conf;
+    bool                     active;
+} nha_tls_session_t;
 
 /* -------------------------------------------------------------------------- */
 /*  The real client context.                                                  */
@@ -111,6 +131,8 @@ struct esp_http_client {
     /* Socket state */
     int                        fd;          /* -1 if disconnected */
     bool                       connected;
+    bool                       response_keep_alive;
+    bool                       reused_request;
 
     /* Request direction inferred from write_len passed to open() */
     bool                       is_writer;   /* !is_writer = reader */
@@ -135,6 +157,11 @@ struct esp_http_client {
 
     /* Stored errno for get_errno() */
     int                        last_errno;
+    bool                     (*cancelled)(void *);
+    void                      *cancel_ctx;
+    int                        transport_mss; /* zero: unchanged socket defaults */
+
+    nha_tls_session_t          tls;
 
     /* Redirect handling: caller's set_redirection() triggers reuse of
      * Location header value on the next open().  We store the raw string. */
@@ -161,9 +188,13 @@ static int nha_parse_url(const char *s, nha_url_t *out)
     const char *p = s;
     /* scheme */
     if (!strncasecmp(p, "http://", 7)) {
-        out->is_https = false; p += 7;
+        out->is_https = false;
+        out->port = NHA_HTTP_PORT;
+        p += 7;
     } else if (!strncasecmp(p, "https://", 8)) {
-        out->is_https = true; p += 8;
+        out->is_https = true;
+        out->port = NHA_HTTPS_PORT;
+        p += 8;
     } else {
         return -1;
     }
@@ -234,47 +265,244 @@ static void nha_delete_header(nha_header_t **list, const char *key)
     }
 }
 
+/* Only callers explicitly requesting persistence opt into connection reuse. */
+static bool nha_response_reusable(struct esp_http_client *c)
+{
+    return c->fd >= 0 && !c->is_writer && c->response_keep_alive &&
+           c->status_code == 200 && !c->chunked &&
+           c->content_length >= 0 && c->body_remaining == 0 &&
+           c->last_errno == 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Forward declarations (TLS handshake uses these before their definitions) */
+/* -------------------------------------------------------------------------- */
+
+static int nha_timeout_ms(struct esp_http_client *c);
+static void nha_close_sock(struct esp_http_client *c);
+
+static bool nha_cancelled(struct esp_http_client *c)
+{
+    if (c && c->cancelled && c->cancelled(c->cancel_ctx)) {
+        c->last_errno = errno = ECANCELED;
+        return true;
+    }
+    return false;
+}
+
+static int64_t nha_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int nha_wait(struct esp_http_client *c, struct pollfd *pfd, int timeout_ms)
+{
+    if (!c->cancelled) return poll(pfd, 1, timeout_ms);
+    const int64_t deadline = nha_monotonic_ms() + timeout_ms;
+    for (;;) {
+        if (nha_cancelled(c)) return -1;
+        const int64_t left = deadline - nha_monotonic_ms();
+        if (left <= 0) { c->last_errno = errno = ETIMEDOUT; return 0; }
+        const int rc = poll(pfd, 1, left > 100 ? 100 : (int)left);
+        if (rc > 0 || (rc < 0 && errno != EINTR)) return rc;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  mbedTLS (shared DRBG, per-connection SSL context)                         */
+/* -------------------------------------------------------------------------- */
+
+static mbedtls_entropy_context s_tls_entropy;
+static mbedtls_ctr_drbg_context s_tls_drbg;
+static bool s_tls_drbg_ready;
+
+static int nha_tls_mbedtls_send(void *ctx, const unsigned char *buf, size_t len)
+{
+    struct esp_http_client *c = (struct esp_http_client *)ctx;
+    if (!c || c->fd < 0 || nha_cancelled(c)) {
+        return MBEDTLS_ERR_NET_SEND_FAILED;
+    }
+    ssize_t n = send(c->fd, buf, len, 0);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return MBEDTLS_ERR_SSL_WANT_WRITE;
+        }
+        return MBEDTLS_ERR_NET_SEND_FAILED;
+    }
+    return (int)n;
+}
+
+static int nha_tls_mbedtls_recv(void *ctx, unsigned char *buf, size_t len)
+{
+    struct esp_http_client *c = (struct esp_http_client *)ctx;
+    if (!c || c->fd < 0 || nha_cancelled(c)) {
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+    ssize_t n = recv(c->fd, buf, len, 0);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+    return (int)n;
+}
+
+static int nha_tls_drbg_init_once(void)
+{
+    if (s_tls_drbg_ready) {
+        return 0;
+    }
+    mbedtls_entropy_init(&s_tls_entropy);
+    mbedtls_ctr_drbg_init(&s_tls_drbg);
+    int ret = mbedtls_ctr_drbg_seed(&s_tls_drbg, mbedtls_entropy_func,
+                                    &s_tls_entropy, NULL, 0);
+    if (ret != 0) {
+        return -1;
+    }
+    s_tls_drbg_ready = true;
+    return 0;
+}
+
+static void nha_tls_teardown(struct esp_http_client *c)
+{
+    if (!c || !c->tls.active) {
+        return;
+    }
+    mbedtls_ssl_free(&c->tls.ssl);
+    mbedtls_ssl_config_free(&c->tls.conf);
+    c->tls.active = false;
+}
+
+static int nha_tls_handshake(struct esp_http_client *c)
+{
+    if (!c || !c->parsed.is_https || c->fd < 0) {
+        return 0;
+    }
+    if (nha_tls_drbg_init_once() != 0) {
+        c->last_errno = EIO;
+        return -1;
+    }
+    nha_tls_teardown(c);
+    mbedtls_ssl_init(&c->tls.ssl);
+    mbedtls_ssl_config_init(&c->tls.conf);
+    /* Own both initialized contexts even when setup/handshake fails. */
+    c->tls.active = true;
+    int ret = mbedtls_ssl_config_defaults(
+        &c->tls.conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
+        MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0) {
+        c->last_errno = EIO;
+        nha_tls_teardown(c);
+        return -1;
+    }
+    mbedtls_ssl_conf_authmode(&c->tls.conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&c->tls.conf, mbedtls_ctr_drbg_random, &s_tls_drbg);
+    ret = mbedtls_ssl_setup(&c->tls.ssl, &c->tls.conf);
+    if (ret != 0) {
+        c->last_errno = EIO;
+        nha_tls_teardown(c);
+        return -1;
+    }
+    ret = mbedtls_ssl_set_hostname(&c->tls.ssl, c->parsed.host);
+    if (ret != 0) {
+        c->last_errno = EIO;
+        nha_tls_teardown(c);
+        return -1;
+    }
+    mbedtls_ssl_set_bio(&c->tls.ssl, c, nha_tls_mbedtls_send,
+                        nha_tls_mbedtls_recv, NULL);
+    while ((ret = mbedtls_ssl_handshake(&c->tls.ssl)) != 0) {
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+            ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            struct pollfd pfd;
+            memset(&pfd, 0, sizeof(pfd));
+            pfd.fd = c->fd;
+            pfd.events = (ret == MBEDTLS_ERR_SSL_WANT_WRITE) ? POLLOUT : POLLIN;
+            if (nha_wait(c, &pfd, nha_timeout_ms(c)) <= 0) {
+                c->last_errno = errno ? errno : ETIMEDOUT;
+                nha_tls_teardown(c);
+                return -1;
+            }
+            continue;
+        }
+        nha_dbg("NHA_TLS_HS_FAIL -0x%x\n", (unsigned)-ret);
+        c->last_errno = EIO;
+        nha_tls_teardown(c);
+        return -1;
+    }
+    c->tls.active = true;
+    nha_dbg("NHA_TLS_OK host=%s\n", c->parsed.host);
+    return 0;
+}
+
 /* -------------------------------------------------------------------------- */
 /*  DNS + TCP connect.                                                        */
 /* -------------------------------------------------------------------------- */
 
+static int nha_configure_stream_socket(struct esp_http_client *c, int fd)
+{
+    if (c->transport_mss == 0) return 0;
+    int mss = c->transport_mss;
+    return setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss));
+}
+
 static int nha_connect_to_host(struct esp_http_client *c)
 {
-    if (c->parsed.is_https) {
-        /* Not implemented.  We could layer OpenSSL/TinySocket later via ops. */
-        c->last_errno = ENOTSUP;
-        return -1;
-    }
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%d", c->parsed.port);
-    struct addrinfo *res = NULL;
-    nha_dbg("NHA_DNS0 host=%s port=%s\n", c->parsed.host, port_str);
-    int rc = getaddrinfo(c->parsed.host, port_str, &hints, &res);
+    if (nha_cancelled(c)) return -1;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(c->parsed.port);
+    nha_dbg("NHA_DNS0 host=%s port=%d\n", c->parsed.host, c->parsed.port);
+    int rc = metalio_media_resolve_ipv4(c->parsed.host, &address.sin_addr.s_addr);
     if (rc != 0) {
         nha_dbg("NHA_DNS_FAIL host=%s rc=%d\n", c->parsed.host, rc);
-        ESP_LOGE(TAG, "getaddrinfo(%s) failed: %d", c->parsed.host, rc);
-        c->last_errno = EIO;
+        c->last_errno = -rc;
         return -1;
     }
-    if (res != NULL && res->ai_addr != NULL &&
-        res->ai_addr->sa_family == AF_INET) {
-        struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
-        nha_dbg("NHA_DNS_OK host=%s ip=%s\n",
-                c->parsed.host, inet_ntoa(sa->sin_addr));
+    if (nha_cancelled(c)) return -1;
+    nha_dbg("NHA_DNS_OK host=%s ip=%s\n", c->parsed.host, inet_ntoa(address.sin_addr));
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        int bound = metalio_app_bind_active_interface(fd);
+        int connection_error = bound < 0 ? -bound : 0;
+        if (!connection_error && nha_configure_stream_socket(c, fd) < 0)
+            connection_error = errno;
+        if (!connection_error && c->cancelled) {
+            // Radio alone opts into nonblocking sockets: TCP establishment
+            // used to block before the socket timeout was even installed.
+            const int flags = fcntl(fd, F_GETFL, 0);
+            if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                connection_error = errno;
+            } else {
+                c->fd = fd;
+                if (connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+                    if (errno != EINPROGRESS && errno != EALREADY && errno != EWOULDBLOCK) {
+                        connection_error = errno;
+                    } else {
+                        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+                        if (nha_wait(c, &pfd, nha_timeout_ms(c)) <= 0) {
+                            connection_error = errno ? errno : ETIMEDOUT;
+                        } else {
+                            socklen_t size = sizeof(connection_error);
+                            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &connection_error, &size) < 0)
+                                connection_error = errno;
+                        }
+                    }
+                }
+            }
+        } else if (!connection_error && connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+            connection_error = errno;
+        }
+        if (connection_error) {
+            int saved_errno = connection_error;
+            c->fd = -1;
+            close(fd); fd = -1; errno = saved_errno;
+        }
     }
-    int fd = -1;
-    for (struct addrinfo *p = res; p; p = p->ai_next) {
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
-        close(fd); fd = -1;
-    }
-    freeaddrinfo(res);
     if (fd < 0) {
         nha_dbg("NHA_CONN_FAIL host=%s errno=%d\n", c->parsed.host, errno);
         ESP_LOGE(TAG, "connect(%s:%d) failed (%s)", c->parsed.host, c->parsed.port,
@@ -303,6 +531,10 @@ static int nha_connect_to_host(struct esp_http_client *c)
     }
     c->fd = fd;
     c->connected = true;
+    if (c->parsed.is_https && nha_tls_handshake(c) != 0) {
+        nha_close_sock(c);
+        return -1;
+    }
     return 0;
 }
 
@@ -310,16 +542,52 @@ static int nha_connect_to_host(struct esp_http_client *c)
 /*  Socket send_all / recv helpers.                                           */
 /* -------------------------------------------------------------------------- */
 
-static int nha_send_all(int fd, const char *buf, int len)
+static int nha_send_all(struct esp_http_client *c, const char *buf, int len)
 {
+    if (!c || c->fd < 0 || !buf || len <= 0) {
+        return -1;
+    }
     int total = 0;
     while (total < len) {
-        int n = send(fd, buf + total, len - total, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
+        if (nha_cancelled(c)) return -1;
+        int n;
+        if (c->tls.active) {
+            n = mbedtls_ssl_write(&c->tls.ssl,
+                                  (const unsigned char *)(buf + total),
+                                  (size_t)(len - total));
+            if (n == MBEDTLS_ERR_SSL_WANT_READ ||
+                n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                struct pollfd pfd;
+                memset(&pfd, 0, sizeof(pfd));
+                pfd.fd = c->fd;
+                pfd.events = (n == MBEDTLS_ERR_SSL_WANT_WRITE) ? POLLOUT : POLLIN;
+                if (nha_wait(c, &pfd, nha_timeout_ms(c)) <= 0) {
+                    c->last_errno = errno ? errno : ETIMEDOUT;
+                    return -1;
+                }
+                continue;
+            }
+            if (n <= 0) {
+                return -1;
+            }
+        } else {
+            n = (int)send(c->fd, buf + total, (size_t)(len - total), 0);
+            if (n < 0) {
+                if (c->cancelled && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    struct pollfd pfd = { .fd = c->fd, .events = POLLOUT };
+                    if (nha_wait(c, &pfd, nha_timeout_ms(c)) > 0) continue;
+                    c->last_errno = errno ? errno : ETIMEDOUT;
+                    return -1;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -1;
+            }
+            if (n == 0) {
+                return -1;
+            }
         }
-        if (n == 0) return -1;
         total += n;
     }
     return total;
@@ -327,7 +595,12 @@ static int nha_send_all(int fd, const char *buf, int len)
 
 static void nha_close_sock(struct esp_http_client *c)
 {
-    if (!c || c->fd < 0) {
+    if (!c) {
+        return;
+    }
+    nha_tls_teardown(c);
+    if (c->fd < 0) {
+        c->connected = false;
         return;
     }
     shutdown(c->fd, SHUT_RDWR);
@@ -354,11 +627,18 @@ static int nha_recv(struct esp_http_client *c, char *buf, int want)
     }
     const int to = nha_timeout_ms(c);
     for (;;) {
+        if (nha_cancelled(c)) return -1;
         struct pollfd pfd;
         memset(&pfd, 0, sizeof(pfd));
         pfd.fd = c->fd;
         pfd.events = POLLIN;
-        int pr = poll(&pfd, 1, to);
+        /* TLS can retain application bytes or unprocessed records after
+         * the socket has been drained. check_pending covers both cases.
+         * Polling the socket first strands those bytes until another packet
+         * arrives (or the timeout fires), interrupting streamed audio. */
+        int pr = (c->tls.active &&
+                  mbedtls_ssl_check_pending(&c->tls.ssl) != 0)
+                     ? 1 : nha_wait(c, &pfd, to);
         if (pr == 0) {
             errno = ETIMEDOUT;
             c->last_errno = ETIMEDOUT;
@@ -373,7 +653,26 @@ static int nha_recv(struct esp_http_client *c, char *buf, int want)
             nha_dbg("NHA_POLL_ERR %d\n", errno);
             return -1;
         }
-        int n = recv(c->fd, buf, want, 0);
+        int n;
+        if (c->tls.active) {
+            n = mbedtls_ssl_read(&c->tls.ssl, (unsigned char *)buf, (size_t)want);
+            if (n == MBEDTLS_ERR_SSL_WANT_READ ||
+                n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                continue;
+            }
+            if (n == 0 || n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                return 0;
+            }
+            if (n < 0) {
+                c->last_errno = EIO;
+                nha_dbg("NHA_TLS_RX_ERR\n");
+                return -1;
+            }
+            return n;
+        }
+        n = (int)recv(c->fd, buf, (size_t)want, 0);
+        if (c->cancelled && n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
         if (n < 0 && errno == EINTR) {
             continue;
         }
@@ -446,9 +745,13 @@ static int nha_send_request(struct esp_http_client *c)
     appendf("%s %s HTTP/1.1\r\n",
             c->is_writer ? "POST" : "GET", c->parsed.path_query);
     appendf("Host: %s", c->parsed.host);
-    if (c->parsed.port != NHA_HTTP_PORT) {
-        len -= 2; /* drop "\r\n" temporarily */
-        appendf(":%d", c->parsed.port);
+    {
+        const int def_port =
+            c->parsed.is_https ? NHA_HTTPS_PORT : NHA_HTTP_PORT;
+        if (c->parsed.port != def_port) {
+            len -= 2; /* drop "\r\n" temporarily */
+            appendf(":%d", c->parsed.port);
+        }
     }
     appendf("\r\n");
     appendf("User-Agent: metalio-gmf-http/1.0\r\n");
@@ -470,11 +773,16 @@ static int nha_send_request(struct esp_http_client *c)
             appendf("%s: %s\r\n", h->key, h->value);
         }
     }
-    appendf("Connection: close\r\n");
+    bool connection_set = false;
+    for (nha_header_t *h = c->headers; h; h = h->next) {
+        if (h->key && h->value && !strcasecmp(h->key, "Connection"))
+            connection_set = true;
+    }
+    if (!connection_set) appendf("Connection: close\r\n");
     appendf("\r\n");
     #undef appendf
 
-    int rc = nha_send_all(c->fd, buf, (int)len);
+    int rc = nha_send_all(c, buf, (int)len);
     nha_dbg("NHA_SENT %d/%d\n", rc, (int)len);
     free(buf);
     if (rc < 0) {
@@ -510,6 +818,7 @@ static void nha_emit_header_cb(struct esp_http_client *c,
 static int64_t nha_parse_headers(struct esp_http_client *c)
 {
     write(1, "NHA_FETCH0\n", 11);
+    c->response_keep_alive = false;
     c->status_code    = 0;
     c->content_length = -1;
     c->chunked        = false;
@@ -531,6 +840,12 @@ static int64_t nha_parse_headers(struct esp_http_client *c)
         c->status_code = atoi(p);
     }
 
+    if (!strncasecmp(line, "HTTP/1.1 ", 9)) {
+        for (nha_header_t *h = c->headers; h; h = h->next) {
+            if (h->key && h->value && !strcasecmp(h->key, "Connection") &&
+                !strcasecmp(h->value, "keep-alive")) c->response_keep_alive = true;
+        }
+    }
     /* Header lines until empty line. */
     for (;;) {
         n = nha_read_line(c, line, sizeof(line));
@@ -556,6 +871,8 @@ static int64_t nha_parse_headers(struct esp_http_client *c)
                 c->chunked = true;
                 c->content_length = -1;
             }
+        } else if (!strcasecmp(line, "Connection")) {
+            if (strcasestr(val, "close")) c->response_keep_alive = false;
         } else if (!strcasecmp(line, "Location")) {
             free(c->redirect_target);
             c->redirect_target = strdup(val);
@@ -632,18 +949,21 @@ esp_err_t esp_http_client_cleanup(esp_http_client_handle_t client)
 esp_err_t esp_http_client_set_url(esp_http_client_handle_t c, const char *url)
 {
     if (!c || !url) return ESP_ERR_INVALID_ARG;
-    /* A new URL may point to a different host.  Drop any existing TCP
-     * connection so the next esp_http_client_open() establishes a fresh
-     * socket.  The shim always sends "Connection: close", so reusing a stale
-     * fd would make nha_send_request() hit a dead socket and fail. */
-    if (c->fd >= 0) {
-        nha_close_sock(c);
+    nha_url_t next;
+    if (nha_parse_url(url, &next) != 0) {
+        nha_free_url(&next);
+        return ESP_FAIL;
     }
+    char *next_url = strdup(url);
+    if (!next_url) { nha_free_url(&next); return ESP_ERR_NO_MEM; }
+    bool same_origin = c->parsed.host &&
+        !strcasecmp(c->parsed.host, next.host) &&
+        c->parsed.port == next.port && c->parsed.is_https == next.is_https;
+    if (!same_origin || !nha_response_reusable(c)) nha_close_sock(c);
     free(c->url);
     nha_free_url(&c->parsed);
-    c->url = strdup(url);
-    if (!c->url) return ESP_ERR_NO_MEM;
-    if (nha_parse_url(url, &c->parsed) != 0) return ESP_FAIL;
+    c->url = next_url;
+    c->parsed = next;
     return ESP_OK;
 }
 
@@ -711,10 +1031,17 @@ esp_err_t esp_http_client_open(esp_http_client_handle_t c, int write_len)
     c->line_pos          = 0;
     c->body_read         = 0;
 
-    if (c->fd < 0) {
-        if (nha_connect_to_host(c) != 0) return ESP_FAIL;
+    c->reused_request = c->fd >= 0 && !c->is_writer;
+    c->status_code = 0;
+    if (c->fd < 0 && nha_connect_to_host(c) != 0) return ESP_FAIL;
+    if (nha_send_request(c) != 0) {
+        bool retry = c->reused_request;
+        nha_close_sock(c);
+        c->reused_request = false;
+        if (!retry || nha_connect_to_host(c) != 0 || nha_send_request(c) != 0)
+            return ESP_FAIL;
+        c->last_errno = 0;
     }
-    if (nha_send_request(c) != 0) return ESP_FAIL;
     write(1, "NHA_REQ_OK\n", 11);
 
     if (c->cfg.event_handler) {
@@ -734,7 +1061,7 @@ esp_err_t esp_http_client_close(esp_http_client_handle_t c)
     if (c->fd >= 0) {
         /* Graceful close: for writer streams, send the terminating chunk. */
         if (c->is_writer && c->write_total == -1 && c->chunked) {
-            (void)nha_send_all(c->fd, "0\r\n\r\n", 5);
+            (void)nha_send_all(c, "0\r\n\r\n", 5);
         }
         nha_close_sock(c);
     }
@@ -752,6 +1079,16 @@ int64_t esp_http_client_fetch_headers(esp_http_client_handle_t c)
         if (n > 0) c->content_written += n;
     }
     int64_t cl = nha_parse_headers(c);
+    /* A server may expire an idle persistent socket. Retry one idempotent GET
+     * on a fresh connection only before any response status/body is received. */
+    if (c->status_code == 0 && c->reused_request && !c->is_writer) {
+        c->reused_request = false;
+        nha_close_sock(c);
+        c->line_len = c->line_pos = 0;
+        c->last_errno = 0;
+        if (nha_connect_to_host(c) == 0 && nha_send_request(c) == 0)
+            cl = nha_parse_headers(c);
+    }
     return cl;
 }
 
@@ -779,6 +1116,25 @@ int esp_http_client_get_socket(esp_http_client_handle_t c)
     return c ? c->fd : -1;
 }
 
+esp_err_t esp_http_client_set_cancel_cb(esp_http_client_handle_t c,
+                                      bool (*cancelled)(void *), void *ctx)
+{
+    if (!c) return ESP_ERR_INVALID_ARG;
+    c->cancel_ctx = ctx;
+    c->cancelled = cancelled;
+    return ESP_OK;
+}
+
+esp_err_t esp_http_client_set_transport_mss(esp_http_client_handle_t c, int bytes)
+{
+    if (!c || bytes < 0 || bytes > 1460 || (bytes != 0 && bytes < 256))
+        return ESP_ERR_INVALID_ARG;
+    if (c->fd >= 0 && c->transport_mss != bytes)
+        return ESP_ERR_INVALID_STATE;
+    c->transport_mss = bytes;
+    return ESP_OK;
+}
+
 int esp_http_client_write(esp_http_client_handle_t c, const char *buf, int len)
 {
     if (!c || !buf || len <= 0) return 0;
@@ -788,12 +1144,12 @@ int esp_http_client_write(esp_http_client_handle_t c, const char *buf, int len)
         /* Chunked: emit chunk size + \r\n, data, \r\n. */
         char head[16];
         int hl = snprintf(head, sizeof(head), "%x\r\n", len);
-        if (nha_send_all(c->fd, head, hl) < 0) {
+        if (nha_send_all(c, head, hl) < 0) {
             c->last_errno = errno; return -1;
         }
-        n = nha_send_all(c->fd, buf, len);
+        n = nha_send_all(c, buf, len);
         if (n < 0) { c->last_errno = errno; return -1; }
-        if (nha_send_all(c->fd, "\r\n", 2) < 0) {
+        if (nha_send_all(c, "\r\n", 2) < 0) {
             c->last_errno = errno; return -1;
         }
     } else {
@@ -801,7 +1157,7 @@ int esp_http_client_write(esp_http_client_handle_t c, const char *buf, int len)
         if (c->write_total >= 0 && c->content_written + to_write > c->write_total) {
             to_write = c->write_total - c->content_written;
         }
-        n = nha_send_all(c->fd, buf, to_write);
+        n = nha_send_all(c, buf, to_write);
         if (n < 0) { c->last_errno = errno; return -1; }
         c->content_written += n;
     }
@@ -885,9 +1241,8 @@ int esp_http_client_read(esp_http_client_handle_t c, char *buf, int len)
             c->last_errno = errno; nha_dbg("NHA_READ cl_err=%d\n", errno); return -1;
         }
         c->body_remaining -= n;
-        if (n == 0 || c->body_remaining <= 0) {
-            /* Connection: close. Drop the PCB so the next HLS playlist /
-             * TS socket can recv — two concurrent TCP sockets starve WiFi RX. */
+        if (n == 0 || (c->body_remaining <= 0 && !nha_response_reusable(c))) {
+            /* Incomplete bodies and nonpersistent responses must close. */
             nha_close_sock(c);
         }
         return n;

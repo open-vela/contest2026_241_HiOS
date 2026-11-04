@@ -6,15 +6,18 @@
  */
 
 #include "weather_screen.h"
+#include "weather_service.h"
 #include "i18n.h"
 #include "esp_log_shim.h"
 #include "home_screen/home_screen.h"
 #include "screen_util.h"
 #include "weather_city_list.h"
 #include "weather_icon_map.h"
+#include "hi_input_method.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -27,221 +30,6 @@ LV_FONT_DECLARE(font_puhui_20_4);
 LV_FONT_DECLARE(font_puhui_30_4);
 
 namespace weather_detail {
-
-// --- Weather data structures + offline demo service (from Weather.hpp) ---
-struct WeatherForecastDay {
-    std::string date;
-    std::string week;
-    std::string text_day;
-    std::string text_night;
-    int32_t high = 0;
-    int32_t low = 0;
-    std::string wc_day;
-    std::string wd_day;
-    std::string wc_night;
-    std::string wd_night;
-    int32_t wind_angle_day = 0;
-    int32_t wind_angle_night = 0;
-    int32_t uvi = 0;
-    int32_t pressure = 0;
-    int32_t dpt = 0;
-};
-
-struct WeatherForecastHour {
-    std::string data_time;
-    std::string text;
-    int32_t temp_fc = 0;
-    std::string wind_class;
-    std::string wind_dir;
-    int32_t rh = 0;
-    float prec1h = 0.f;
-    int32_t clouds = 0;
-    int32_t wind_angle = 0;
-    int32_t pop = 0;
-    int32_t uvi = 0;
-    int32_t pressure = 0;
-    int32_t dpt = 0;
-};
-
-struct WeatherLifeIndex {
-    std::string name;
-    std::string brief;
-    std::string detail;
-};
-
-struct WeatherAlert {
-    std::string title;
-    std::string content;
-};
-
-struct WeatherDistrictData {
-    std::string country;
-    std::string province;
-    std::string city;
-    std::string district;
-    std::string district_id;
-    std::string text;
-    int32_t temp = 0;
-    int32_t feels_like = 0;
-    int32_t rh = 0;
-    std::string wind_class;
-    std::string wind_dir;
-    int32_t wind_angle = 0;
-    float prec1h = 0.f;
-    int32_t clouds = 0;
-    int32_t vis = 0;
-    int32_t aqi = 0;
-    int32_t pm25 = 0;
-    int32_t pm10 = 0;
-    int32_t no2 = 0;
-    int32_t so2 = 0;
-    int32_t o3 = 0;
-    float co = 0.f;
-    int32_t uvi = 0;
-    int32_t pressure = 0;
-    int32_t dpt = 0;
-    std::string uptime;
-    std::vector<WeatherForecastDay> forecasts;
-    std::vector<WeatherForecastHour> forecast_hours;
-    std::vector<WeatherLifeIndex> indexes;
-    std::vector<WeatherAlert> alerts;
-    bool valid = false;
-};
-
-class WeatherService {
-public:
-    static constexpr const char* kDefaultDistrictId = "440306";
-    static WeatherService& Instance() {
-        static WeatherService instance;
-        return instance;
-    }
-    void SetDistrictId(const std::string& id) {
-        if (!id.empty()) district_id_ = id;
-    }
-    const std::string& DistrictId() const { return district_id_; }
-    int Fetch(WeatherDistrictData& out) {
-        out = MakeDemoData(district_id_);
-        cached_ = out;
-        return 0;
-    }
-    const WeatherDistrictData& Cached() const { return cached_; }
-private:
-    WeatherService() : district_id_(kDefaultDistrictId) {}
-    static WeatherDistrictData MakeDemoData(const std::string& district_id) {
-        WeatherDistrictData d;
-        d.valid = true;
-        d.country = "中国";
-        const std::string id =
-            district_id.empty() ? kDefaultDistrictId : district_id;
-        d.district_id = id;
-
-        /* Bind UI city line to the selected district — hardcoded 深圳宝安
-         * made every save look like weather never updated. */
-        const weather_cities::LookupResult found =
-            weather_cities::FindDistrictById(id.c_str());
-        if (found.province_idx < weather_cities::kProvinceCount) {
-            const weather_cities::ProvinceEntry& pe =
-                weather_cities::kProvinces[found.province_idx];
-            d.province = pe.name;
-            const weather_cities::CityEntry& ce =
-                weather_cities::kCities[pe.city_start + found.city_idx];
-            d.city = ce.name;
-            const weather_cities::DistrictEntry* de =
-                weather_cities::GetDistrict(found.province_idx, found.city_idx,
-                                            found.district_idx);
-            d.district = (de != nullptr) ? de->name : "";
-        } else {
-            d.province = "广东省";
-            d.city = "深圳市";
-            d.district = "宝安区";
-            d.district_id = kDefaultDistrictId;
-        }
-
-        unsigned hash = 0;
-        for (char c : id) {
-            hash = hash * 33u + static_cast<unsigned char>(c);
-        }
-        d.text = (hash % 3u == 0) ? "晴" : ((hash % 3u == 1) ? "多云" : "阴");
-        d.temp = static_cast<int32_t>(18 + (hash % 15u));
-        d.feels_like = d.temp + static_cast<int32_t>(hash % 3u);
-        d.rh = static_cast<int32_t>(55 + (hash % 30u));
-        d.wind_class = "3级";
-        d.wind_dir = "东南风";
-        d.wind_angle = static_cast<int32_t>(90 + (hash % 180u));
-        d.prec1h = 0.f;
-        d.clouds = static_cast<int32_t>(30 + (hash % 50u));
-        d.vis = 12000;
-        d.aqi = static_cast<int32_t>(30 + (hash % 60u));
-        d.pm25 = static_cast<int32_t>(10 + (hash % 40u));
-        d.pm10 = static_cast<int32_t>(20 + (hash % 50u));
-        d.no2 = 12;
-        d.so2 = 6;
-        d.o3 = 48;
-        d.co = 0.6f;
-        d.uvi = static_cast<int32_t>(3 + (hash % 6u));
-        d.pressure = 1012;
-        d.dpt = 19;
-        d.uptime = "20260913120000";
-        const char* weeks[] = {"周一","周二","周三","周四","周五","周六","周日"};
-        const char* day_texts[] = {"晴","多云","阴","小雨","多云","晴","阵雨"};
-        for (int i = 0; i < 7; ++i) {
-            WeatherForecastDay day;
-            day.date = "2026-09-" + std::to_string(13 + i);
-            day.week = weeks[i % 7];
-            day.text_day = day_texts[(i + static_cast<int>(hash)) % 7];
-            day.text_night = (i % 2) ? "多云" : "晴";
-            day.high = d.temp + 2 + (i % 3);
-            day.low = d.temp - 4 + (i % 2);
-            day.wc_day = "3级";
-            day.wd_day = "东南风";
-            day.wc_night = "2级";
-            day.wd_night = "东风";
-            day.uvi = 4 + (i % 4);
-            day.pressure = 1010 + i;
-            day.dpt = 18 + (i % 3);
-            d.forecasts.push_back(std::move(day));
-        }
-        for (int h = 0; h < 24; ++h) {
-            WeatherForecastHour hour;
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "2026-09-13 %02d:00:00", h);
-            hour.data_time = buf;
-            hour.text = (h < 6 || h > 18) ? "多云" : "晴";
-            hour.temp_fc = static_cast<int32_t>(d.temp - 2 + (h % 6));
-            hour.wind_class = "3级";
-            hour.wind_dir = "东南风";
-            hour.rh = static_cast<int32_t>(60 + (h % 10));
-            hour.prec1h = (h % 7 == 0) ? 0.2f : 0.f;
-            hour.clouds = 40 + (h % 20);
-            hour.wind_angle = 120;
-            hour.pop = h % 5 * 10;
-            hour.uvi = (h >= 10 && h <= 16) ? 6 : 2;
-            hour.pressure = 1012;
-            hour.dpt = 19;
-            d.forecast_hours.push_back(std::move(hour));
-        }
-        WeatherLifeIndex idx1;
-        idx1.name = "穿衣";
-        idx1.brief = "舒适";
-        idx1.detail = "建议穿短袖或薄长袖。";
-        WeatherLifeIndex idx2;
-        idx2.name = "紫外线";
-        idx2.brief = "中等";
-        idx2.detail = "外出请做好防晒。";
-        WeatherLifeIndex idx3;
-        idx3.name = "运动";
-        idx3.brief = "适宜";
-        idx3.detail = "天气不错，适合户外运动。";
-        d.indexes.push_back(idx1);
-        d.indexes.push_back(idx2);
-        d.indexes.push_back(idx3);
-        return d;
-    }
-    std::string district_id_;
-    WeatherDistrictData cached_;
-};
-
-
 
 constexpr int32_t kPanelW = 720;
 constexpr int32_t kHeaderH  = 88;
@@ -298,6 +86,12 @@ lv_obj_t* s_prov_dd      = nullptr;
 lv_obj_t* s_city_dd      = nullptr;
 lv_obj_t* s_dist_dd      = nullptr;
 lv_obj_t* s_city_dlg_mask = nullptr;
+lv_obj_t* s_city_search_ta = nullptr;
+lv_obj_t* s_city_search_results = nullptr;
+lv_obj_t* s_city_ime = nullptr;
+lv_obj_t* s_prov_row = nullptr;
+lv_obj_t* s_city_row = nullptr;
+lv_obj_t* s_dist_row = nullptr;
 lv_obj_t* s_reveal_cover  = nullptr;
 std::string s_prov_options;
 std::string s_city_options;
@@ -305,6 +99,8 @@ std::string s_dist_options;
 bool s_dd_syncing        = false;
 std::atomic<uint32_t> s_session{0};
 lv_timer_t *s_save_timer  = nullptr;
+lv_timer_t *s_fetch_timer = nullptr;
+unsigned s_seen_generation = ~0u;
 bool s_mounted = false;
 bool s_overview_dirty = false;
 bool s_forecast_dirty = false;
@@ -445,11 +241,11 @@ std::string LoadSavedDistrictId() {
     return WeatherService::Instance().DistrictId();
 }
 
-void SaveDistrictId(const char* district_id) {
+bool SaveDistrictId(const char* district_id) {
     if (district_id == nullptr || district_id[0] == '\0') {
-        return;
+        return false;
     }
-    WeatherService::Instance().SetDistrictId(district_id);
+    return WeatherService::Instance().SetDistrictId(district_id);
 }
 
 const char* SelectedDistrictId() {
@@ -620,6 +416,10 @@ void DestroyCityPickerHard()
         s_prov_dd = nullptr;
         s_city_dd = nullptr;
         s_dist_dd = nullptr;
+        s_city_search_ta = nullptr;
+        s_city_search_results = nullptr;
+        s_city_ime = nullptr;
+        s_prov_row = s_city_row = s_dist_row = nullptr;
         return;
     }
     lv_obj_t *mask = s_city_dlg_mask;
@@ -627,11 +427,16 @@ void DestroyCityPickerHard()
     s_prov_dd = nullptr;
     s_city_dd = nullptr;
     s_dist_dd = nullptr;
+    s_city_search_ta = nullptr;
+    s_city_search_results = nullptr;
+    s_city_ime = nullptr;
+    s_prov_row = s_city_row = s_dist_row = nullptr;
     lv_obj_delete(mask);
 }
 
 void CloseCityPickerDialog() {
     /* Opaque cover → strip tabs → peel — plain SoftHide blues. */
+    if (s_city_ime != nullptr) lv_obj_add_flag(s_city_ime, LV_OBJ_FLAG_HIDDEN);
     ArmSafeCityPickerHide(false);
 }
 
@@ -648,8 +453,9 @@ void OnCityPickerSaveClicked(lv_event_t* /*e*/) {
         std::strncpy(pending, district_id, sizeof(pending) - 1);
         pending[sizeof(pending) - 1] = '\0';
     }
-    SaveDistrictId(pending[0] != '\0' ? pending
-                                      : WeatherService::kDefaultDistrictId);
+    if(!SaveDistrictId(pending[0] != '\0' ? pending : WeatherService::kDefaultDistrictId)) {
+        ShowStatus("地区保存失败，请重试");s_save_busy=false;return;
+    }
 
     /* Click stack: id + status only. Soft-hide / ClearContainer after save
      * completed markers then still solid-blued the next flush. */
@@ -670,26 +476,10 @@ void OnCityPickerSaveClicked(lv_event_t* /*e*/) {
                 return;
             }
 
-            write(1, "WX_FETCH\n", 9);
-            WeatherDistrictData data;
-            WeatherService::Instance().Fetch(data);
-
-            write(1, "WX_APPLY\n", 9);
-            if (data.valid) {
-                char buf[96];
-                std::snprintf(buf, sizeof(buf), "%s %s  %" PRId32 "°",
-                              data.city.c_str(), data.district.c_str(),
-                              data.temp);
-                ShowStatus(buf);
-            } else {
-                ShowStatus(I18n::T("加载失败"));
-            }
-            s_overview_dirty = true;
-            s_forecast_dirty = true;
-            s_hours_dirty = true;
-            s_index_dirty = true;
-            write(1, "WX_APPLY_OK\n", 12);
-
+            WeatherService::Instance().Request(true);
+            s_seen_generation=~0u;
+            ShowStatus("地区已保存，正在更新天气");
+            s_overview_dirty=s_forecast_dirty=s_hours_dirty=s_index_dirty=true;
             ArmSafeCityPickerHide(true);
         },
         kSaveApplyDelayMs, nullptr);
@@ -725,6 +515,101 @@ void SyncDropdownsFromDistrictId(const char* district_id) {
     FillDistrictOptions(prov, city);
     lv_dropdown_set_selected(s_dist_dd, static_cast<uint32_t>(dist));
     s_dd_syncing = false;
+}
+
+bool SearchContains(const char* value, const std::string& query) {
+    if (value == nullptr || query.empty()) return query.empty();
+    std::string haystack(value), needle(query);
+    if (haystack.find(needle) != std::string::npos) return true;
+    std::transform(haystack.begin(), haystack.end(), haystack.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(needle.begin(), needle.end(), needle.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return haystack.find(needle) != std::string::npos;
+}
+
+struct CitySearchItem { std::string district_id; };
+
+void OnCitySearchItemClicked(lv_event_t* e) {
+    auto* item = static_cast<CitySearchItem*>(lv_event_get_user_data(e));
+    if (item == nullptr) return;
+    SyncDropdownsFromDistrictId(item->district_id.c_str());
+    if (s_city_ime != nullptr) lv_obj_add_flag(s_city_ime, LV_OBJ_FLAG_HIDDEN);
+    if (s_city_search_ta != nullptr) lv_textarea_set_text(s_city_search_ta, "");
+}
+
+void OnCitySearchItemDeleted(lv_event_t* e) {
+    delete static_cast<CitySearchItem*>(lv_event_get_user_data(e));
+}
+
+void RefreshCitySearchResults() {
+    if (s_city_search_ta == nullptr || s_city_search_results == nullptr) return;
+    const char* raw = lv_textarea_get_text(s_city_search_ta);
+    const std::string query = raw ? raw : "";
+    const bool searching = !query.empty();
+    lv_obj_t* rows[] = {s_prov_row, s_city_row, s_dist_row};
+    for (lv_obj_t* row : rows) {
+        if (row == nullptr) continue;
+        if (searching) lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (searching) lv_obj_remove_flag(s_city_search_results, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(s_city_search_results, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clean(s_city_search_results);
+    if (!searching) return;
+
+    size_t matches = 0;
+    for (size_t p = 0; p < weather_cities::kProvinceCount && matches < 8; ++p) {
+        const auto& province = weather_cities::kProvinces[p];
+        for (uint16_t c = 0; c < province.city_count && matches < 8; ++c) {
+            const size_t city_index = province.city_start + c;
+            const auto& city = weather_cities::kCities[city_index];
+            for (uint16_t d = 0; d < city.district_count && matches < 8; ++d) {
+                const auto& district = weather_cities::kDistricts[city.district_start + d];
+                if (!SearchContains(province.name, query) &&
+                    !SearchContains(city.name, query) &&
+                    !SearchContains(district.name, query) &&
+                    !SearchContains(district.id, query)) continue;
+                char label[160];
+                std::snprintf(label, sizeof(label), "%s  /  %s  /  %s",
+                              province.name, city.name, district.name);
+                lv_obj_t* button = lv_button_create(s_city_search_results);
+                screen_strip_obj_chrome(button);
+                lv_obj_set_width(button, LV_PCT(100));
+                lv_obj_set_height(button, 40);
+                lv_obj_set_style_radius(button, 10, LV_PART_MAIN);
+                lv_obj_set_style_bg_color(button, lv_color_hex(kColorCard), LV_PART_MAIN);
+                lv_obj_set_style_bg_color(button, lv_color_hex(kColorTabActive),
+                                          LV_PART_MAIN | LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(button, 0, LV_PART_MAIN);
+                auto* text = lv_label_create(button);
+                lv_label_set_text(text, label);
+                lv_label_set_long_mode(text, LV_LABEL_LONG_DOT);
+                lv_obj_set_width(text, kModalCardW - 64);
+                lv_obj_set_style_text_color(text, lv_color_hex(kColorText), LV_PART_MAIN);
+                lv_obj_set_style_text_font(text, font_sub(), LV_PART_MAIN);
+                lv_obj_center(text);
+                auto* ctx = new CitySearchItem{district.id};
+                lv_obj_add_event_cb(button, OnCitySearchItemClicked, LV_EVENT_CLICKED, ctx);
+                lv_obj_add_event_cb(button, OnCitySearchItemDeleted, LV_EVENT_DELETE, ctx);
+                ++matches;
+            }
+        }
+    }
+    if (!matches) {
+        lv_obj_t* hint = lv_label_create(s_city_search_results);
+        lv_label_set_text(hint, I18n::T("没有匹配地区，试试拼音候选或区县名"));
+        lv_obj_set_width(hint, LV_PCT(100));
+        lv_obj_set_style_text_color(hint, lv_color_hex(kColorSubtle), LV_PART_MAIN);
+        lv_obj_set_style_text_font(hint, font_sub(), LV_PART_MAIN);
+    }
+}
+
+void OnCitySearchChanged(lv_event_t* /*e*/) { RefreshCitySearchResults(); }
+
+void OnCitySearchFocused(lv_event_t* e) {
+    if (s_city_ime != nullptr)
+        HiInputMethod_SetTextArea(s_city_ime, lv_event_get_target_obj(e), true);
 }
 
 void OnProvinceChanged(lv_event_t* /*e*/) {
@@ -780,7 +665,7 @@ void OpenCityPickerDialog() {
         return;
     }
 
-    constexpr int32_t kCardH = 480;
+    constexpr int32_t kCardH = 560;
     constexpr int32_t kBtnW = 200;
     constexpr int32_t kBtnH = 56;
     constexpr int32_t kBtnRowH = 72;
@@ -819,8 +704,38 @@ void OpenCityPickerDialog() {
     lv_obj_set_style_pad_bottom(dlg_title, 8, LV_PART_MAIN);
     lv_obj_remove_flag(dlg_title, LV_OBJ_FLAG_CLICKABLE);
 
-    auto make_picker_row = [&](const char* label, lv_obj_t** out_dd) {
+    s_city_search_ta = lv_textarea_create(card);HiInputMethod_Bind(s_city_search_ta,true);
+    lv_obj_set_size(s_city_search_ta, LV_PCT(100), 48);
+    lv_textarea_set_one_line(s_city_search_ta, true);
+    lv_textarea_set_max_length(s_city_search_ta, 32);
+    lv_textarea_set_placeholder_text(s_city_search_ta,
+                                     I18n::T("搜索地区，支持拼音输入"));
+    lv_obj_set_style_radius(s_city_search_ta, 12, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_city_search_ta, lv_color_hex(0x121726), LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_city_search_ta, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_city_search_ta, font_sub(), LV_PART_MAIN);
+    lv_obj_add_event_cb(s_city_search_ta, OnCitySearchFocused, LV_EVENT_FOCUSED,
+                        nullptr);
+    lv_obj_add_event_cb(s_city_search_ta, OnCitySearchFocused, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(s_city_search_ta, OnCitySearchChanged,
+                        LV_EVENT_VALUE_CHANGED, nullptr);
+    screen_swipe_back_ignore(s_city_search_ta, true);
+
+    s_city_search_results = lv_obj_create(card);
+    screen_strip_obj_chrome(s_city_search_results);
+    lv_obj_set_width(s_city_search_results, LV_PCT(100));
+    lv_obj_set_height(s_city_search_results, 190);
+    lv_obj_set_style_bg_opa(s_city_search_results, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_city_search_results, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(s_city_search_results, 6, LV_PART_MAIN);
+    lv_obj_set_flex_flow(s_city_search_results, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(s_city_search_results, LV_DIR_VER);
+    lv_obj_add_flag(s_city_search_results, LV_OBJ_FLAG_HIDDEN);
+
+    auto make_picker_row = [&](const char* label, lv_obj_t** out_dd,
+                               lv_obj_t** out_row) {
         lv_obj_t* row = lv_obj_create(card);
+        *out_row = row;
         screen_strip_obj_chrome(row);
         lv_obj_set_width(row, LV_PCT(100));
         lv_obj_set_height(row, LV_SIZE_CONTENT);
@@ -842,14 +757,14 @@ void OpenCityPickerDialog() {
         lv_obj_add_event_cb(*out_dd, OnDropdownListOpened, LV_EVENT_READY, nullptr);
     };
 
-    make_picker_row(I18n::T("省份"), &s_prov_dd);
+    make_picker_row(I18n::T("省份"), &s_prov_dd, &s_prov_row);
     lv_obj_add_event_cb(s_prov_dd, OnProvinceChanged, LV_EVENT_VALUE_CHANGED,
                         nullptr);
 
-    make_picker_row(I18n::T("城市"), &s_city_dd);
+    make_picker_row(I18n::T("城市"), &s_city_dd, &s_city_row);
     lv_obj_add_event_cb(s_city_dd, OnCityChanged, LV_EVENT_VALUE_CHANGED, nullptr);
 
-    make_picker_row(I18n::T("区县"), &s_dist_dd);
+    make_picker_row(I18n::T("区县"), &s_dist_dd, &s_dist_row);
     lv_obj_add_event_cb(s_dist_dd, OnDistrictChanged, LV_EVENT_VALUE_CHANGED,
                         nullptr);
 
@@ -892,6 +807,13 @@ void OpenCityPickerDialog() {
     lv_obj_set_style_text_color(save_lbl, lv_color_hex(kColorText), LV_PART_MAIN);
     lv_obj_center(save_lbl);
     lv_obj_remove_flag(save_lbl, LV_OBJ_FLAG_CLICKABLE);
+
+    s_city_ime = HiInputMethod_Create(mask);
+    if (s_city_ime != nullptr) {
+        lv_obj_set_size(s_city_ime, kPanelW, 350);
+        lv_obj_align(s_city_ime, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_add_flag(s_city_ime, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void OnCityPickerOpenClicked(lv_event_t* /*e*/) { OpenCityPickerDialog(); }
@@ -944,6 +866,9 @@ void AppendDetailRow(lv_obj_t* grid, const char* key, const char* value) {
 }
 
 void FormatUptime(const std::string& uptime, char* buf, size_t len) {
+    if(uptime.size()>=16 && uptime[4]=='-' && uptime[10]=='T') {
+        std::snprintf(buf,len,"%s %s",uptime.substr(5,5).c_str(),uptime.substr(11,5).c_str());return;
+    }
     if (uptime.size() >= 12) {
         std::snprintf(buf, len, "%s-%s %s:%s", uptime.substr(4, 2).c_str(),
                       uptime.substr(6, 2).c_str(), uptime.substr(8, 2).c_str(),
@@ -1206,18 +1131,25 @@ void BuildOverviewTab(const WeatherDistrictData& data) {
     std::snprintf(buf, sizeof(buf), "%" PRId32, data.uvi);
     AppendDetailRow(detail_grid, I18n::T("紫外线"), buf);
     std::snprintf(buf, sizeof(buf), "%" PRId32, data.aqi);
+    if(data.aqi<0) std::snprintf(buf,sizeof(buf),"--");
     AppendDetailRow(detail_grid, "AQI", buf);
-    std::snprintf(buf, sizeof(buf), "%" PRId32 " µg/m³", data.pm25);
+    std::snprintf(buf, sizeof(buf), "%" PRId32 " ug/m3", data.pm25);
+    if(data.pm25<0) std::snprintf(buf,sizeof(buf),"--");
     AppendDetailRow(detail_grid, "PM2.5", buf);
-    std::snprintf(buf, sizeof(buf), "%" PRId32 " µg/m³", data.pm10);
+    std::snprintf(buf, sizeof(buf), "%" PRId32 " ug/m3", data.pm10);
+    if(data.pm10<0) std::snprintf(buf,sizeof(buf),"--");
     AppendDetailRow(detail_grid, "PM10", buf);
-    std::snprintf(buf, sizeof(buf), "%" PRId32 " µg/m³", data.no2);
-    AppendDetailRow(detail_grid, "NO₂", buf);
-    std::snprintf(buf, sizeof(buf), "%" PRId32 " µg/m³", data.so2);
-    AppendDetailRow(detail_grid, "SO₂", buf);
-    std::snprintf(buf, sizeof(buf), "%" PRId32 " µg/m³", data.o3);
-    AppendDetailRow(detail_grid, "O₃", buf);
-    std::snprintf(buf, sizeof(buf), "%.1f mg/m³", data.co);
+    std::snprintf(buf, sizeof(buf), "%" PRId32 " ug/m3", data.no2);
+    if(data.no2<0) std::snprintf(buf,sizeof(buf),"--");
+    AppendDetailRow(detail_grid, "NO2", buf);
+    std::snprintf(buf, sizeof(buf), "%" PRId32 " ug/m3", data.so2);
+    if(data.so2<0) std::snprintf(buf,sizeof(buf),"--");
+    AppendDetailRow(detail_grid, "SO2", buf);
+    std::snprintf(buf, sizeof(buf), "%" PRId32 " ug/m3", data.o3);
+    if(data.o3<0) std::snprintf(buf,sizeof(buf),"--");
+    AppendDetailRow(detail_grid, "O3", buf);
+    std::snprintf(buf, sizeof(buf), "%.1f mg/m3", data.co);
+    if(data.co<0) std::snprintf(buf,sizeof(buf),"--");
     AppendDetailRow(detail_grid, "CO", buf);
     FormatUptime(data.uptime, buf, sizeof(buf));
     AppendDetailRow(detail_grid, I18n::T("更新"), buf);
@@ -1435,45 +1367,26 @@ void ShowLoadingPlaceholder() {
     ShowStatus(I18n::T("加载中..."));
 }
 
-struct FetchTimerCtx {
-    uint32_t session;
-};
-
-void OnFetchTimer(lv_timer_t* t) {
-    auto* ctx = static_cast<FetchTimerCtx*>(lv_timer_get_user_data(t));
-    const uint32_t my_session = ctx ? ctx->session : 0;
-    delete ctx;
-    lv_timer_delete(t);
-
-    WeatherDistrictData data;
-    const int err = WeatherService::Instance().Fetch(data);
-
-    if (s_session.load() == my_session && s_screen != nullptr) {
-        if (err == 0) {
-            ApplyOverviewOnly(data);
-        } else {
-            ApplyOverviewOnly(WeatherDistrictData());
-            ShowStatus(I18n::T("加载失败"));
-        }
+void OnFetchTimer(lv_timer_t*) {
+    if(!s_screen || s_save_busy || s_hide_busy) return;
+    auto& service=WeatherService::Instance();
+    service.Request();
+    auto snapshot=service.GetSnapshot();
+    if(snapshot.generation==s_seen_generation) return;
+    s_seen_generation=snapshot.generation;
+    if(snapshot.data.valid) {
+        ApplyOverviewOnly(snapshot.data);
+        if(!snapshot.error.empty()) ShowStatus("更新失败，显示上次天气");
+    } else if(!snapshot.error.empty()) {
+        ClearTabMessage(s_tab_overview,"暂无实时天气数据");
+        ShowStatus(snapshot.error.c_str());
     }
 }
-
 void TriggerFetch() {
-    const uint32_t session =
-        s_session.fetch_add(1, std::memory_order_relaxed) + 1;
-    ShowStatus(I18n::T("加载中..."));
-    ShowLoadingPlaceholder();
-
-    auto* ctx = new FetchTimerCtx{session};
-    lv_timer_t* tm = lv_timer_create(OnFetchTimer, 1, ctx);
-    if (tm == nullptr) {
-        delete ctx;
-        WeatherDistrictData data;
-        WeatherService::Instance().Fetch(data);
-        ApplyOverviewOnly(data);
-    } else {
-        lv_timer_set_repeat_count(tm, 1);
-    }
+    WeatherService::Instance().Request(true);
+    s_seen_generation=~0u;
+    ShowStatus("正在更新天气…");
+    if(!WeatherService::Instance().Cached().valid) ShowLoadingPlaceholder();
 }
 
 void OnTabChanged(lv_event_t* /*e*/) {
@@ -1529,7 +1442,7 @@ void BuildTabView(lv_obj_t* scr) {
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_CHECKED);
 
     lv_obj_t* content = lv_tabview_get_content(tv);
-    screen_swipe_back_ignore(content, true);
+    (void)content;
 
     s_tab_overview = lv_tabview_add_tab(tv, I18n::T("今日天气"));
     StyleScrollTab(s_tab_overview);
@@ -1550,9 +1463,11 @@ void OnSwipeBack() {
     HomeScreen::SwitchToHome();
 }
 
-void OnScreenUnloaded(lv_event_t* /*e*/) {
+void OnScreenUnloaded(lv_event_t* e) {
+    if (lv_event_get_target_obj(e) != s_screen) return;
     s_session.fetch_add(1, std::memory_order_relaxed);
     DestroyCityPickerHard();
+    if(s_fetch_timer){lv_timer_delete(s_fetch_timer);s_fetch_timer=nullptr;}
     s_screen = nullptr;
     s_tabview = nullptr;
     s_tab_overview = nullptr;
@@ -1560,6 +1475,10 @@ void OnScreenUnloaded(lv_event_t* /*e*/) {
     s_tab_hours = nullptr;
     s_tab_index = nullptr;
     s_status_lbl = nullptr;
+    s_city_search_ta = nullptr;
+    s_city_search_results = nullptr;
+    s_city_ime = nullptr;
+    s_prov_row = s_city_row = s_dist_row = nullptr;
     s_mounted = false;
     s_overview_dirty = false;
     s_forecast_dirty = false;
@@ -1656,9 +1575,11 @@ lv_obj_t *CreateStaticImpl()
     /* Full chrome — fetch after first paint, not inside APP_CREATE. */
     BuildTabView(scr);
     BuildChrome(scr);
-    WeatherService::Instance().SetDistrictId(LoadSavedDistrictId());
+    // District is restored by the shared service from persistent settings.
     ShowLoadingPlaceholder();
     s_mounted = true;
+    s_seen_generation=~0u;
+    s_fetch_timer=lv_timer_create(OnFetchTimer,250,nullptr);
     lv_timer_t *arm = lv_timer_create(
         [](lv_timer_t *t) {
             lv_timer_delete(t);
@@ -1689,3 +1610,14 @@ lv_obj_t* WeatherScreen::Create() {
     root_ = CreateStatic();
     return root_;
 }
+
+#if defined(HI_SERVICES_PROBE) && HI_SERVICES_PROBE
+extern "C" bool hi_weather_probe_picker(){
+    using namespace weather_detail;OpenCityPickerDialog();if(!s_dist_dd)return false;
+    const auto id=WeatherService::Instance().DistrictId();const auto match=weather_cities::FindDistrictById(id.c_str());
+    const auto* entry=weather_cities::GetDistrict(match.province_idx,match.city_idx,match.district_idx);
+    char selected[160];lv_dropdown_get_selected_str(s_dist_dd,selected,sizeof(selected));
+    printf("WEATHER_PICKER selected=%s id=%s\n",selected,id.c_str());fflush(stdout);
+    return entry&&!strcmp(selected,entry->name)&&id==SelectedDistrictId();
+}
+#endif

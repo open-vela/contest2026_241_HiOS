@@ -26,13 +26,19 @@
 #define FONT_AWESOME_BATTERY_SLASH     "\xEF\x8D\xB7"  /* U+F377 battery-slash */
 
 /* Network icons */
+#define FONT_AWESOME_PLANE             "\xEF\x81\xB2"
+#define FONT_AWESOME_SIGNAL_1          "\xEF\x9A\x8C"
+#define FONT_AWESOME_SIGNAL_2          "\xEF\x9A\x8D"
+#define FONT_AWESOME_SIGNAL_3          "\xEF\x9A\x8E"
 #define FONT_AWESOME_WIFI              "\xEF\x87\xAB"  /*  */
-#define FONT_AWESOME_WIFI_WEAK         "\xEF\x9A\xAB"  /*  */
-#define FONT_AWESOME_WIFI_FAIR         "\xEF\x9A\xAC"  /*  */
-#define FONT_AWESOME_WIFI_STRONG       "\xEF\x9A\xAD"  /*  */
-#define FONT_AWESOME_WIFI_SLASH        "\xEF\x9A\xAA"  /*  */
+#define FONT_AWESOME_WIFI_WEAK         "\xEF\x9A\xAA"  /*  */
+#define FONT_AWESOME_WIFI_FAIR         "\xEF\x9A\xAB"  /*  */
+#define FONT_AWESOME_WIFI_STRONG       FONT_AWESOME_WIFI  /*  */
+#define FONT_AWESOME_WIFI_SLASH        "\xEF\x9A\xAC"  /*  */
 #define FONT_AWESOME_SIGNAL            "\xEF\x80\x92"  /*  */
-#define FONT_AWESOME_SIGNAL_SLASH      "\xEF\x9A\xB9"  /*  */
+#define FONT_AWESOME_SIGNAL_SLASH      "\xEF\x9A\x95"  /*  */
+
+#define FONT_AWESOME_WIFI_WARNING      "\xEF\x9A\xAD"
 
 /* Connectivity icons */
 #define FONT_AWESOME_BLUETOOTH         "\xEF\x8A\x93"  /*  */

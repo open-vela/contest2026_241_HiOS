@@ -49,35 +49,36 @@
 
 LV_FONT_DECLARE(font_puhui_30_4);
 LV_FONT_DECLARE(font_puhui_20_4);
+LV_FONT_DECLARE(font_puhui_number_50_4);
 
 namespace {
 
 // ----- screen layout constants ---------------------------------------------
 constexpr int kPanelSize  = 720;
 constexpr int kPad        = 16;
-constexpr int kHeaderH    = 80;
-constexpr int kHistoryH   = 40;
-constexpr int kDisplayH   = 120;
+constexpr int kHeaderH    = 64;
+constexpr int kHistoryH   = 32;
+constexpr int kDisplayH   = 102;
 constexpr int kGridY      = kHeaderH + kHistoryH + kDisplayH;     // 240
 constexpr int kGridH      = kPanelSize - kGridY - kPad;           // 464
 constexpr int kGridCols   = 4;
-constexpr int kGridRows   = 5;
+constexpr int kGridRows   = 6;
 
 // ----- color palette (iOS-inspired dark) -----------------------------------
-constexpr uint32_t kColorBg          = 0x000000;
-constexpr uint32_t kColorTextPrimary = 0xFFFFFF;
-constexpr uint32_t kColorTextHistory = 0x9A9A9A;
+constexpr uint32_t kColorBg          = 0xDDDeda;
+constexpr uint32_t kColorTextPrimary = 0x30382E;
+constexpr uint32_t kColorTextHistory = 0x747D6E;
 
-constexpr uint32_t kDigitBg          = 0x333333;
-constexpr uint32_t kDigitBgPress     = 0x595959;
-constexpr uint32_t kDigitText        = 0xFFFFFF;
+constexpr uint32_t kDigitBg          = 0xF9FAF5;
+constexpr uint32_t kDigitBgPress     = 0xD4D8D0;
+constexpr uint32_t kDigitText        = 0x353A34;
 
-constexpr uint32_t kFuncBg           = 0xA5A5A5;
-constexpr uint32_t kFuncBgPress      = 0xD0D0D0;
-constexpr uint32_t kFuncText         = 0x1A1A1A;
+constexpr uint32_t kFuncBg           = 0x999D96;
+constexpr uint32_t kFuncBgPress      = 0x656B62;
+constexpr uint32_t kFuncText         = 0xFFFFFF;
 
-constexpr uint32_t kOpBg             = 0xFF9500;
-constexpr uint32_t kOpBgPress        = 0xFFB04D;
+constexpr uint32_t kOpBg             = 0x969B94;
+constexpr uint32_t kOpBgPress        = 0x697165;
 constexpr uint32_t kOpText           = 0xFFFFFF;
 
 constexpr uint32_t kColorHintText    = 0x6E6E70;
@@ -85,7 +86,7 @@ constexpr uint32_t kColorHintText    = 0x6E6E70;
 // ----- calculator state machine --------------------------------------------
 enum class Action {
     kDigit, kDot, kClear, kBackspace, kSign, kPercent,
-    kOpAdd, kOpSub, kOpMul, kOpDiv, kEquals,
+    kOpAdd, kOpSub, kOpMul, kOpDiv, kEquals, kMc, kMAdd, kMSub, kMr,
 };
 
 struct Btn {
@@ -99,32 +100,17 @@ struct Btn {
 
 // Layout table -- this is the single source of truth for the keypad.
 const Btn kButtons[] = {
-    // row 0: function row
-    {"AC",  Action::kClear,     0, 0, 0, 1, 1, Btn::Style::kFunc},
-    {"+/-", Action::kSign,      0, 0, 1, 1, 1, Btn::Style::kFunc},
-    {"%",   Action::kPercent,   0, 0, 2, 1, 1, Btn::Style::kFunc},
-    {"/",   Action::kOpDiv,     0, 0, 3, 1, 1, Btn::Style::kOp},
-    // row 1
-    {"7",   Action::kDigit,   '7', 1, 0, 1, 1, Btn::Style::kDigit},
-    {"8",   Action::kDigit,   '8', 1, 1, 1, 1, Btn::Style::kDigit},
-    {"9",   Action::kDigit,   '9', 1, 2, 1, 1, Btn::Style::kDigit},
-    {"x",   Action::kOpMul,     0, 1, 3, 1, 1, Btn::Style::kOp},
-    // row 2
-    {"4",   Action::kDigit,   '4', 2, 0, 1, 1, Btn::Style::kDigit},
-    {"5",   Action::kDigit,   '5', 2, 1, 1, 1, Btn::Style::kDigit},
-    {"6",   Action::kDigit,   '6', 2, 2, 1, 1, Btn::Style::kDigit},
-    {"-",   Action::kOpSub,     0, 2, 3, 1, 1, Btn::Style::kOp},
-    // row 3
-    {"1",   Action::kDigit,   '1', 3, 0, 1, 1, Btn::Style::kDigit},
-    {"2",   Action::kDigit,   '2', 3, 1, 1, 1, Btn::Style::kDigit},
-    {"3",   Action::kDigit,   '3', 3, 2, 1, 1, Btn::Style::kDigit},
-    {"+",   Action::kOpAdd,     0, 3, 3, 1, 1, Btn::Style::kOp},
-    // row 4 -- "0" spans 2 columns
-    {"0",   Action::kDigit,   '0', 4, 0, 1, 2, Btn::Style::kDigit},
-    {".",   Action::kDot,       0, 4, 2, 1, 1, Btn::Style::kDigit},
-    {"=",   Action::kEquals,    0, 4, 3, 1, 1, Btn::Style::kOp},
+ {"mc",Action::kMc,0,0,0,1,1,Btn::Style::kFunc},{"m+",Action::kMAdd,0,0,1,1,1,Btn::Style::kFunc},{"m-",Action::kMSub,0,0,2,1,1,Btn::Style::kFunc},{"mr",Action::kMr,0,0,3,1,1,Btn::Style::kFunc},
+ {"C",Action::kClear,0,1,0,1,1,Btn::Style::kFunc},{"+/-",Action::kSign,0,1,1,1,1,Btn::Style::kFunc},{"÷",Action::kOpDiv,0,1,2,1,1,Btn::Style::kOp},{"×",Action::kOpMul,0,1,3,1,1,Btn::Style::kOp},
+ {"7",Action::kDigit,'7',2,0,1,1,Btn::Style::kDigit},{"8",Action::kDigit,'8',2,1,1,1,Btn::Style::kDigit},{"9",Action::kDigit,'9',2,2,1,1,Btn::Style::kDigit},{"−",Action::kOpSub,0,2,3,1,1,Btn::Style::kOp},
+ {"4",Action::kDigit,'4',3,0,1,1,Btn::Style::kDigit},{"5",Action::kDigit,'5',3,1,1,1,Btn::Style::kDigit},{"6",Action::kDigit,'6',3,2,1,1,Btn::Style::kDigit},{"+",Action::kOpAdd,0,3,3,1,1,Btn::Style::kOp},
+ {"1",Action::kDigit,'1',4,0,1,1,Btn::Style::kDigit},{"2",Action::kDigit,'2',4,1,1,1,Btn::Style::kDigit},{"3",Action::kDigit,'3',4,2,1,1,Btn::Style::kDigit},{"=",Action::kEquals,0,4,3,2,1,Btn::Style::kOp},
+ {"0",Action::kDigit,'0',5,0,1,2,Btn::Style::kDigit},{".",Action::kDot,0,5,2,1,1,Btn::Style::kDigit},
 };
 
+double s_memory=0;
+lv_obj_t *s_memory_lbl=nullptr;
+lv_font_t s_lcd_font{};
 double s_acc;             // accumulator
 bool   s_has_acc;         // is accumulator valid
 char   s_input[24];       // currently typed number
@@ -303,6 +289,7 @@ void OnEquals() {
 // ----- UI updates ----------------------------------------------------------
 
 void RefreshDisplay() {
+    if(s_memory_lbl)lv_label_set_text(s_memory_lbl,s_memory!=0?"M":"");
     if (s_error) {
         lv_label_set_text(s_history_lbl, "");
         lv_label_set_text(s_display_lbl, I18n::T("错误"));
@@ -357,6 +344,10 @@ void BtnEventCb(lv_event_t* e) {
         case Action::kOpMul:    OnOp('*'); break;
         case Action::kOpDiv:    OnOp('/'); break;
         case Action::kEquals:   OnEquals();          break;
+        case Action::kMc:s_memory=0;break;
+        case Action::kMAdd:if(!s_error)s_memory+=s_input[0]?ParseInput():s_has_acc?s_acc:0;break;
+        case Action::kMSub:if(!s_error)s_memory-=s_input[0]?ParseInput():s_has_acc?s_acc:0;break;
+        case Action::kMr:FormatNumber(s_memory,s_input,sizeof(s_input));s_just_eq=false;s_error=false;break;
     }
     RefreshDisplay();
 }
@@ -393,28 +384,34 @@ void BuildHeader(lv_obj_t* parent) {
 }
 
 void BuildDisplay(lv_obj_t* parent) {
+    auto *lcd=lv_obj_create(parent);screen_strip_obj_chrome(lcd);lv_obj_set_pos(lcd,16,64);lv_obj_set_size(lcd,688,120);lv_obj_remove_flag(lcd,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(lcd,lv_color_hex(0xD5D6B9),0);lv_obj_set_style_bg_opa(lcd,255,0);lv_obj_set_style_bg_grad_color(lcd,lv_color_hex(0xC3C6A9),0);lv_obj_set_style_bg_grad_dir(lcd,LV_GRAD_DIR_VER,0);
+    lv_obj_set_style_border_width(lcd,5,0);lv_obj_set_style_border_color(lcd,lv_color_hex(0x696D5E),0);lv_obj_set_style_radius(lcd,12,0);lv_obj_set_style_shadow_width(lcd,8,0);lv_obj_set_style_shadow_opa(lcd,LV_OPA_30,0);
+    s_memory_lbl=lv_label_create(lcd);lv_obj_set_pos(s_memory_lbl,7,17);lv_obj_set_style_text_font(s_memory_lbl,&font_puhui_20_4,0);
+    s_lcd_font=font_puhui_number_50_4;s_lcd_font.fallback=&font_puhui_30_4;
     // History line above the main display.
-    s_history_lbl = lv_label_create(parent);
+    s_history_lbl = lv_label_create(lcd);
     lv_label_set_text(s_history_lbl, "");
     lv_obj_set_style_text_color(s_history_lbl,
                                 lv_color_hex(kColorTextHistory), LV_PART_MAIN);
     lv_obj_set_style_text_font(s_history_lbl, &font_puhui_20_4, LV_PART_MAIN);
     lv_obj_set_style_text_align(s_history_lbl, LV_TEXT_ALIGN_RIGHT,
                                 LV_PART_MAIN);
-    lv_obj_set_size(s_history_lbl, kPanelSize - 2 * kPad, kHistoryH);
-    lv_obj_set_pos(s_history_lbl, kPad, kHeaderH);
+    lv_label_set_long_mode(s_history_lbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_size(s_history_lbl, kPanelSize - 2 * kPad - 24, kHistoryH);
+    lv_obj_set_pos(s_history_lbl, 7, 9);
 
     // Main display -- right-aligned big number.
-    s_display_lbl = lv_label_create(parent);
+    s_display_lbl = lv_label_create(lcd);
     lv_label_set_text(s_display_lbl, "0");
     lv_obj_set_style_text_color(s_display_lbl,
                                 lv_color_hex(kColorTextPrimary), LV_PART_MAIN);
-    lv_obj_set_style_text_font(s_display_lbl, &font_puhui_30_4, LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_display_lbl, &s_lcd_font, LV_PART_MAIN);
     lv_obj_set_style_text_align(s_display_lbl, LV_TEXT_ALIGN_RIGHT,
                                 LV_PART_MAIN);
     lv_label_set_long_mode(s_display_lbl, LV_LABEL_LONG_CLIP);
-    lv_obj_set_size(s_display_lbl, kPanelSize - 2 * kPad - 8, kDisplayH);
-    lv_obj_set_pos(s_display_lbl, kPad + 4, kHeaderH + kHistoryH);
+    lv_obj_set_size(s_display_lbl, kPanelSize - 2 * kPad - 30, 60);
+    lv_obj_set_pos(s_display_lbl, 5, 43);
 }
 
 void StyleButton(lv_obj_t* btn, Btn::Style style) {
@@ -433,9 +430,12 @@ void StyleButton(lv_obj_t* btn, Btn::Style style) {
      * layout/click chrome and leaves a broken unusable keypad. */
     lv_obj_set_style_bg_color(btn, lv_color_hex(bg),       LV_PART_MAIN);
     lv_obj_set_style_bg_opa  (btn, LV_OPA_COVER,           LV_PART_MAIN);
-    lv_obj_set_style_radius  (btn, LV_RADIUS_CIRCLE,       LV_PART_MAIN);
+    lv_obj_set_style_radius  (btn, 10,       LV_PART_MAIN);
     lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(btn, 6, LV_PART_MAIN);
+    lv_obj_set_style_shadow_ofs_y(btn,4,0);lv_obj_set_style_shadow_opa(btn,LV_OPA_30,0);
+    lv_obj_set_style_border_width(btn,1,0);lv_obj_set_style_border_color(btn,lv_color_hex(0xADB1A7),0);
+    lv_obj_set_style_bg_grad_color(btn,lv_color_hex(style==Btn::Style::kDigit?0xECEFE7:0x71786C),0);lv_obj_set_style_bg_grad_dir(btn,LV_GRAD_DIR_VER,0);
     lv_obj_set_style_bg_color(btn, lv_color_hex(bg_press),
                               LV_PART_MAIN | LV_STATE_PRESSED);
 
@@ -466,6 +466,9 @@ void BuildKeypad(lv_obj_t* parent) {
                              LV_GRID_ALIGN_STRETCH, def.col, def.col_span,
                              LV_GRID_ALIGN_STRETCH, def.row, def.row_span);
         StyleButton(btn, def.style);
+        if(def.row==0){lv_obj_set_style_bg_color(btn,lv_color_hex(0x565C51),0);lv_obj_set_style_bg_grad_color(btn,lv_color_hex(0x333A30),0);}
+        if(def.action==Action::kEquals){lv_obj_set_style_bg_color(btn,lv_color_hex(0xFF9067),0);lv_obj_set_style_bg_grad_color(btn,lv_color_hex(0xF37045),0);}
+        screen_swipe_back_ignore(btn,true);
         lv_obj_add_event_cb(btn, BtnEventCb, LV_EVENT_CLICKED,
                             const_cast<Btn*>(&def));
 

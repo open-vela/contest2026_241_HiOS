@@ -9,6 +9,8 @@
 #include <arch/board/board.h>
 #include <metalio/metalio.h>
 
+static FAR struct i2c_master_s *g_i2c;
+
 static int nu_write(FAR struct i2c_master_s *i2c, uint8_t reg, uint8_t val)
 {
   struct i2c_msg_s msg;
@@ -47,6 +49,8 @@ int metalio_nu1680_initialize(FAR struct i2c_master_s *i2c)
       return -EINVAL;
     }
 
+  g_i2c = i2c;
+
   ret = nu_read(i2c, 0x1e, &cur);
   if (ret < 0)
     {
@@ -67,4 +71,16 @@ int metalio_nu1680_initialize(FAR struct i2c_master_s *i2c)
   ret = nu_write(i2c, 0x15, 0x00);
   syslog(LOG_INFO, "NU1680 ready, ILIM=1.4A\n");
   return ret;
+}
+
+int metalio_nu1680_probe(void)
+{
+  uint8_t cur = 0;
+
+  if (g_i2c == NULL)
+    {
+      return -ENODEV;
+    }
+
+  return nu_read(g_i2c, 0x1e, &cur);
 }

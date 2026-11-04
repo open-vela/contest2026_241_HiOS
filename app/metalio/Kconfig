@@ -20,6 +20,16 @@ config METALIO_LOG_LEVEL
 	---help---
 		Controls ESP_LOGE/W/I/D/V output via the esp_log_shim layer.
 
+config METALIO_PHONE_PCM_BRIDGE
+	bool "Build the phone duplex PCM transport core"
+	default n
+	---help---
+		Build the bounded bidirectional 8/16 kHz PCM transport. This does
+		not configure pins or enable a modem audio interface. A board
+		adapter must supply verified, cancellable full-duplex PCM ports
+		and coordinate exclusive audio ownership before using the core.
+		Leave disabled until that board adapter has been implemented.
+
 config METALIO_OPENCLAW_URL
 	string "OpenClaw HTTP base URL"
 	default "https://api.openclaw.local"

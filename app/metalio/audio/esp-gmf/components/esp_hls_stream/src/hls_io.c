@@ -79,9 +79,11 @@ static char *get_matched_io(esp_gmf_pool_handle_t pool, char *url)
 static void *cache_open(char *url, void *input_ctx)
 {
     hls_io_t *hls_io = (hls_io_t *)input_ctx;
+    if (__atomic_load_n(&hls_io->aborted, __ATOMIC_ACQUIRE)) return NULL;
     esp_hls_io_cfg_t *cfg = (esp_hls_io_cfg_t *)OBJ_GET_CFG(hls_io);
     cached_io_t *cached_io = esp_gmf_oal_calloc(1, sizeof(cached_io_t));
     ESP_GMF_MEM_VERIFY(TAG, cached_io, return NULL, "cached io", sizeof(cached_io_t));
+    cached_io->hls_io = hls_io;
     esp_hls_file_type_t type = ESP_HLS_FILE_TYPE_AUDIO;
     hls_fetcher_get_file_type(hls_io->hls_fetcher, url, &type);
     esp_gmf_err_t ret = ESP_GMF_ERR_OK;
@@ -147,6 +149,8 @@ static void *cache_open(char *url, void *input_ctx)
 static int cache_reload(void *ctx, char *url)
 {
     cached_io_t *cached_io = (cached_io_t *)ctx;
+    if (!cached_io || !cached_io->hls_io ||
+        __atomic_load_n(&cached_io->hls_io->aborted, __ATOMIC_ACQUIRE)) return -1;
     ESP_LOGI(TAG, "Reload %s", url);
     return esp_gmf_io_reload(cached_io->io, url);
 }
@@ -160,6 +164,8 @@ static int cache_read(void *buffer, uint32_t size, void *ctx)
     bool is_done = false;
     int fill_size = 0;
     while (!is_done && fill_size < size) {
+        if (cached_io->hls_io &&
+            __atomic_load_n(&cached_io->hls_io->aborted, __ATOMIC_ACQUIRE)) return -1;
         int buf_len = size - fill_size;
         esp_gmf_payload_t payload = {
             .buf = buffer,
@@ -256,6 +262,7 @@ static esp_gmf_err_t _hls_get_score(esp_gmf_io_handle_t obj, const char *url, in
 static esp_gmf_err_t _hls_open(esp_gmf_io_handle_t io)
 {
     hls_io_t *hls_io = (hls_io_t *)io;
+    __atomic_store_n(&hls_io->aborted, false, __ATOMIC_RELEASE);
     char *uri = NULL;
     esp_gmf_io_get_uri((esp_gmf_io_handle_t)hls_io, &uri);
     if (uri == NULL) {
@@ -443,12 +450,19 @@ static esp_gmf_err_io_t _hls_acquire_read(esp_gmf_io_handle_t handle, void *payl
     }
     int retry_count = HLS_MAX_RETRY_COUNT;
 RETRY:
+    if (__atomic_load_n(&hls_io->aborted, __ATOMIC_ACQUIRE)) return ESP_GMF_IO_ABORT;
     ret = hls_fetcher_read_data(hls_io->hls_fetcher, ESP_EXTRACTOR_STREAM_TYPE_AUDIO,
                                 &stream_data);
+    if (__atomic_load_n(&hls_io->aborted, __ATOMIC_ACQUIRE)) return ESP_GMF_IO_ABORT;
 
     if (ret != 0) {
         if (ret == ESP_EXTRACTOR_ERR_WAITING_OUTPUT) {
-            media_lib_thread_sleep(500);
+            // Preserve the active-stream retry interval, but allow station
+            // teardown to leave within 50ms rather than waiting 200*500ms.
+            for (int wait = 0; wait < 10; ++wait) {
+                if (__atomic_load_n(&hls_io->aborted, __ATOMIC_ACQUIRE)) return ESP_GMF_IO_ABORT;
+                media_lib_thread_sleep(50);
+            }
             retry_count--;
             if (retry_count <= 0) {
                 ESP_LOGE(TAG, "Waiting for new URL timeout");
@@ -545,6 +559,7 @@ static esp_gmf_err_t _hls_prev_close(esp_gmf_io_handle_t io)
     if (hls_io == NULL) {
         return ESP_GMF_IO_FAIL;
     }
+    __atomic_store_n(&hls_io->aborted, true, __ATOMIC_RELEASE);
     if (hls_io->hls_fetcher) {
         hls_fetcher_read_abort(hls_io->hls_fetcher);
     }

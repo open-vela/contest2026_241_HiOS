@@ -27,6 +27,7 @@ public:
 
     // Switch to the standby page (must be called on the LVGL thread).
     static void Show();
+    static bool IsVisible();
     // Return from standby to the home page (must be called on the LVGL thread).
     static void ReturnHome();
 };

@@ -1,3 +1,4 @@
+#include "network_service.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -11,6 +12,8 @@
  */
 
 #include "board_shim.h"
+
+#include <time.h>
 #include "metalio_claw_4_board.h"
 #include "esp_log_shim.h"
 #include "esp_err_shim.h"
@@ -18,7 +21,10 @@
 #include "application.h"
 #include "font_awesome.h"
 #include "settings.h"
+#include "hi_task_policy.h"
 #include "system_info.h"
+#include <pthread.h>
+#include <sched.h>
 #include "display.h"
 #include "i18n.h"
 
@@ -27,15 +33,20 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <ctime>
+#include <atomic>
 #include <cstdlib>
 
 #ifdef CONFIG_NET
 #include <netutils/netlib.h>
 #include <netinet/in.h>
+#include <net/if.h>
 #include <arpa/inet.h>
 #endif
 
 static const char *TAG = "board_shim";
+static std::atomic<bool> s_clock_synced{false};
+extern "C" bool metalio_board_clock_ready(void) { return s_clock_synced.load(); }
+extern "C" void metalio_board_clock_synced(void) { s_clock_synced.store(true); }
 
 /* Global Board instance — avoids __cxa_guard_acquire which may hang
  * during early startup on NuttX.  Allocated lazily via placement-new
@@ -172,7 +183,10 @@ std::string Board::GetBoardJson()
 #ifdef CONFIG_NET
     struct in_addr addr;
     memset(&addr, 0, sizeof(addr));
-    if (netlib_get_ipv4addr("eth0", &addr) == 0 && addr.s_addr != 0)
+    const auto transport = NetworkService::AvailableTransport();
+    const char *iface = transport == NetworkService::Transport::Cellular ? "eth1" : "eth0";
+    if (transport != NetworkService::Transport::None &&
+        netlib_get_ipv4addr(iface, &addr) == 0 && addr.s_addr != 0)
     {
         char ip[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, &addr, ip, sizeof(ip));
@@ -214,30 +228,155 @@ std::string Board::GetSystemInfoJson()
     return json;
 }
 
+static void StartBatteryMonitor();
+
 extern "C" void board_shim_initialize(void)
 {
     /* board_shim_initialize() — no logging to preserve USB serial buffer */
     Board::GetInstance().Initialize();
+    StartBatteryMonitor();
 }
 
 /* C-linkage hardware accessors — read from NuttX drivers via
  * MetalioClaw4Board.  Until the BQ27220 / network / audio drivers are
  * fully wired, these return safe defaults. */
-extern "C" int metalio_board_get_battery(int *level, int *charging, int *discharging)
+namespace {
+
+constexpr uint32_t kBatteryCacheMs = 1000;
+
+uint32_t BatteryMonotonicMs()
 {
-    int lvl = 0;
-    bool chg = false, dis = false;
-    bool ok = MetalioClaw4Board::GetInstance().GetBatteryLevel(lvl, chg, dis);
-    if (level) *level = lvl;
-    if (charging) *charging = chg ? 1 : 0;
-    if (discharging) *discharging = dis ? 1 : 0;
-    return ok ? 1 : 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint32_t>(ts.tv_sec * 1000ULL +
+                                 ts.tv_nsec / 1000000ULL);
 }
 
+struct BatteryCache {
+    int level = 0;
+    int charging = 0;
+    int discharging = 0;
+    bool valid = false;
+    uint32_t last_ms = 0;
+};
+
+BatteryCache s_batt_cache;
+
+}  // namespace
+
+extern "C" void metalio_board_note_battery(int level, int charging, int discharging)
+{
+    if (level < 0)
+        level = 0;
+    if (level > 100)
+        level = 100;
+    s_batt_cache.level = level;
+    s_batt_cache.charging = charging ? 1 : 0;
+    s_batt_cache.discharging = discharging ? 1 : 0;
+    s_batt_cache.valid = true;
+    s_batt_cache.last_ms = BatteryMonotonicMs();
+}
+
+extern "C" int metalio_board_peek_battery(int *level, int *charging, int *discharging)
+{
+    if (!s_batt_cache.valid)
+        return 0;
+    if (level)
+        *level = s_batt_cache.level;
+    if (charging)
+        *charging = s_batt_cache.charging;
+    if (discharging)
+        *discharging = s_batt_cache.discharging;
+    return 1;
+}
+
+static bool s_batt_monitor = false;
+
+static void *BatteryMonitor(void *)
+{
+    for (;;)
+    {
+        int lvl = 0;
+        bool chg = false, dis = false;
+        if (MetalioClaw4Board::GetInstance().GetBatteryLevel(lvl, chg, dis))
+            metalio_board_note_battery(lvl, chg ? 1 : 0, dis ? 1 : 0);
+        /* One second is enough for the corner to track charge and plug-in
+         * without reading the gauge from the interface thread. */
+        usleep(1000000);
+    }
+    return nullptr;
+}
+
+static void StartBatteryMonitor()
+{
+    if (s_batt_monitor)
+        return;
+    s_batt_monitor = true;
+    pthread_t thread{};
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 8192);
+    struct sched_param sp{};
+    sp.sched_priority = 80;
+    pthread_attr_setschedpolicy(&attr, SCHED_RR);
+    pthread_attr_setschedparam(&attr, &sp);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+    if (hi_task_create_legacy(&thread, &attr, BatteryMonitor, nullptr) != 0)
+        s_batt_monitor = false;
+    pthread_attr_destroy(&attr);
+}
+
+extern "C" int metalio_board_get_battery(int *level, int *charging, int *discharging)
+{
+    StartBatteryMonitor();
+    const uint32_t now = BatteryMonotonicMs();
+    const bool stale = !s_batt_cache.valid ||
+                       (now - s_batt_cache.last_ms) >= kBatteryCacheMs;
+    /* A caller that is not drawing the screen may read the gauge directly.
+     * The status corner only peeks; the monitor fills the cache. */
+    if (stale && !SettingsOnUiThread())
+    {
+        int lvl = 0;
+        bool chg = false, dis = false;
+        const bool ok =
+            MetalioClaw4Board::GetInstance().GetBatteryLevel(lvl, chg, dis);
+        if (ok)
+            metalio_board_note_battery(lvl, chg ? 1 : 0, dis ? 1 : 0);
+    }
+    return metalio_board_peek_battery(level, charging, discharging);
+}
+
+extern "C" int metalio_app_active_data_path(void);
+extern "C" int metalio_nt26_is_registered(void);
+extern "C" int metalio_nt26_get_signal_strength(void);
+extern "C" int metalio_board_get_network_mode(void)
+{
+    Settings network("network", false);
+    if (network.GetBool("airplane", false)) return 2;
+    const int path = metalio_app_active_data_path();
+    return path >= 0 ? path : (network.GetInt("type", 0) == 1 ? 1 : 0);
+}
 extern "C" const char *metalio_board_get_network_icon(void)
 {
-    return metalio_esp_hosted_is_connected() ? FONT_AWESOME_WIFI
-                                             : FONT_AWESOME_WIFI_SLASH;
+    const int mode = metalio_board_get_network_mode();
+    if (mode == 2) return FONT_AWESOME_PLANE;
+    if (mode == 1) {
+        const int csq = metalio_nt26_get_signal_strength();
+        if (!metalio_nt26_is_registered() || csq < 0 || csq == 99)
+            return FONT_AWESOME_SIGNAL_SLASH;
+        if (csq < 8) return FONT_AWESOME_SIGNAL_1;
+        if (csq < 15) return FONT_AWESOME_SIGNAL_2;
+        if (csq < 22) return FONT_AWESOME_SIGNAL_3;
+        return FONT_AWESOME_SIGNAL;
+    }
+    struct in_addr address{};
+    uint8_t flags = 0;
+    const bool usable = metalio_esp_hosted_is_connected() &&
+        metalio_app_active_data_path() == 0 &&
+        netlib_getifstatus("eth0", &flags) == 0 && (flags & IFF_UP) &&
+        netlib_get_ipv4addr("eth0", &address) == 0 && address.s_addr != 0;
+    return usable ? FONT_AWESOME_WIFI : FONT_AWESOME_WIFI_WARNING;
 }
 
 extern "C" int metalio_board_get_volume(int *volume)

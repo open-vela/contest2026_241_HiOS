@@ -1529,6 +1529,11 @@ static int stbi_write_jpg_core(stbi__write_context *s, int width, int height, in
       const unsigned char *dataR = (const unsigned char *)data;
       const unsigned char *dataG = dataR + ofsG;
       const unsigned char *dataB = dataR + ofsB;
+#ifdef STBIW_JPEG_INPUT_BGR
+      /* Camera BGR pixels: identical YCbCr arithmetic, without a second
+         full-resolution RGB allocation. Only the local JPEG encoder opts in. */
+      if(comp >= 3) { dataR = (const unsigned char *)data + 2; dataB = (const unsigned char *)data; }
+#endif
       int x, y, pos;
       if(subsample) {
          for(y = 0; y < height; y += 16) {

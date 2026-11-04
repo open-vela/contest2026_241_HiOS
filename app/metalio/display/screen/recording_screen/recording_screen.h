@@ -39,6 +39,7 @@ public:
     // Legacy static entry point — matches the MetalioClaw4 signature
     // (used by HomeScreen grid launcher / ScreenManager wiring).
     static lv_obj_t *CreateStatic();
+    static bool IsCapturing();
 
     // Screen lifecycle hook (LOAD / UNLOAD).
     static void LifecycleCallback(screen_lifecycle_event_t event);

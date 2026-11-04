@@ -32,6 +32,7 @@
 #include <memory>
 #include <atomic>
 #include <thread>
+#include <pthread.h>
 
 /* AES-CTR for UDP audio — use NuttX mbedTLS when available. */
 #if defined(CONFIG_CRYPTO_MBEDTLS) || defined(CONFIG_METALIO_MBEDTLS)
@@ -40,7 +41,7 @@
 #endif
 
 #define MQTT_PING_INTERVAL_SECONDS 90
-#define MQTT_RECONNECT_INTERVAL_MS 60000
+#define MQTT_RECONNECT_INTERVAL_MS 5000
 
 #define MQTT_PROTOCOL_SERVER_HELLO_EVENT (1 << 0)
 
@@ -100,7 +101,8 @@ private:
     void TlsTeardown();
     bool WaitConnack(int timeout_ms);
     void RxLoop();
-    bool ReadMqttPacketLocked(uint8_t &fh, std::string &payload);
+    int ReadMqttPacketLocked(uint8_t &fh, std::string &payload);
+    std::string rx_buffer_; // Partial MQTT frames and TLS write-side input.
 };
 
 /* Minimal UDP audio transport used by MqttProtocol. */
@@ -130,6 +132,7 @@ public:
     ~MqttProtocol();
 
     bool Start() override;
+    bool OnNetworkReady() override;
     bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) override;
     bool OpenAudioChannel() override;
     void CloseAudioChannel() override;
@@ -143,7 +146,15 @@ private:
     std::string subscribe_topic_;
 
     std::mutex channel_mutex_;
-    std::unique_ptr<Mqtt> mqtt_;
+    std::shared_ptr<Mqtt> mqtt_;
+    std::mutex mqtt_pointer_mutex_, mqtt_start_mutex_, reconnect_worker_mutex_;
+    std::shared_ptr<std::atomic<bool>> reconnect_alive_ = std::make_shared<std::atomic<bool>>(true);
+    std::atomic<bool> stopping_{false}, reconnect_running_{false}, client_ready_{false};
+    pthread_t reconnect_worker_{};
+    bool reconnect_joinable_ = false;
+    std::atomic<uint32_t> network_generation_{0}, connected_generation_{~0u};
+    std::shared_ptr<Mqtt> GetMqttClient();
+    void StartReconnectWorker();
     std::unique_ptr<Udp> udp_;
 #ifdef METALIO_MQTT_HAVE_AES
     mbedtls_aes_context aes_ctx_;

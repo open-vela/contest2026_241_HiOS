@@ -21,12 +21,28 @@ void screen_make_input_passive(lv_obj_t* obj);
 // from a generic container that we are using purely for layout.
 void screen_strip_obj_chrome(lv_obj_t* obj);
 
+// Zero theme outline/border/shadow (the default primary-blue frames) on
+// `obj` and every descendant. Does not change background or radius.
+void screen_kill_theme_chrome(lv_obj_t* obj);
+
+// Load a new root screen and force a complete redraw. The display may have
+// invalidation paused by a previous overlay update; without this, the panel
+// can retain its blue fallback frame when an app is opened.
+void screen_load_safe(lv_obj_t* scr);
+
 // Attach a right-swipe-to-back gesture to `scr`. When the user presses on
 // the screen and releases at least `kSwipeBackThreshold` px to the right
 // (with smaller vertical movement than horizontal), `on_back` is invoked.
 // `on_back` is responsible for whatever navigation should happen.
 typedef void (*screen_swipe_back_cb_t)();
 void screen_attach_swipe_back(lv_obj_t* scr, screen_swipe_back_cb_t on_back);
+void screen_ensure_swipe_back(lv_obj_t* scr, screen_swipe_back_cb_t on_back);
+
+// Observe edge swipes below `top_inset` without placing a hit strip over
+// buttons. Ordinary taps and long presses retain their original targets.
+void screen_attach_left_edge_back(lv_obj_t* scr, int top_inset,
+                                  screen_swipe_back_cb_t on_back);
+void screen_set_back_sensitivity(lv_obj_t* scr, int edge_width, int distance);
 
 // Mark `obj` (and by default all of its descendants) so that any touch event
 // that originates inside it is *not* counted as a candidate for the

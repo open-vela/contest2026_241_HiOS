@@ -1,3 +1,5 @@
+#include "hi_task_policy.h"
+#include "sms_screen/sms_screen.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -6,15 +8,33 @@
  */
 
 #include "nuttx_lvgl_display.h"
+#include "board_shim.h"
+#include "metalio_claw_4_board.h"
 #include "boot_screen/boot_screen.h"
+#include "panel_screen/panel_screen.h"
 #include "home_screen/home_screen.h"
 #include "pwr_key_handler/pwr_key_handler.h"
 #include "chat_screen/chat_screen.h"
+#include "call_screen/call_screen.h"
+#include "bluetooth_screen/bluetooth_screen.h"
+#include "idle_power_policy/idle_power_policy.h"
 #include "digital_people_screen/digital_people_screen.h"
+#include "system_chrome/system_chrome.h"
 #include "esp_log_shim.h"
+#include "settings.h"
 #include "esp_timer_shim.h"
+#include "input_method/hi_input_method.h"
+#include "screen/clock_screen/clock_screen.h"
+#include "screen/digital_people_screen/xiaobai_resources.h"
 
 #include <lvgl.h>
+#include "src/misc/cache/instance/lv_image_cache.h"
+#include "src/misc/cache/instance/lv_image_header_cache.h"
+#include "src/core/lv_global.h"
+#include <time.h>
+#if LV_USE_OS != LV_OS_PTHREAD
+#error "The NuttX display and screen workers require LVGL pthread locking"
+#endif
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +48,7 @@ int lv_nuttx_fbdev_set_file(lv_display_t * disp, const char * file);
 lv_indev_t * lv_nuttx_touchscreen_create(const char * dev_path);
 void lvgl_assets_fs_init(void);
 void metalio_fonts_init(void);
+void metalio_boot_pwr_vibrate_once(void);
 }
 
 #include <cstring>
@@ -43,6 +64,26 @@ void metalio_fonts_init(void);
 #include <nuttx/video/fb.h>
 
 #define TAG "NuttxDisplay"
+
+namespace {
+lv_obj_t *s_boot_screen_waiting_for_first_frame = nullptr;
+
+void on_boot_display_refresh_ready(lv_event_t * /*event*/)
+{
+    lv_obj_t *boot_scr = s_boot_screen_waiting_for_first_frame;
+    if (boot_scr == nullptr)
+        return;
+    if (lv_screen_active() == boot_scr)
+        return;
+
+    /* DSI scanout is asynchronous. Keep the boot frame alive until LVGL has
+     * rendered and flushed the first destination frame, avoiding an unpainted frame
+     * during the transition. */
+    s_boot_screen_waiting_for_first_frame = nullptr;
+    write(1, "PANEL_FIRST_FRAME\n", 18);
+    lv_obj_delete_async(boot_scr);
+}
+}  // namespace
 
 /* ------------------------------------------------------------------ */
 /* LVGL tick source                                                   */
@@ -73,6 +114,13 @@ NuttxLvglDisplay::NuttxLvglDisplay()
     /* Provide a real tick source so LVGL timers can fire. */
     lv_tick_set_cb(lvgl_monotonic_ms);
 
+    /* 34 launcher icons need about 2.2 MiB decoded. Keep them and the
+     * current app's assets across page changes; the 1 MiB default evicted
+     * icons during a two-page swipe and repeatedly decoded PNGs. This is
+     * an upper bound, allocated lazily by the image cache. */
+    lv_image_cache_resize(4 * 1024 * 1024, false);
+    lv_image_header_cache_resize(192, false);
+
     /* Load PuHui CBin fonts into font_puhui_* symbols before any screen
      * (boot/home) creates labels that reference them. */
     metalio_fonts_init();
@@ -98,6 +146,8 @@ NuttxLvglDisplay::NuttxLvglDisplay()
                       "display will be inactive");
         return;
     }
+    lv_display_add_event_cb(display_, on_boot_display_refresh_ready,
+                            LV_EVENT_REFR_READY, nullptr);
     /* Keep DIRECT (set by lv_nuttx_fbdev). FULL redraw on every home
      * pager scroll_by was too heavy and made swipe flash worse; stale
      * tiles are fixed by full-page FBIO_UPDATE before FBIOPAN. */
@@ -116,6 +166,19 @@ NuttxLvglDisplay::NuttxLvglDisplay()
      * default screen/layers and hangs right after DD5 (in
      * lv_nuttx_touchscreen_create). The config flag is the correct fix. */
     write(1, "DD5\n", 4);
+
+    /* Default screen is the theme primary (blue) until a real screen
+     * covers it. Paint it black so a gap between loads cannot flash blue. */
+    if (lv_obj_t *base = lv_screen_active())
+    {
+        lv_obj_set_style_bg_color(base, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(base, LV_OPA_COVER, LV_PART_MAIN);
+    }
+    if (lv_obj_t *bottom = lv_layer_bottom())
+    {
+        lv_obj_set_style_bg_color(bottom, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(bottom, LV_OPA_COVER, LV_PART_MAIN);
+    }
 
     /* 3. Touchscreen input device */
     lv_nuttx_touchscreen_create("/dev/input0");
@@ -146,6 +209,9 @@ NuttxLvglDisplay::NuttxLvglDisplay()
     SetupUI();
     Unlock();
     write(1, "DD8\n", 4);
+    SettingsPrimeFlash();
+    StartLvglThread();
+    write(1, "DD9\n", 4);
 }
 
 void NuttxLvglDisplay::StartLvglThread()
@@ -173,11 +239,11 @@ void NuttxLvglDisplay::StartLvglThread()
     pthread_attr_setschedparam(&attr, &sp);
     pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
 
-    int rc = pthread_create(&lvgl_thread_, &attr, LvglEventLoopEntry, this);
+    int rc = hi_task_create_legacy(&lvgl_thread_, &attr, LvglEventLoopEntry, this);
     if (rc != 0)
     {
         pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
-        rc = pthread_create(&lvgl_thread_, &attr, LvglEventLoopEntry, this);
+        rc = hi_task_create_legacy(&lvgl_thread_, &attr, LvglEventLoopEntry, this);
     }
     pthread_attr_destroy(&attr);
     if (rc == 0)
@@ -201,41 +267,82 @@ NuttxLvglDisplay::~NuttxLvglDisplay()
 }
 
 /* ------------------------------------------------------------------ */
-/* SetupUI — boot screen then transition to HomeScreen                */
+/* SetupUI — boot screen then transition to the smart-home panel        */
 /*                                                                    */
 /* Mirrors LVAdapterDisplay::SetupUI() from the original MetalioClaw4 */
 /* code: a boot screen is shown first, then after 2 seconds a one-shot */
-/* LVGL timer replaces it with the HomeScreen.                         */
+/* LVGL timer replaces it with the smart-home panel.                   */
 /* ------------------------------------------------------------------ */
 
 namespace {
 std::atomic<bool> s_home_transition_armed{false};
 std::atomic<bool> s_home_transition_done{false};
 std::atomic<bool> s_boot_min_time_reached{false};
-lv_timer_t *s_home_poll_timer = nullptr;
+uint32_t s_boot_start_tick = 0;
 
-constexpr uint32_t kBootGuideMinMs = 5000;
+constexpr uint32_t kBootGuideMinMs = 3000;
+constexpr uint32_t kBootForceHomeMs = 8000;
 
-void DoBootToHomeTransition()
+void DoBootToPanelTransition()
 {
     if (s_home_transition_done.load())
         return;
 
-    write(1, "HOME_GO\n", 8);
-    /* Boot→home must NOT use SwitchToHome(): that path deletes the active
+    write(1, "PANEL_GO\n", 9);
+    /* Boot→panel must NOT use SwitchToHome(): that path deletes the active
      * screen (boot + LVGL default layer) before CreateStatic, and the first
-     * refresh then shows the default-theme primary blue. Load home on top
+     * refresh then shows the default-theme primary blue. Load panel on top
      * of boot, then drop boot after home is the active screen. */
     lv_obj_t *boot_scr = lv_screen_active();
     PwrKey_OnScreenLifecycle("boot", SCREEN_LIFECYCLE_UNLOAD);
-    lv_obj_t *home_scr = HomeScreen::CreateStatic();
-    if (home_scr == nullptr)
+    lv_obj_t *panel_scr = PanelScreen::CreateStatic();
+    if (panel_scr == nullptr)
         return;
-    lv_screen_load(home_scr);
-    if (boot_scr != nullptr && boot_scr != home_scr)
-        lv_obj_delete(boot_scr);
+    lv_screen_load(panel_scr);
+    if (boot_scr != nullptr && boot_scr != panel_scr)
+        s_boot_screen_waiting_for_first_frame = boot_scr;
+    /* Match the safe launcher/panel transitions: another overlay may have
+     * paused invalidation before boot completed. Re-enable it and invalidate
+     * the full opaque destination so the first scanout cannot keep a stale
+     * framebuffer frame or expose the theme's blue fallback. */
+    if (lv_display_t *disp = lv_display_get_default())
+    {
+        lv_display_enable_invalidation(disp, true);
+        lv_timer_t *refr_timer = lv_display_get_refr_timer(disp);
+        if (refr_timer != nullptr)
+        {
+            lv_timer_resume(refr_timer);
+            lv_timer_ready(refr_timer);
+        }
+    }
+    lv_obj_invalidate(panel_scr);
+    /* The normal LVGL refresh loop paints the destination after this timer
+     * callback returns. Keep the boot screen alive until that refresh is
+     * complete so no empty/default-theme frame is exposed. */
     s_home_transition_done.store(true);
-    write(1, "HOME_OK\n", 8);
+    BluetoothScreen::InitAudioObserver();
+    HiInputMethod_InitGlobal();
+    ClockScreen::InitGlobal();
+    SmsScreen::InitGlobal();
+    IdlePower_Attach(IdlePowerSession::App, true);
+    write(1, "PANEL_OK\n", 9);
+#ifdef HI_STABILITY_PROBE
+    lv_timer_create([](lv_timer_t *timer) {
+        HomeScreen::OpenGrid();
+        lv_timer_delete(timer);
+    }, 5000, nullptr);
+#endif
+    XiaobaiResources::EnsureAsync();
+    // Phone initialization also initializes SMS and reads persistent SD
+    // stores. Let resource provisioning establish its writable mount first,
+    // then start the global call observer on this same LVGL thread.
+    // The panel and audio tasks remain live throughout provisioning.
+    lv_timer_create([](lv_timer_t *timer) {
+        const int status = XiaobaiResources::Status();
+        if (status == 0 || status == 1) return;
+        CallScreen::InitGlobal();
+        lv_timer_delete(timer);
+    }, 50, nullptr);
 }
 
 void TryBootToHomeTransition()
@@ -244,26 +351,21 @@ void TryBootToHomeTransition()
         return;
     if (!s_boot_min_time_reached.load())
         return;
-    if (!s_home_transition_armed.load())
+    const uint32_t elapsed =
+        s_boot_start_tick != 0 ? lv_tick_elaps(s_boot_start_tick) : 0;
+    const bool force_home =
+        elapsed >= kBootForceHomeMs && s_boot_min_time_reached.load();
+    if (!s_home_transition_armed.load() && !force_home)
         return;
-    DoBootToHomeTransition();
-    if (s_home_transition_done.load() && s_home_poll_timer != nullptr)
-    {
-        lv_timer_del(s_home_poll_timer);
-        s_home_poll_timer = nullptr;
-    }
+    DoBootToPanelTransition();
 }
 
 void OnBootMinTimeTimer(lv_timer_t *t)
 {
     s_boot_min_time_reached.store(true);
+    if (!s_home_transition_armed.load())
+        s_home_transition_armed.store(true);
     lv_timer_del(t);
-    TryBootToHomeTransition();
-}
-
-void OnHomeTransitionPollTimer(lv_timer_t * /*t*/)
-{
-    TryBootToHomeTransition();
 }
 }  // namespace
 
@@ -279,9 +381,8 @@ void NuttxLvglDisplay::ArmHomeTransition()
 
     write(1, "HOME_ARM\n", 9);
     s_home_transition_armed.store(true);
-    /* HomeScreen::CreateStatic must run on the LVGL thread (poll timer).
-     * Do not block here — the old 10s wait made boot feel stuck after the
-     * 5s guide bar finished. */
+    /* The LVGL event loop performs the transition on its next pass. Do not
+     * block here — the old wait made boot feel stuck after the guide bar. */
 }
 
 void NuttxLvglDisplay::SetupUI()
@@ -295,23 +396,26 @@ void NuttxLvglDisplay::SetupUI()
     {
         lv_screen_load(boot_scr);
         PwrKey_OnScreenLifecycle("boot", SCREEN_LIFECYCLE_LOAD);
+        /* Pixels first, then backlight, then the buzz. The motor shares
+         * the LEDC clock with the backlight, so this order is the one
+         * that shows the guide for the whole vibration. */
+        lv_refr_now(nullptr);
+        if (Backlight *bl = Board::GetInstance().GetBacklight())
+            bl->RestoreBrightness();
+        metalio_boot_pwr_vibrate_once();
     }
     write(1, "SUI2\n", 5);
 
-    /* 5s boot guide minimum (matches BootScreen progress bar), then switch
+    /* 3s boot guide minimum (matches BootScreen progress bar), then switch
      * as soon as Application arms the transition after network bring-up. */
     s_home_transition_armed.store(false);
     s_home_transition_done.store(false);
     s_boot_min_time_reached.store(false);
-    s_home_poll_timer = nullptr;
+    s_boot_start_tick = lv_tick_get();
 
     lv_timer_t *min_timer = lv_timer_create(OnBootMinTimeTimer, kBootGuideMinMs, nullptr);
     if (min_timer != nullptr)
         lv_timer_set_repeat_count(min_timer, 1);
-
-    s_home_poll_timer = lv_timer_create(OnHomeTransitionPollTimer, 50, nullptr);
-    if (s_home_poll_timer == nullptr)
-        ESP_LOGE(TAG, "lv_timer_create failed for boot→home poll");
 }
 
 /* ------------------------------------------------------------------ */
@@ -330,8 +434,6 @@ void *NuttxLvglDisplay::LvglEventLoopEntry(void *arg)
 
 bool NuttxLvglDisplay::Lock(int timeout_ms)
 {
-    (void)timeout_ms;
-
     /* lv_lock()/lv_unlock() are the single recursive mutex that serialises
      * ALL LVGL access: the render thread (lv_timer_handler self-locks),
      * Application-thread DisplayLockGuard holders, and the per-screen worker
@@ -339,8 +441,17 @@ bool NuttxLvglDisplay::Lock(int timeout_ms)
      * Using the same lock here instead of a separate std::mutex prevents the
      * worker threads from racing the Application thread on LVGL object/heap
      * state — the corruption that showed up as blue/garbled app screens. */
-    lv_lock();
-    return true;
+    if (timeout_ms <= 0) { lv_lock(); return true; }
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return false;
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        ++deadline.tv_sec;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    return pthread_mutex_timedlock(&LV_GLOBAL_DEFAULT()->lv_general_mutex,
+                                  &deadline) == 0;
 }
 
 void NuttxLvglDisplay::Unlock()
@@ -360,17 +471,17 @@ struct EmoteCategoryEntry {
 };
 
 constexpr EmoteCategoryEntry kEmoteCategoryMap[] = {
-    {"happy", "happy"},       {"laughing", "happy"},
+    {"happy", "happy"},       {"laughing", "laughing"},
     {"funny", "happy"},       {"silly", "happy"},
     {"winking", "happy"},     {"cool", "happy"},
     {"confident", "happy"},   {"loving", "loving"},
     {"kissy", "loving"},      {"delicious", "loving"},
     {"sad", "crying"},        {"crying", "crying"},
-    {"angry", "crying"},      {"surprised", "surprised"},
+    {"angry", "angry"},      {"surprised", "surprised"},
     {"shocked", "surprised"}, {"embarrassed", "surprised"},
     {"thinking", "thinking"}, {"confused", "thinking"},
     {"neutral", "neutral"},   {"relaxed", "neutral"},
-    {"sleepy", "neutral"},
+    {"sleepy", "thinking"},
 };
 
 const char *GetEmoteCategory(const char *emote)
@@ -503,8 +614,8 @@ void OnSetChatMessageAsync(void *user_data)
 
     write(1, "UI_MSG\n", 7);
     const bool is_user = (std::strcmp(msg->role, "user") == 0);
-    const bool chat_active = ChatScreen::IsActive();
-    const bool dp_active = DigitalPeopleScreen::IsActive();
+    const bool chat_active = ChatScreen::IsForeground();
+    const bool dp_active = DigitalPeopleScreen::IsForeground();
 
     if (chat_active)
     {
@@ -518,6 +629,8 @@ void OnSetChatMessageAsync(void *user_data)
         else
             DigitalPeopleScreen::ShowSystemMessage(msg->content);
     }
+    if (SystemChrome_FloatAiOpen())
+        SystemChrome_FloatAiAppend(msg->role, msg->content);
 
     free(msg);
 }
@@ -533,16 +646,14 @@ void NuttxLvglDisplay::SetEmotion(const char *emotion)
     /* HARD RULE: while chat is foreground, never take DisplayLockGuard or
      * touch DigitalPeople widgets — that path paints solid blue on wake.
      * ChatScreen::SetEmotion only caches the name (LVGL apply is async). */
-    if (ChatScreen::IsActive())
+    if (ChatScreen::IsForeground())
     {
         ChatScreen::SetEmotion(src);
         return;
     }
 
-    /* Cache emotion for the next DP Create(). Do not call SetEmotion while
-     * DP is active: SetEmotionSrc from the app/MQTT thread races LVGL. */
-    if (!DigitalPeopleScreen::IsActive())
-        DigitalPeopleScreen::SetEmotion(GetEmoteCategory(src));
+    // Thread-safe cache only; the owning UI timer applies the image.
+    DigitalPeopleScreen::SetEmotion(GetEmoteCategory(src));
 }
 
 void NuttxLvglDisplay::SetChatMessage(const char *role, const char *content)
@@ -560,7 +671,8 @@ void NuttxLvglDisplay::SetChatMessage(const char *role, const char *content)
     if (!is_user && !is_bot)
         return;
 
-    if (!ChatScreen::IsActive() && !DigitalPeopleScreen::IsActive())
+    if (!ChatScreen::IsActive() && !DigitalPeopleScreen::IsActive() &&
+        !SystemChrome_FloatAiOpen())
         return;
 
     const size_t content_len = std::strlen(content);
@@ -591,12 +703,30 @@ void NuttxLvglDisplay::SetChatMessage(const char *role, const char *content)
 
 void NuttxLvglDisplay::LvglEventLoop()
 {
+    SettingsBindUiThread();
     ESP_LOGI(TAG, "LVGL event loop entered");
+    bool panel_return_probe_written = false;
+    bool panel_begin_probe_written = false;
 
     while (lvgl_running_.load())
     {
         Lock();
+        /* Change screens before entering LVGL's timer-list traversal. The
+         * page-loaded callback creates its own timers; doing that inside a
+         * timer callback can leave the iterator spinning before the first
+         * panel frame is rendered. */
+        TryBootToHomeTransition();
+        if (!panel_begin_probe_written && s_home_transition_done.load())
+        {
+            panel_begin_probe_written = true;
+            write(1, "PANEL_HANDLER_BEGIN\n", 20);
+        }
         uint32_t idle = lv_timer_handler();
+        if (!panel_return_probe_written && s_home_transition_done.load())
+        {
+            panel_return_probe_written = true;
+            write(1, "PANEL_TIMER_RETURNED\n", 21);
+        }
         Unlock();
 
         /* lv_timer_handler returns the suggested sleep time in ms.

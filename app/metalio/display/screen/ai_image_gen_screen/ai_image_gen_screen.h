@@ -5,12 +5,11 @@
  * AiImageGenScreen — ported from MetalioClaw4
  * main/display/screen/ai_image_gen_screen/ai_image_gen_screen.h.
  *
- * AI voice-to-image page.
- *
- * Flow: press-and-hold to talk -> POST /xiaozhi/api/asr?format=wav to
- * get the prompt -> POST /xiaozhi/api/dashscope/text2image (n=1..4) ->
- * poll GET .../text2image/tasks/{taskId}?maxSide=500 -> download the
- * imageUrls and display them on the page.
+ * Direct AI Horde image page: text -> HTTPS generate/async -> check ->
+ * status -> HTTPS image download -> bounded on-device WebP decoding.
+ * Anonymous access, 512px output, 1-4 images. No LAN adapter is used.
+ * Optional imagegen/asr_url enables voice using a compatible cloud ASR.
+ * Without it, the main button opens the system text composer.
  *
  * Recording / HTTP / polling all run on a dedicated FreeRTOS worker
  * task (via freertos_shim) so the LVGL thread is never blocked.

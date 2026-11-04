@@ -1,3 +1,4 @@
+#include "hi_task_policy.h"
 /*
  * EspWakeWord — WakeNet without AFE (MetalioClaw4 esp_wake_word.cc port).
  */
@@ -97,7 +98,7 @@ bool EspWakeWord::Initialize(AudioCodec *codec, srmodel_list_t *models_list)
         pthread_t th;
         pthread_attr_init(&attr);
         (void)pthread_attr_setstacksize(&attr, 192 * 1024);
-        int prc = pthread_create(
+        int prc = hi_task_create_legacy(
             &th, &attr,
             [](void *) -> void * {
                 s_data = s_iface->create(s_name, DET_MODE_95);

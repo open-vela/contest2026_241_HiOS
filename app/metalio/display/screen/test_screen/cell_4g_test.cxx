@@ -4,6 +4,9 @@
 #include "esp_log_shim.h"
 #include "test_ui_common.h"
 
+#include <metalio/metalio.h>
+#include <cstdio>
+
 namespace {
 
 constexpr const char* TAG = "Cell4gTest";
@@ -35,9 +38,20 @@ void BuildRow(lv_obj_t* list) {
 }
 
 void OnLoad() {
-    // openvela 尚未移植 NT26 AT 命令栈，无法执行 SIM 卡 / 搜网 / PING 流程。
-    SetText(I18n::T("4G模块未移植"), false);
-    ESP_LOGW(TAG, "cell 4g test: NT26 AT stack not ported");
+    /* NT26 is implemented by the board driver and started only when the
+     * selected network mode is cellular.  Do not label an idle modem as
+     * missing or start/reset it merely by opening the hardware test screen. */
+    const int sim_slot = metalio_nt26_get_sim_slot();
+    if (sim_slot >= 0) {
+        char status[48];
+        snprintf(status, sizeof(status), "NT26已启动（SIM卡槽 %d）", sim_slot + 1);
+        SetText(status, true);
+        ESP_LOGI(TAG, "cell 4g test: NT26 control channel ready, SIM slot %d",
+                 sim_slot + 1);
+    } else {
+        SetText(I18n::T("NT26驱动已集成，当前未启用"), false);
+        ESP_LOGI(TAG, "cell 4g test: NT26 driver present, cellular mode idle");
+    }
 }
 
 void OnUnload() {

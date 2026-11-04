@@ -5,11 +5,8 @@
  * Idle power policy — ported from MetalioClaw4
  * main/display/screen/idle_power_policy.h.
  *
- * Shared no-activity timer for the home and standby screens:
- *   - enter standby: only counts idle while on the home screen
- *   - auto shutdown: home + standby share the same idle interval
- * Entering another app Detaches the timer; auto-entering standby
- * preserves the idle start point.
+ * One no-input interval across all apps and overlays. App transitions do
+ * not stop the timer; automatic standby preserves the shutdown interval.
  */
 
 #pragma once
@@ -20,6 +17,7 @@ enum class IdlePowerSession : uint8_t {
     None = 0,
     Home,
     Standby,
+    App,
 };
 
 void IdlePower_NotifyActivity();
@@ -35,3 +33,5 @@ int IdlePower_GetStandbyMinutes();
 void IdlePower_SetStandbyMinutes(int minutes);
 int IdlePower_GetShutdownMinutes();
 void IdlePower_SetShutdownMinutes(int minutes);
+
+IdlePowerSession IdlePower_CurrentSession();

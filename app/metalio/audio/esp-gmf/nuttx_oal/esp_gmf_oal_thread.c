@@ -1,3 +1,4 @@
+#include "hi_task_policy.h"
 /*
  * SPDX-FileCopyrightText: 2026 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -19,6 +20,7 @@
 #include <sched.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <stdio.h>
 
 #include "esp_log.h"
 #include "esp_gmf_err.h"
@@ -39,6 +41,9 @@ static void *gmf_thread_trampoline(void *p)
     void (*fn)(void *) = ctx->main_func;
     void *arg = ctx->arg;
     free(ctx);
+#ifdef HI_STABILITY_PROBE
+    printf("STABILITY_GMF_THREAD cpu=%u mask=%u\n",hi_task_current_cpu(),hi_task_current_mask());
+#endif
     fn(arg);
     return NULL;
 }
@@ -48,7 +53,6 @@ esp_gmf_err_t esp_gmf_oal_thread_create(esp_gmf_oal_thread_t *p_handle, const ch
                                          uint32_t stack, int prio, bool stack_in_ext, int core_id)
 {
     (void)stack_in_ext; /* PSRAM stack not supported on NuttX — always internal */
-    (void)core_id;      /* Single-core ESP32-P4 */
     (void)name;         /* pthread doesn't support named threads on NuttX */
 
     gmf_thread_ctx_t *ctx = (gmf_thread_ctx_t *)malloc(sizeof(gmf_thread_ctx_t));
@@ -66,12 +70,25 @@ esp_gmf_err_t esp_gmf_oal_thread_create(esp_gmf_oal_thread_t *p_handle, const ch
     if (stack > 0) {
         pthread_attr_setstacksize(&attr, stack);
     }
+#ifdef CONFIG_SMP
+    /* Keep existing legacy/default workers on CPU0. Honor an explicitly
+     * requested secondary core for radio decoding, away from LVGL. */
+    if (core_id > 0 && (unsigned)core_id < hi_task_supported_cpus()) {
+        cpu_set_t mask = (cpu_set_t)(1u << core_id);
+        if (pthread_attr_setaffinity_np(&attr, sizeof(mask), &mask) != 0) {
+            pthread_attr_destroy(&attr);
+            free(ctx);
+            return ESP_GMF_ERR_FAIL;
+        }
+    }
+#else
+    (void)core_id;
+#endif
 
-    /* Priority — NuttX uses sched_priority (1=highest, 255=lowest).
+    /* Priority — NuttX uses larger sched_priority for higher priority.
      * ESP-IDF FreeRTOS priorities are 0-31 with higher=more important.
      * ESP-IDF "5" is low-mid priority; mapping it directly would yield NuttX
-     * priority 5 (very high) and starve the UI/event loop (default 100).
-     * Map to a priority LOWER than the app default. */
+     * Keep the existing mapping below the display thread's priority. */
     if (prio > 0) {
         struct sched_param sp;
         sp.sched_priority = SCHED_PRIORITY_DEFAULT + (int)prio;
@@ -80,7 +97,7 @@ esp_gmf_err_t esp_gmf_oal_thread_create(esp_gmf_oal_thread_t *p_handle, const ch
 
     pthread_t tid;
     write(1, "OAL_T0\n", 7);
-    int ret = pthread_create(&tid, &attr, gmf_thread_trampoline, ctx);
+    int ret = hi_task_create_legacy(&tid, &attr, gmf_thread_trampoline, ctx);
     write(1, "OAL_T1\n", 7);
     pthread_attr_destroy(&attr);
 

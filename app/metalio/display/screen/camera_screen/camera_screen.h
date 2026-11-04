@@ -10,29 +10,21 @@
  *   - Bottom 720x120: capture button + gallery tab button
  *   - Gallery mode: full-screen + 90px header (back + "相册" title)
  *
- * The original drives an OV2710 MIPI-CSI sensor through V4L2
- * (esp_video_init / esp_cam_sensor_xclk / VIDIOC_* ioctls), uses
- * IOExpander::CAM_PWDN for power control, esp_lv_adapter_lock for
- * cross-thread LVGL access, image_to_jpeg for JPEG encoding, and
- * heap_caps_aligned_alloc for PSRAM-backed canvas buffer.
- *
- * openvela has none of those (no V4L2 camera driver, no IOExpander,
- * no esp_lv_adapter, no image_to_jpeg, no heap_caps), so the camera
- * capture plane is stubbed behind a clean CameraDriver interface:
+ * Live preview comes from NuttxV4l2CameraDriver: /dev/video0, OV2710
+ * RAW10 demosaiced to BGR888. CameraDriver is still pluggable:
  *
  *   - StartStreaming(buf, w, h, on_frame_ready): begin filling `buf`
  *     with BGR888 frames; call `on_frame_ready` (on any thread) after
  *     each frame is written so the UI can invalidate the canvas.
  *   - StopStreaming(): stop the capture source.
  *
- * The default StubCameraDriver paints a slow-moving placeholder
- * gradient into the canvas via a low-priority FreeRTOS task, so the
- * preview visibly updates, the "拍照" button freezes a real frame,
- * and the gallery / viewer / delete flows are testable end-to-end.
+ * If no driver has been installed, the screen binds the V4L2 driver
+ * on first use. A failed stream leaves the canvas black and posts
+ * "摄像头初始化失败".
  *
- * JPEG encoding is also stubbed (StubJpegEncoder returns false), which
- * matches the original's "编码失败，未保存" path. Plug in a real
- * JpegEncoder when an encoder is available — no UI changes needed.
+ * JPEG encoding falls back to StubJpegEncoder (returns false) when no
+ * encoder is installed, matching the original's "编码失败，未保存"
+ * path. camera_jpeg_encoder.cxx installs the stb encoder at startup.
  *
  * SD card / gallery code uses POSIX (opendir/readdir/unlink/fopen),
  * which NuttX provides natively. LVGL image loads use the "S:" POSIX
@@ -49,6 +41,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <string>
 
 class CameraScreen : public Screen
 {
@@ -60,10 +53,8 @@ public:
     // callers that still use the original MetalioClaw4 signature.
     static lv_obj_t *CreateStatic();
 
-    // Lifecycle hook: original toggled IOExpander::CAM_PWDN and started
-    // / stopped the V4L2 capture worker. openvela forwards to the
-    // configured CameraDriver (default stub) plus a log line for the
-    // PWDN transition.
+    // Lifecycle hook: start / stop the configured CameraDriver
+    // (default: OV2710 via /dev/video0).
     static void LifecycleCallback(screen_lifecycle_event_t event);
 
     // -----------------------------------------------------------------
@@ -91,6 +82,11 @@ public:
                                          FrameReadyCallback on_frame_ready,
                                          void *user_data) = 0;
         virtual esp_err_t StopStreaming() = 0;
+
+        // Called only from the frame-ready callback, before the next frame.
+        // Return true when the driver can safely write into this next buffer.
+        virtual bool SetFrameBuffer(uint8_t * /*next*/) { return false; }
+
 
         // Optional quality hint (1 = high, 2 = medium, 4 = low). Default
         // implementation is a no-op; stub drivers can ignore it.
@@ -122,17 +118,33 @@ public:
     };
 
     // Install a custom camera driver / JPEG encoder. Pass nullptr to
-    // revert to the default stub. Must be called before Create() for
-    // the change to take effect on the next screen instance.
+    // revert to the default (V4L2 camera, stub JPEG until the stb
+    // encoder registers). Must be called before Create() for the
+    // change to take effect on the next screen instance.
     static void SetCameraDriver(CameraDriver *driver);
     static void SetJpegEncoder(JpegEncoder *encoder);
+
+    // Look-and-see shares the live camera preview and writes the analyzed
+    // frame into the same SD-card root consumed by the camera gallery.
+    static bool OpenLookAndSee(bool return_to_digital_people = false);
+    static bool IsLookAndSeeMode();
+    static unsigned VisionVisit();
+    static void SetVisionService(const std::string &url,
+                                 const std::string &token);
+    static bool CaptureAndExplain(const std::string &question,
+                                  std::string &answer,
+                                  std::string &error);
+    static bool CanAcceptPreviewFrame();
+    static bool IsCapturing();
+    // True only after the owning camera task has joined its capture driver.
+    static bool PreviewStopped();
 
     // -----------------------------------------------------------------
     // PreviewBuffer — public surface kept for parity with the original
     // (the hardware test page reuses the camera pipeline on a custom
     // canvas). On openvela this just hands out the shared canvas
-    // buffer; the caller is responsible for installing a CameraDriver
-    // that will actually fill it.
+    // buffer. StartExternalPreview fills it from the active camera
+    // driver (OV2710 /dev/video0 by default).
     // -----------------------------------------------------------------
     struct PreviewBuffer {
         uint8_t *data;
@@ -143,6 +155,8 @@ public:
     static bool PreparePreviewBuffer(PreviewBuffer *out);
     static esp_err_t StartExternalPreview(lv_obj_t *canvas);
     static void StopExternalPreview();
+    typedef void (*PreviewObserver)(const uint8_t *bgr, int width, int height);
+    static void SetPreviewObserver(PreviewObserver observer);
 };
 
 #endif  // METALIO_CAMERA_SCREEN_H

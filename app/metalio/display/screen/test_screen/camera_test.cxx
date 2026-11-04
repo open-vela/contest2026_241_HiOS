@@ -7,7 +7,6 @@
 #include "esp_log_shim.h"
 #include "screen_util.h"
 #include "test_ui_common.h"
-#include <metalio/metalio.h>
 
 LV_FONT_DECLARE(font_puhui_20_4);
 LV_FONT_DECLARE(font_puhui_30_4);
@@ -200,16 +199,11 @@ void BuildRow(lv_obj_t* list) {
 
 void OnLoad() {
     s_preview_started = false;
-    if (metalio_camera_power(false) < 0) {
-        SetErrorText(I18n::T("上电失败"));
-        return;
-    }
-    SetPassText(I18n::T("OV2710 已上电"));
+    SetPassText(I18n::T("OV2710 /dev/video0"));
 }
 
 void OnUnload() {
     ClosePreviewOverlay();
-    metalio_camera_power(true);
     s_value_lbl   = nullptr;
     s_status_icon = nullptr;
     s_preview_btn = nullptr;

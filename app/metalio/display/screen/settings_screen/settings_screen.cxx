@@ -1,3 +1,5 @@
+#include "hi_task_policy.h"
+#include "notification_sound.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -14,17 +16,25 @@
  */
 
 #include "settings_screen.h"
+#include "hi_music_screen/local_music_player.h"
+#include <pthread.h>
 #include "i18n.h"
 #include "esp_log_shim.h"
 #include "board_shim.h"
+#include "metalio_claw_4_board.h"
 #include "application.h"
 #include "home_screen/home_screen.h"
+#include "smart_home/smart_home.h"
 #include "idle_power_policy/idle_power_policy.h"
 #include "bluetooth_screen/bluetooth_screen.h"
 #include "settings.h"
+#include "phone_service.h"
 
+#include <atomic>
+#include <mutex>
 #include <cstdint>
 #include <cstdio>
+#include <pthread.h>
 
 LV_FONT_DECLARE(font_puhui_20_4);
 LV_FONT_DECLARE(font_puhui_30_4);
@@ -68,15 +78,19 @@ struct UiState {
     lv_obj_t *shutdown_slider = nullptr;
 };
 UiState s_ui;
+bool s_assistant_tab_built = false;
+bool s_home_tab_built = false;
+lv_obj_t *s_assistant_tab = nullptr;
+lv_obj_t *s_home_tab = nullptr;
 
 // ---- stubbed hardware accessors -------------------------------------------
 // TODO(openvela): wire to real Backlight / AudioCodec drivers once the
 // board_shim exposes them. For now we persist values through Settings.
 namespace hw {
 int ReadBrightness();
-void ApplyBrightness(int value);
+void ApplyBrightness(int value, bool persist);
 int ReadVolume();
-void ApplyVolume(int volume);
+void ApplyVolume(int volume, bool persist);
 }  // namespace hw
 
 namespace hw {
@@ -88,29 +102,66 @@ int ReadBrightness()
     if (v > 100) v = 100;
     return v;
 }
-void ApplyBrightness(int value)
+void ApplyBrightness(int value, bool persist)
 {
     if (value < kBacklightMinPercent) value = kBacklightMinPercent;
     if (value > 100) value = 100;
+    if (Backlight *bl = Board::GetInstance().GetBacklight()) {
+        bl->SetBrightness(static_cast<uint8_t>(value), false);
+    }
+    if (!persist) {
+        return;
+    }
     Settings settings("display", true);
     settings.SetInt("brightness", value);
-    // TODO(openvela): backlight->SetBrightness(value, true);
 }
 int ReadVolume()
 {
     /* Same source as voice MCP / SoftVolume — never a second NVS key. */
     return Application::GetInstance().GetAudioService().GetVolume();
 }
-void ApplyVolume(int volume)
+void ApplyVolume(int volume, bool persist)
 {
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
-    Application::GetInstance().GetAudioService().SetVolume(volume);
+    Application::GetInstance().GetAudioService().SetVolume(volume, persist);
 }
 }  // namespace hw
 
 void OnSwipeBack();
 void OnBackClicked(lv_event_t *e);
+
+struct SmartHomeSettingsJob {
+    int kind;
+    int first;
+    int second;
+};
+
+void *PersistSmartHomeSetting(void *arg)
+{
+    auto *job = static_cast<SmartHomeSettingsJob *>(arg);
+    if (job->kind == 0)
+        SmartHome_SetVoiceEnabled(job->first != 0);
+    else
+        SmartHome_SetPower(job->first, job->second, true);
+    delete job;
+    return nullptr;
+}
+
+void ScheduleSmartHomeSetting(int kind, int first, int second)
+{
+    auto *job = new SmartHomeSettingsJob{kind, first, second};
+    if (job == nullptr)
+        return;
+    pthread_t thread{};
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 8192);
+    if (hi_task_create_legacy(&thread, &attr, PersistSmartHomeSetting, job) != 0)
+        PersistSmartHomeSetting(job);
+    pthread_attr_destroy(&attr);
+}
 
 void UpdatePctLabel(lv_obj_t *label, int pct)
 {
@@ -131,15 +182,43 @@ void OnBrightnessSliderChanged(lv_event_t *e)
         lv_slider_set_value(slider, value, LV_ANIM_OFF);
     }
     UpdatePctLabel(s_ui.brightness_pct_label, value);
-    hw::ApplyBrightness(value);
+    /* PWM ioctl on every tick stalls the 720 panel. Apply at most ~12 Hz
+     * while dragging; release still persists. */
+    static uint32_t s_last_bri_tick = 0;
+    const uint32_t now = lv_tick_get();
+    if (s_last_bri_tick != 0 && (now - s_last_bri_tick) < 80) {
+        return;
+    }
+    s_last_bri_tick = now;
+    hw::ApplyBrightness(value, false);
+}
+
+void OnBrightnessSliderReleased(lv_event_t *e)
+{
+    auto *slider = static_cast<lv_obj_t *>(lv_event_get_target(e));
+    int value = static_cast<int>(lv_slider_get_value(slider));
+    hw::ApplyBrightness(value, true);
 }
 
 void OnVolumeSliderChanged(lv_event_t *e)
 {
     auto *slider = static_cast<lv_obj_t *>(lv_event_get_target(e));
     int value = static_cast<int>(lv_slider_get_value(slider));
-    hw::ApplyVolume(value);
     UpdatePctLabel(s_ui.volume_pct_label, value);
+    static uint32_t s_last_vol_tick = 0;
+    const uint32_t now = lv_tick_get();
+    if (s_last_vol_tick != 0 && (now - s_last_vol_tick) < 80) {
+        return;
+    }
+    s_last_vol_tick = now;
+    hw::ApplyVolume(value, false);
+}
+
+void OnVolumeSliderReleased(lv_event_t *e)
+{
+    auto *slider = static_cast<lv_obj_t *>(lv_event_get_target(e));
+    int value = static_cast<int>(lv_slider_get_value(slider));
+    hw::ApplyVolume(value, true);
 }
 
 void StyleSlider(lv_obj_t *slider)
@@ -183,6 +262,13 @@ lv_obj_t *CreateSliderRow(lv_obj_t *parent, int min_value, int max_value,
     lv_obj_align(slider, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_event_cb(slider, cb, LV_EVENT_VALUE_CHANGED, nullptr);
     return row;
+}
+
+void BindSliderRelease(lv_obj_t *slider, lv_event_cb_t cb)
+{
+    if (slider != nullptr && cb != nullptr) {
+        lv_obj_add_event_cb(slider, cb, LV_EVENT_RELEASED, nullptr);
+    }
 }
 
 void BuildSliderPanel(lv_obj_t *parent, const char *title, const char *hint,
@@ -263,6 +349,7 @@ void BuildBrightnessTab(lv_obj_t *tab, int initial_brightness)
                      initial_brightness, &s_ui.brightness_pct_label,
                      &s_ui.brightness_slider, kBacklightMinPercent, 100,
                      OnBrightnessSliderChanged);
+    BindSliderRelease(s_ui.brightness_slider, OnBrightnessSliderReleased);
 
     lv_obj_t *foot = lv_label_create(tab);
     lv_label_set_text(foot, I18n::T("亮度设置会自动保存"));
@@ -288,6 +375,12 @@ void OnEnterStandbySliderChanged(lv_event_t *e)
     int value = static_cast<int>(lv_slider_get_value(slider));
     UpdateMinutesLabel(s_ui.enter_standby_min_label, value,
                        I18n::T("永不进入"));
+}
+
+void OnEnterStandbySliderReleased(lv_event_t *e)
+{
+    auto *slider = static_cast<lv_obj_t *>(lv_event_get_target(e));
+    int value = static_cast<int>(lv_slider_get_value(slider));
     IdlePower_SetStandbyMinutes(value);
     IdlePower_NotifyActivity();
 }
@@ -297,6 +390,12 @@ void OnShutdownSliderChanged(lv_event_t *e)
     auto *slider = static_cast<lv_obj_t *>(lv_event_get_target(e));
     int value = static_cast<int>(lv_slider_get_value(slider));
     UpdateMinutesLabel(s_ui.shutdown_min_label, value, I18n::T("永不关机"));
+}
+
+void OnShutdownSliderReleased(lv_event_t *e)
+{
+    auto *slider = static_cast<lv_obj_t *>(lv_event_get_target(e));
+    int value = static_cast<int>(lv_slider_get_value(slider));
     IdlePower_SetShutdownMinutes(value);
     IdlePower_NotifyActivity();
 }
@@ -311,6 +410,7 @@ void BuildStandbyTab(lv_obj_t *tab)
                      I18n::T("0 ~ 60 分钟"), initial_standby,
                      &s_ui.enter_standby_min_label, &s_ui.enter_standby_slider,
                      0, 60, OnEnterStandbySliderChanged, kStandbyCardH);
+    BindSliderRelease(s_ui.enter_standby_slider, OnEnterStandbySliderReleased);
     UpdateMinutesLabel(s_ui.enter_standby_min_label, initial_standby,
                        I18n::T("永不进入"));
 
@@ -319,6 +419,7 @@ void BuildStandbyTab(lv_obj_t *tab)
                      initial_shutdown, &s_ui.shutdown_min_label,
                      &s_ui.shutdown_slider, 0, 60, OnShutdownSliderChanged,
                      kStandbyCardH);
+    BindSliderRelease(s_ui.shutdown_slider, OnShutdownSliderReleased);
     UpdateMinutesLabel(s_ui.shutdown_min_label, initial_shutdown,
                        I18n::T("永不关机"));
 
@@ -347,6 +448,7 @@ void BuildVolumeTab(lv_obj_t *tab, int initial_volume)
     BuildSliderPanel(tab, I18n::T("拖动调节"), I18n::T("当前音量"), "0% ~ 100%",
                      initial_volume, &s_ui.volume_pct_label,
                      &s_ui.volume_slider, 0, 100, OnVolumeSliderChanged);
+    BindSliderRelease(s_ui.volume_slider, OnVolumeSliderReleased);
 
     lv_obj_t *foot = lv_label_create(tab);
     lv_label_set_text(foot, I18n::T("音量设置会自动保存"));
@@ -499,12 +601,170 @@ void FixTabBarItemHeights(lv_obj_t *tabview)
     }
 }
 
-void BuildBluetoothTab(lv_obj_t *tab)
+bool s_bt_tab_ready = false;
+lv_obj_t *s_bt_tab = nullptr;
+
+void EnsureBluetoothTab()
 {
-    lv_obj_set_style_bg_opa(tab, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(tab, 0, LV_PART_MAIN);
+    if (s_bt_tab_ready || s_bt_tab == nullptr) {
+        return;
+    }
+    s_bt_tab_ready = true;
+    lv_obj_set_style_bg_opa(s_bt_tab, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_bt_tab, 0, LV_PART_MAIN);
+    lv_obj_add_flag(s_bt_tab, LV_OBJ_FLAG_SCROLLABLE);
+    BluetoothScreen::BuildInto(s_bt_tab);
+    BluetoothScreen::LifecycleCallback(SCREEN_LIFECYCLE_LOAD);
+}
+
+void OnAssistantSwitchChanged(lv_event_t *e)
+{
+    auto *sw = static_cast<lv_obj_t *>(lv_event_get_target(e));
+    const bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    ScheduleSmartHomeSetting(0, enabled ? 1 : 0, 0);
+    /* This API only posts a request from the LVGL thread; it does not run
+     * wake-word/audio work synchronously inside the switch callback. */
+    Application::GetInstance().RequestSpokenWakeEnabled(enabled);
+}
+
+void OnHomeDeviceSwitchChanged(lv_event_t *e)
+{
+    auto *sw = static_cast<lv_obj_t *>(lv_event_get_target(e));
+    const int index = static_cast<int>(reinterpret_cast<intptr_t>(
+        lv_event_get_user_data(e)));
+    ScheduleSmartHomeSetting(1, index,
+                             lv_obj_has_state(sw, LV_STATE_CHECKED) ? 1 : 0);
+}
+
+void OnOpenHomeManager(lv_event_t * /*e*/)
+{
+    HomeScreen::LaunchApp("home");
+}
+
+void BuildAssistantTab(lv_obj_t *tab)
+{
+    lv_obj_set_style_pad_all(tab, 24, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(tab, 16, LV_PART_MAIN);
+    lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(tab);
+    screen_strip_obj_chrome(card);
+    lv_obj_set_width(card, LV_PCT(100));
+    lv_obj_set_height(card, 140);
+    lv_obj_set_style_bg_color(card, lv_color_hex(kColorCard), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 24, LV_PART_MAIN);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, I18n::T("AI 语音助手"));
+    lv_obj_set_style_text_font(title, &font_puhui_30_4, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 8, 16);
+
+    lv_obj_t *hint = lv_label_create(card);
+    lv_label_set_text(hint, I18n::T("Hi openvela，或长按底部白条"));
+    lv_obj_set_style_text_font(hint, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hint, lv_color_hex(kColorSubtle), LV_PART_MAIN);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_LEFT, 8, -16);
+
+    lv_obj_t *sw = lv_switch_create(card);
+    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -12, 0);
+    if (Application::GetInstance().IsSpokenWakeEnabled())
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(0x34C759),
+                              LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_anim_duration(sw, 0, LV_PART_MAIN);
+    lv_obj_set_style_anim_duration(sw, 0, LV_PART_INDICATOR);
+    lv_obj_add_event_cb(sw, OnAssistantSwitchChanged, LV_EVENT_VALUE_CHANGED,
+                        nullptr);
+}
+
+void BuildHomeDevicesTab(lv_obj_t *tab)
+{
+    SmartHome_EnsureLoaded();
+    lv_obj_set_style_pad_all(tab, 20, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(tab, 12, LV_PART_MAIN);
+    lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
     lv_obj_add_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
-    BluetoothScreen::BuildInto(tab);
+
+    lv_obj_t *hint = lv_label_create(tab);
+    lv_label_set_text(hint, I18n::T("桌面卡片显示已置顶的设备"));
+    lv_obj_set_style_text_font(hint, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hint, lv_color_hex(kColorSubtle), LV_PART_MAIN);
+
+    for (int i = 0; i < SmartHome_Count(); ++i) {
+        const SmartDevice *dev = SmartHome_At(i);
+        if (dev == nullptr)
+            continue;
+        lv_obj_t *row = lv_obj_create(tab);
+        screen_strip_obj_chrome(row);
+        lv_obj_set_width(row, LV_PCT(100));
+        lv_obj_set_height(row, 84);
+        lv_obj_set_style_bg_color(row, lv_color_hex(kColorCard), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(row, 18, LV_PART_MAIN);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name = lv_label_create(row);
+        lv_label_set_text(name, dev->name);
+        lv_obj_set_style_text_font(name, &font_puhui_20_4, LV_PART_MAIN);
+        lv_obj_set_style_text_color(name, lv_color_hex(kColorText), LV_PART_MAIN);
+        lv_obj_align(name, LV_ALIGN_TOP_LEFT, 12, 10);
+
+        char subtitle[72];
+        std::snprintf(subtitle, sizeof(subtitle), "%s · %s", dev->room,
+                      SmartHome_StatusText(dev));
+        lv_obj_t *status = lv_label_create(row);
+        lv_label_set_text(status, subtitle);
+        lv_obj_set_style_text_font(status, &font_puhui_20_4, LV_PART_MAIN);
+        lv_obj_set_style_text_color(status, lv_color_hex(kColorSubtle), LV_PART_MAIN);
+        lv_obj_align(status, LV_ALIGN_BOTTOM_LEFT, 12, -8);
+
+        lv_obj_t *sw = lv_switch_create(row);
+        lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -12, 0);
+        const bool on = dev->kind == kSmartCurtain ? dev->level > 0 : dev->on != 0;
+        if (on)
+            lv_obj_add_state(sw, LV_STATE_CHECKED);
+        lv_obj_set_style_bg_color(sw, lv_color_hex(0x34C759),
+                                  LV_PART_INDICATOR | LV_STATE_CHECKED);
+        lv_obj_set_style_anim_duration(sw, 0, LV_PART_MAIN);
+        lv_obj_set_style_anim_duration(sw, 0, LV_PART_INDICATOR);
+        lv_obj_add_event_cb(sw, OnHomeDeviceSwitchChanged, LV_EVENT_VALUE_CHANGED,
+                            reinterpret_cast<void *>(static_cast<intptr_t>(i)));
+    }
+
+    lv_obj_t *open = lv_button_create(tab);
+    lv_obj_set_width(open, LV_PCT(100));
+    lv_obj_set_height(open, 64);
+    lv_obj_set_style_bg_color(open, lv_color_hex(kColorAccent), LV_PART_MAIN);
+    lv_obj_set_style_radius(open, 16, LV_PART_MAIN);
+    lv_obj_set_style_border_width(open, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(open, OnOpenHomeManager, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *label = lv_label_create(open);
+    lv_label_set_text(label, I18n::T("打开 Home 管理设备"));
+    lv_obj_set_style_text_font(label, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_set_style_text_color(label, lv_color_hex(kColorText), LV_PART_MAIN);
+    lv_obj_center(label);
+}
+
+#include "settings_ringtone.inc"
+
+void OnSettingsTabChanged(lv_event_t *e)
+{
+    auto *tv = static_cast<lv_obj_t *>(lv_event_get_target(e));
+    const uint32_t active = lv_tabview_get_tab_active(tv);
+    if(active!=2)StopRingtonePreview();
+    if (active == 5) {
+        EnsureBluetoothTab();
+    } else if (active == 6 && !s_assistant_tab_built && s_assistant_tab != nullptr) {
+        BuildAssistantTab(s_assistant_tab);
+        s_assistant_tab_built = true;
+    } else if (active == 7 && !s_home_tab_built && s_home_tab != nullptr) {
+        BuildHomeDevicesTab(s_home_tab);
+        s_home_tab_built = true;
+    }
 }
 
 void BuildTabView(lv_obj_t *parent)
@@ -538,7 +798,15 @@ void BuildTabView(lv_obj_t *parent)
                                 LV_PART_ITEMS | LV_STATE_CHECKED);
 
     lv_obj_t *content = lv_tabview_get_content(tv);
+    /* Instant tab switches. The default scroll animation repaints the
+     * whole 720 panel and is what makes the option list feel stuck. */
+    lv_obj_set_style_anim_duration(tv, 0, LV_PART_MAIN);
+    lv_obj_set_style_anim_duration(bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_anim_duration(content, 0, LV_PART_MAIN);
+    lv_obj_set_style_anim_duration(content, 0, LV_PART_SCROLLBAR);
     screen_swipe_back_ignore(content, true);
+    lv_obj_add_event_cb(tv, OnSettingsTabChanged, LV_EVENT_VALUE_CHANGED,
+                        nullptr);
 
     // TODO(openvela): CX25601N charge IC not ported; charge tab hidden.
     lv_obj_t *tab_brightness = lv_tabview_add_tab(tv, I18n::T("亮度"));
@@ -547,14 +815,22 @@ void BuildTabView(lv_obj_t *parent)
     lv_obj_t *tab_standby = lv_tabview_add_tab(tv, I18n::T("待机"));
     BuildStandbyTab(tab_standby);
 
+    lv_obj_t *tab_ringtone = lv_tabview_add_tab(tv, I18n::T("铃声"));
+    BuildRingtoneTab(tab_ringtone);
+
     lv_obj_t *tab_volume = lv_tabview_add_tab(tv, I18n::T("音量"));
     BuildVolumeTab(tab_volume, initial_volume);
 
     lv_obj_t *tab_language = lv_tabview_add_tab(tv, I18n::T("语言"));
     BuildLanguageTab(tab_language);
 
-    lv_obj_t *tab_bluetooth = lv_tabview_add_tab(tv, I18n::T("蓝牙"));
-    BuildBluetoothTab(tab_bluetooth);
+    s_bt_tab = lv_tabview_add_tab(tv, I18n::T("蓝牙"));
+    s_bt_tab_ready = false;
+
+    s_assistant_tab = lv_tabview_add_tab(tv, I18n::T("助手"));
+    s_assistant_tab_built = false;
+    s_home_tab = lv_tabview_add_tab(tv, I18n::T("家居"));
+    s_home_tab_built = false;
 
     FixTabBarItemHeights(tv);
 }
@@ -572,6 +848,16 @@ void OnBackClicked(lv_event_t * /*e*/) { OnSwipeBack(); }
 
 void OnScreenUnloaded(lv_event_t * /*e*/)
 {
+    StopRingtonePreview();s_ringtone_hint=nullptr;s_ringtone_tab=nullptr;++s_ringtone_generation;s_ringtone_files.clear();
+    if (s_bt_tab_ready) {
+        BluetoothScreen::LifecycleCallback(SCREEN_LIFECYCLE_UNLOAD);
+    }
+    s_bt_tab_ready = false;
+    s_bt_tab = nullptr;
+    s_assistant_tab = nullptr;
+    s_home_tab = nullptr;
+    s_assistant_tab_built = false;
+    s_home_tab_built = false;
     BluetoothScreen::ResetUi();
     s_ui = UiState{};
 }
@@ -611,5 +897,6 @@ void SettingsScreen::LifecycleCallback(screen_lifecycle_event_t event)
     } else {
         ESP_LOGI(TAG, "unload: settings_screen");
     }
-    BluetoothScreen::LifecycleCallback(event);
+    /* Bluetooth UART starts only when that tab is opened. Starting it
+     * with the settings screen stole /dev/ttyS1 from voice mode 1. */
 }

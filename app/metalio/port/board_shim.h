@@ -89,7 +89,14 @@ extern "C" void board_shim_initialize(void);
 
 /* C-linkage hardware accessors (used by display/protocol code) */
 extern "C" int  metalio_board_get_battery(int *level, int *charging, int *discharging);
+/* Last sample only. Does not touch the fuel-gauge I2C bus. */
+extern "C" int  metalio_board_peek_battery(int *level, int *charging, int *discharging);
+extern "C" void metalio_board_note_battery(int level, int charging, int discharging);
 extern "C" const char *metalio_board_get_network_icon(void);
+/* 0 = WiFi, 1 = 4G, 2 = airplane. Reads cached state; never sends AT. */
+extern "C" int metalio_board_get_network_mode(void);
+extern "C" bool metalio_board_clock_ready(void);
+extern "C" void metalio_board_clock_synced(void);
 extern "C" int  metalio_board_get_volume(int *volume);
 extern "C" const char *metalio_board_get_network_state(void);
 

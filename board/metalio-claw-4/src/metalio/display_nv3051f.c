@@ -24,6 +24,8 @@
 #include <nuttx/video/mipi_dsi.h>
 #include <nuttx/kmalloc.h>
 #include <nuttx/arch.h>
+#include <nuttx/wqueue.h>
+#include <arch/board/metalio/display_health.h>
 
 #include <syslog.h>
 #include <string.h>
@@ -139,6 +141,9 @@ static int metalio_getplaneinfo(FAR struct fb_vtable_s *vtable, int planeno,
 static int metalio_pandisplay(FAR struct fb_vtable_s *vtable,
                               FAR struct fb_planeinfo_s *pinfo);
 static void metalio_frame_done(FAR void *arg);
+static int metalio_display_ioctl(FAR struct fb_vtable_s *vtable,
+                                  int cmd, unsigned long arg);
+static void metalio_display_monitor(FAR void *arg);
 #ifdef CONFIG_FB_UPDATE
 static int metalio_updatearea(FAR struct fb_vtable_s *vtable,
                               FAR const struct fb_area_s *area);
@@ -153,6 +158,7 @@ static struct fb_vtable_s g_metalio_vtable =
   .getvideoinfo = metalio_getvideoinfo,
   .getplaneinfo = metalio_getplaneinfo,
   .pandisplay   = metalio_pandisplay,
+  .ioctl        = metalio_display_ioctl,
 #ifdef CONFIG_FB_UPDATE
   .updatearea   = metalio_updatearea,
 #endif
@@ -181,6 +187,59 @@ static struct fb_planeinfo_s g_metalio_plane =
 
 static FAR uint8_t *g_metalio_fb;
 static bool g_metalio_fb_ready;
+static struct work_s g_display_monitor;
+static uint32_t g_display_recoveries;
+static uint32_t g_monitor_frames;
+static uint32_t g_monitor_underruns;
+static unsigned int g_monitor_stalls;
+
+static int metalio_display_ioctl(FAR struct fb_vtable_s *vtable,
+                                  int cmd, unsigned long arg)
+{
+#ifdef HI_STABILITY_PROBE
+  if (cmd == METALIO_FBIO_STALL) {esp_mipi_dsi_probe_stall(); return OK;}
+#endif
+  if (cmd == METALIO_FBIO_HEALTH)
+    {
+      FAR struct metalio_display_health_s *health = (FAR void *)(uintptr_t)arg;
+      if (!health) return -EINVAL;
+      health->frames = esp_mipi_dsi_get_frames();
+      health->underruns = esp_mipi_dsi_get_underruns();
+      health->recoveries = g_display_recoveries;
+      return OK;
+    }
+  if (cmd != METALIO_FBIO_RECOVER) return -ENOTTY;
+  if (!g_metalio_fb || arg % METALIO_FB_HEIGHT ||
+      arg >= METALIO_FB_HEIGHT * METALIO_FB_COUNT) return -EINVAL;
+  int rc = esp_mipi_dsi_recover_framebuffer(g_metalio_fb + arg * METALIO_FB_STRIDE);
+  if (rc == OK)
+    {
+      ++g_display_recoveries;
+      syslog(LOG_WARNING, "DISPLAY_RECOVER count=%lu y=%lu\n",
+             (unsigned long)g_display_recoveries, arg);
+    }
+  return rc > 0 ? OK : rc;
+}
+
+/* Independent of LVGL and of the DMA ISR: a stopped ISR cannot report its
+ * own failure. Never touch widgets or user storage from this monitor. */
+static void metalio_display_monitor(FAR void *arg)
+{
+  uint32_t frames = esp_mipi_dsi_get_frames();
+  uint32_t underruns = esp_mipi_dsi_get_underruns();
+  if (frames == g_monitor_frames) ++g_monitor_stalls;
+  else g_monitor_stalls = 0;
+  if (g_monitor_stalls >= 3 || underruns != g_monitor_underruns)
+    {
+      if (metalio_display_ioctl(&g_metalio_vtable, METALIO_FBIO_RECOVER,
+                                g_metalio_plane.yoffset) == OK)
+        g_monitor_stalls = 0;
+    }
+  g_monitor_frames = frames;
+  g_monitor_underruns = underruns;
+  work_queue(LPWORK, &g_display_monitor, metalio_display_monitor, NULL,
+             MSEC2TICK(100));
+}
 
 /****************************************************************************
  * Private Functions
@@ -224,7 +283,8 @@ static int metalio_getplaneinfo(FAR struct fb_vtable_s *vtable, int planeno,
   pinfo->display = display;
   pinfo->fbmem   = g_metalio_fb + (size_t)display * METALIO_FB_SIZE;
   pinfo->fblen   = (display == 0) ? METALIO_FB_TOTAL : METALIO_FB_SIZE;
-  pinfo->yoffset = (uint32_t)display * METALIO_FB_HEIGHT;
+  pinfo->yoffset = display == 0 ? g_metalio_plane.yoffset :
+                    (uint32_t)display * METALIO_FB_HEIGHT;
 
   return OK;
 }
@@ -255,6 +315,9 @@ static void metalio_frame_done(FAR void *arg)
 {
   FAR struct fb_vtable_s *vtable = (FAR struct fb_vtable_s *)arg;
 
+  union fb_paninfo_u info;
+  if (fb_peek_paninfo(vtable, &info, FB_NO_OVERLAY) == OK)
+    g_metalio_plane.yoffset = info.planeinfo.yoffset;
   fb_remove_paninfo(vtable, FB_NO_OVERLAY);
 }
 
@@ -263,7 +326,13 @@ static int metalio_updatearea(FAR struct fb_vtable_s *vtable,
                               FAR const struct fb_area_s *area)
 {
   size_t offset;
-  size_t len;
+  size_t row_len;
+  size_t span_len;
+  uint32_t x;
+  uint32_t y;
+  uint32_t width;
+  uint32_t height;
+  int ret;
 
   DEBUGASSERT(vtable != NULL && vtable == &g_metalio_vtable);
 
@@ -277,22 +346,47 @@ static int metalio_updatearea(FAR struct fb_vtable_s *vtable,
       return esp_mipi_dsi_flush_framebuffer(g_metalio_fb, METALIO_FB_TOTAL);
     }
 
-  if (area->y >= (METALIO_FB_HEIGHT * METALIO_FB_COUNT) ||
-      area->x >= METALIO_FB_WIDTH)
+  if (area->x >= METALIO_FB_WIDTH ||
+      area->y >= (METALIO_FB_HEIGHT * METALIO_FB_COUNT) ||
+      area->w == 0 || area->h == 0)
     {
       return OK;
     }
 
-  offset = (size_t)area->y * METALIO_FB_STRIDE +
-           (size_t)area->x * (METALIO_FB_BPP / 8);
-  len = (size_t)area->h * METALIO_FB_STRIDE;
-  if (offset + len > METALIO_FB_TOTAL)
+  x = area->x;
+  y = area->y;
+  width = area->w;
+  height = area->h;
+  if (width > METALIO_FB_WIDTH - x)
     {
-      len = METALIO_FB_TOTAL - offset;
+      width = METALIO_FB_WIDTH - x;
+    }
+  if (height > (METALIO_FB_HEIGHT * METALIO_FB_COUNT) - y)
+    {
+      height = (METALIO_FB_HEIGHT * METALIO_FB_COUNT) - y;
     }
 
-  return esp_mipi_dsi_flush_framebuffer((FAR uint8_t *)g_metalio_fb + offset,
-                                        len);
+  row_len = (size_t)width * (METALIO_FB_BPP / 8);
+  offset = (size_t)y * METALIO_FB_STRIDE +
+           (size_t)x * (METALIO_FB_BPP / 8);
+  /* One cache operation per dirty rectangle. Flushing each scanline
+   * separately made a full-screen LVGL repaint issue hundreds of cache
+   * maintenance calls and starved the MIPI scanout DMA. The bounding span
+   * includes unchanged pixels between rows, which are already valid in the
+   * same framebuffer and safe to write back. */
+  span_len = (size_t)(height - 1) * METALIO_FB_STRIDE + row_len;
+  if (offset >= METALIO_FB_TOTAL)
+    {
+      return OK;
+    }
+  if (span_len > METALIO_FB_TOTAL - offset)
+    {
+      span_len = METALIO_FB_TOTAL - offset;
+    }
+
+  ret = esp_mipi_dsi_flush_framebuffer(
+      (FAR uint8_t *)g_metalio_fb + offset, span_len);
+  return ret;
 }
 #endif /* CONFIG_FB_UPDATE */
 
@@ -514,6 +608,8 @@ int metalio_display_initialize(void)
   esp_mipi_dsi_register_frame_done_cb(metalio_frame_done, &g_metalio_vtable);
 
   g_metalio_fb_ready = true;
+  work_queue(LPWORK, &g_display_monitor, metalio_display_monitor, NULL,
+             MSEC2TICK(100));
   syslog(LOG_INFO,
          "/dev/fb0 ready %ux%u RGB888 triple-buffered (NV3051F MIPI-DSI)\n",
          METALIO_FB_WIDTH, METALIO_FB_HEIGHT);

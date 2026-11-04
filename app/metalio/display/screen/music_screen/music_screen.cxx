@@ -43,11 +43,18 @@
  */
 
 #include "music_screen.h"
+#include "display_text.h"
+#include "cJSON_compat.h"
 #include "i18n.h"
 #include "esp_log_shim.h"
 #include "freertos_shim.h"
 #include "home_screen/home_screen.h"
 #include "simple_uart.h"
+#include "application.h"
+#include "audio_service.h"
+#include <algorithm>
+#include <atomic>
+#include <metalio/metalio.h>
 
 #include <cstdio>
 #include <cstring>
@@ -101,6 +108,7 @@ struct MusicUi {
     lv_obj_t *lbl_song = nullptr;
     lv_obj_t *lbl_lyric[kLyricLineCount] = {nullptr, nullptr, nullptr};
     lv_obj_t *img_play_icon = nullptr;
+    lv_obj_t *lbl_volume = nullptr;
     lv_obj_t *album_img = nullptr;  // was album_eaf; lv_eaf not on NuttX
     // 进入界面时蓝牙端通常还没在播放，默认按钮显示"▶ 播放"，
     // 用户点击后才切到"❚❚ 暂停"图标。
@@ -108,8 +116,18 @@ struct MusicUi {
 };
 
 MusicUi s_ui;
-bool s_screen_active = false;
+std::atomic<bool> s_screen_active{false},s_voice_paused{false};
+std::atomic<unsigned> s_music_epoch{0};
 std::string s_rx_buffer;
+lv_timer_t *s_volume_timer=nullptr;
+int s_shown_volume=-1;
+void UpdateMusicVolume(){
+ if(!s_screen_active||!s_ui.lbl_volume)return;
+ int volume=Application::GetInstance().GetAudioService().GetVolume();
+ if(volume==s_shown_volume)return;s_shown_volume=volume;
+ lv_label_set_text_fmt(s_ui.lbl_volume,"音量 %d",volume);
+}
+void StopVolumeTimer(){if(s_volume_timer){lv_timer_delete(s_volume_timer);s_volume_timer=nullptr;}}
 
 // 把 (part | state) 显式转成 lv_style_selector_t，规避
 // -Wdeprecated-enum-enum-conversion 告警。
@@ -247,7 +265,7 @@ void post_song(const std::string &text) {
         return;
     }
     auto *msg = new AsyncTextMsg{};
-    snprintf(msg->text, sizeof(msg->text), "%s", text.c_str());
+    snprintf(msg->text, sizeof(msg->text), "%s", DisplayUtf8(text,sizeof(msg->text)-1).c_str());
     lv_async_call(async_set_song, msg);
 }
 
@@ -256,7 +274,7 @@ void post_lyric(const std::string &text) {
         return;
     }
     auto *msg = new AsyncTextMsg{};
-    snprintf(msg->text, sizeof(msg->text), "%s", text.c_str());
+    snprintf(msg->text, sizeof(msg->text), "%s", DisplayUtf8(text,sizeof(msg->text)-1).c_str());
     lv_async_call(async_set_lyric, msg);
 }
 
@@ -266,27 +284,12 @@ void post_lyric(const std::string &text) {
 //   {"type":"lyrics","data":"..."}
 // 直接做字符串查找，避免引入完整 JSON 解析器。
 // ---------------------------------------------------------------------------
-bool extract_quoted_value(const std::string &line, const std::string &key,
-                          std::string &out) {
-    const std::string pattern = "\"" + key + "\"";
-    size_t p = line.find(pattern);
-    if (p == std::string::npos) {
-        return false;
-    }
-    size_t colon = line.find(':', p + pattern.size());
-    if (colon == std::string::npos) {
-        return false;
-    }
-    size_t quote_open = line.find('"', colon + 1);
-    if (quote_open == std::string::npos) {
-        return false;
-    }
-    size_t quote_close = line.find('"', quote_open + 1);
-    if (quote_close == std::string::npos) {
-        return false;
-    }
-    out = line.substr(quote_open + 1, quote_close - quote_open - 1);
-    return true;
+bool extract_quoted_value(const std::string &line,const std::string &key,std::string &out) {
+    cJSON *root=cJSON_Parse(line.c_str());if(!root)return false;
+    const cJSON *value=cJSON_GetObjectItemCaseSensitive(root,key.c_str());
+    bool ok=cJSON_IsString(value)&&value->valuestring;
+    if(ok)out=value->valuestring;
+    cJSON_Delete(root);return ok;
 }
 
 void handle_json_line(const std::string &line) {
@@ -365,19 +368,20 @@ void on_uart_data(const std::vector<uint8_t> &data) {
 // ---------------------------------------------------------------------------
 // BT 模式切换 task：通过 /dev/ttyS1 把 BT 模块切到模式三 / 模式一。
 // ---------------------------------------------------------------------------
-void switch_to_mode3_task(void * /*arg*/) {
+void switch_to_mode3_task(void *arg) {
+    unsigned epoch=(unsigned)(uintptr_t)arg;
+    if(epoch!=s_music_epoch||!s_screen_active||s_voice_paused){vTaskDelete(nullptr);return;}
     ESP_LOGI(TAG, "load: switching BT to mode 3");
-    send_at("AT+RX=1\r\n");
-    vTaskDelay(pdMS_TO_TICKS(700));
-    send_at("AT+MODE=3\r\n");
+    metalio_bt_enter_music();
+    if(!s_screen_active||s_voice_paused)metalio_bt_ensure_mode1();
     vTaskDelete(nullptr);
 }
 
 void switch_to_mode1_task(void * /*arg*/) {
     ESP_LOGI(TAG, "unload: switching BT back to mode 1");
-    send_at("AT+RX=2\r\n");
-    vTaskDelay(pdMS_TO_TICKS(700));
-    send_at("AT+MODE=1\r\n");
+    /* Wait for SET MODE 1. A fire-and-forget AT pair left the codec in
+     * music mode, so the ring bubble, mic and TTS all stayed silent. */
+    if(!s_screen_active||s_voice_paused){metalio_bt_ensure_mode1();Application::GetInstance().ArmAssistantWakeWord();}
     vTaskDelete(nullptr);
 }
 
@@ -393,6 +397,10 @@ void OnPlayClicked(lv_event_t * /*e*/) {
     //   - 已暂停  （playing=false，图标=▶ ） -> 点 = 播放 -> 发 MPLAY
     // 先乐观切图标，BT 模块随后会回包 MPLAY / MPAUSE 让外部推送做最终对齐。
     const bool want_playing = !s_ui.playing;
+    if(want_playing&&s_voice_paused.exchange(false)){
+        unsigned epoch=++s_music_epoch;
+        xTaskCreateLegacy(switch_to_mode3_task,"mus_resume",4096,(void*)(uintptr_t)epoch,5,nullptr);
+    }
     send_at(want_playing ? "AT+MPLAY=1\r\n" : "AT+MPAUSE=1\r\n");
     s_ui.playing = want_playing;
     if (s_ui.img_play_icon != nullptr) {
@@ -403,8 +411,11 @@ void OnPlayClicked(lv_event_t * /*e*/) {
     sync_album_eaf(want_playing);
 }
 
-void OnVolDownClicked(lv_event_t * /*e*/) { send_at("AT+VOLDOWN\r\n"); }
-void OnVolUpClicked(lv_event_t * /*e*/) { send_at("AT+VOLUP\r\n"); }
+void AdjustMusicVolume(int delta){auto &audio=Application::GetInstance().GetAudioService();
+ int old=audio.GetVolume(),value=std::max(0,std::min(100,old+delta));
+ if(value!=old){audio.SetVolume(value);send_at(delta>0?"AT+VOLUP\r\n":"AT+VOLDOWN\r\n");}UpdateMusicVolume();}
+void OnVolDownClicked(lv_event_t *) {AdjustMusicVolume(-5);}
+void OnVolUpClicked(lv_event_t *) {AdjustMusicVolume(5);}
 
 void OnSwipeBack()
 {
@@ -412,6 +423,7 @@ void OnSwipeBack()
 }
 
 void OnScreenUnloaded(lv_event_t * /*e*/) {
+    StopVolumeTimer();
     s_screen_active = false;
     s_ui = MusicUi{};
 }
@@ -607,13 +619,16 @@ lv_obj_t *MusicScreen::CreateStatic() {
     BuildAlbum(scr);
     BuildLyric(scr);
     BuildControls(scr);
+    s_ui.lbl_volume=lv_label_create(scr);lv_obj_set_style_text_font(s_ui.lbl_volume,&font_puhui_20_4,0);
+    lv_obj_set_style_text_color(s_ui.lbl_volume,lv_color_hex(0xBFC5D0),0);lv_obj_align(s_ui.lbl_volume,LV_ALIGN_TOP_MID,0,526);screen_make_input_passive(s_ui.lbl_volume);
     // BackButton 最后建，保证它在 z-order 顶层、可被点中。
     BuildBackButton(scr);
 
     lv_obj_add_event_cb(scr, OnScreenUnloaded, LV_EVENT_SCREEN_UNLOADED, nullptr);
     screen_attach_swipe_back(scr, OnSwipeBack);
 
-    s_screen_active = true;
+    s_screen_active = true;s_shown_volume=-1;UpdateMusicVolume();StopVolumeTimer();
+    s_volume_timer=lv_timer_create([](lv_timer_t*){UpdateMusicVolume();},250,nullptr);
     return scr;
 }
 
@@ -626,7 +641,8 @@ void MusicScreen::LifecycleCallback(screen_lifecycle_event_t event) {
     if (event == SCREEN_LIFECYCLE_LOAD) {
         ESP_LOGI(TAG, "load: music_screen -> switching BT to mode 3");
         // 让 BT 模块切到「音乐接收」模式三；命令需要 700ms 间隔，放后台 task。
-        xTaskCreate(switch_to_mode3_task, "mus_mode3", 4096, nullptr, 5, nullptr);
+        s_voice_paused=false;unsigned epoch=++s_music_epoch;
+        xTaskCreateLegacy(switch_to_mode3_task, "mus_mode3", 4096, (void*)(uintptr_t)epoch, 5, nullptr);
         // 注册 UART RX 回调，监听手机回传的 JSON 与播放状态。
         s_rx_buffer.clear();
         SimpleUart::getInstance().begin();
@@ -636,10 +652,10 @@ void MusicScreen::LifecycleCallback(screen_lifecycle_event_t event) {
         // 摘掉回调，避免 UART task 仍向已销毁的 UI 投递更新。
         SimpleUart::getInstance().registerCallback(
             std::function<void(const std::vector<uint8_t> &)>());
-        s_screen_active = false;
+        ++s_music_epoch;StopVolumeTimer();s_screen_active = false;
         s_rx_buffer.clear();
         // 切回模式 1 同样需要 700ms 间隔，放后台 task 异步执行。
-        xTaskCreate(switch_to_mode1_task, "mus_mode1", 4096, nullptr, 5, nullptr);
+        xTaskCreateLegacy(switch_to_mode1_task, "mus_mode1", 4096, nullptr, 5, nullptr);
     }
 }
 
@@ -651,3 +667,8 @@ void MusicScreen::PushSong(const std::string &text) { post_song(text); }
 void MusicScreen::PushLyric(const std::string &text) { post_lyric(text); }
 
 void MusicScreen::PushPlayState(bool playing) { post_play_state(playing); }
+void MusicScreen::PauseForVoice(){
+ if(!s_screen_active)return;s_voice_paused=true;++s_music_epoch;
+ send_at("AT+MPAUSE=1\r\n");PushPlayState(false);
+ // ArmAssistantWakeWord restores mode 1 under the existing UART lock.
+}

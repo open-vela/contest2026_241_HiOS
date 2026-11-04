@@ -47,6 +47,9 @@ public:
 
     // Prefer metalio_sdcard_mount_ro(); keep API parity for screen code.
     bool Mount() { return metalio_sdcard_mount_ro() == 0; }
+
+    // Writable FAT for photo save. Boot leaves the card unmounted.
+    bool EnsureWritable() { return metalio_sdcard_ensure_rw() == 0; }
     void Unmount() {}
 
     // MSC raw-card paths — not supported on openvela yet.

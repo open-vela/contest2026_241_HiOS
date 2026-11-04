@@ -2,10 +2,10 @@
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
  *
- * RadioPlayer — progressive MP3 live radio for the HiOS radio page.
+ * RadioPlayer — HTTP/HTTPS HLS (m3u8) and MP3 live radio for HiOS.
  *
- * Owns stream playback, paced I2S output, lightweight spectrum levels,
- * and soft system-audio occupancy. The radio page only reads this API.
+ * Owns stream playback, paced I2S output via AudioService (not pcm0),
+ * lightweight spectrum levels, and soft system-audio occupancy.
  */
 
 #pragma once
@@ -57,7 +57,11 @@ public:
 
     int volume() const;
     void AdjustVolume(int delta);
+#ifdef HI_STABILITY_PROBE
+    struct ProbeStats { uint32_t produced,submitted,rebuffer;size_t buffered; };
+    ProbeStats GetProbeStats() const;
+#endif
 
 private:
-    RadioPlayer() = default;
+    RadioPlayer();
 };

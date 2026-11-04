@@ -1,0 +1,13 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+#ifndef METALIO_FLASH_LAYOUT_H
+#define METALIO_FLASH_LAYOUT_H
+#define METALIO_FLASH_BYTES       0x02000000u
+#define METALIO_APP_START         0x00002000u
+#define METALIO_APP_END           0x01fc0000u
+#define METALIO_SETTINGS_A        0x01fe0000u
+#define METALIO_SETTINGS_A_META   0x01fe1000u
+#define METALIO_SETTINGS_B        0x01fe2000u
+#define METALIO_SETTINGS_B_META   0x01fe3000u
+#define METALIO_SETTINGS_LEGACY   0x00ff0000u
+#define METALIO_FLASH_SECTOR      0x00001000u
+#endif

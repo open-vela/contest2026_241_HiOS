@@ -1,3 +1,4 @@
+#include "hi_task_cpp.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -6,7 +7,7 @@
  * main/display/screen/secondary_screen/secondary_screen.cc.
  *
  * Adaptations:
- *   - usb_extend_screen_* → stubbed (NuttX has no USB extend screen yet)
+ *   - USB vendor JPEG stream → bounded NuttX TinyUSB transport
  *   - usb_extend_prefs_* → Settings class (file-based)
  *   - esp_lv_adapter_lock/unlock → lv_lock()/lv_unlock()
  *   - esp_lcd_touch/touch_feed → stubbed
@@ -21,6 +22,8 @@
 #include "esp_log_shim.h"
 #include "esp_err_shim.h"
 #include "settings.h"
+#include "usb_virtual_disk.h"
+#include "usb_secondary_display.h"
 #include "home_screen/home_screen.h"
 
 #include <cstdio>
@@ -30,19 +33,23 @@ LV_FONT_DECLARE(font_puhui_20_4);
 LV_FONT_DECLARE(font_puhui_30_4);
 
 /* ---------------------------------------------------------------------------
- * USB extend screen stubs — TODO(openvela): implement with NuttX USB device
+ * USB extend screen transport and persisted preferences
  * ------------------------------------------------------------------------- */
 namespace usb_extend
 {
-static bool s_running = false;
+
 static void (*s_stopped_cb)(void *) = nullptr;
 static void *s_stopped_ctx = nullptr;
 
-inline bool is_running() { return s_running; }
-inline void start() { s_running = true; }
+inline bool is_running() { return UsbVirtualDisk::GetInstance().IsDisplayActive(); }
+inline void start() {
+    Settings settings("usb_extend",false);
+    UsbSecondary::Configure(settings.GetInt("jpeg_quality",5),settings.GetInt("max_fps",15),settings.GetInt("frame_limit_kb",100)*1024);
+    UsbVirtualDisk::GetInstance().StartDisplay();
+}
 inline void stop()
 {
-    s_running = false;
+    UsbVirtualDisk::GetInstance().StopDisplay();
     if (s_stopped_cb)
         s_stopped_cb(s_stopped_ctx);
 }
@@ -105,6 +112,7 @@ struct UiState
     lv_obj_t *fps_slider = nullptr;
     lv_obj_t *frame_slider = nullptr;
     bool starting = false;
+    lv_timer_t *state_timer=nullptr;
 };
 
 UiState s_ui;
@@ -173,11 +181,12 @@ void RefreshUi()
     if (running)
     {
         lv_label_set_text(s_ui.status_lbl,
-                          I18n::T("副屏运行中。短按电源键可退出；请在电脑上将显示模式设为「扩展」。"));
+                          UsbSecondary::HasPicture() ? I18n::T("副屏画面已接收，画面右上角 X 可关闭。") :
+                          I18n::T("等待电脑发送画面，请在电脑副屏驱动中选择扩展。"));
         SetStatusVisible(true);
         lv_label_set_text(s_ui.start_lbl, I18n::T("关闭副屏"));
     }
-    else if (s_ui.starting)
+    else if (s_ui.starting || UsbVirtualDisk::GetInstance().IsDisplayRequested())
     {
         lv_label_set_text(s_ui.status_lbl, I18n::T("正在开启副屏…"));
         SetStatusVisible(true);
@@ -229,7 +238,7 @@ void OnStartBtn(lv_event_t *e)
     }
     s_ui.starting = true;
     RefreshUi();
-    std::thread(StartWorker).detach();
+    HiTask::LegacyThread(StartWorker).detach();
 }
 
 void OnJpgSlider(lv_event_t *e)
@@ -330,9 +339,9 @@ void BuildMainTab(lv_obj_t *tab)
              true);
     add_step("3",
              "安装驱动后用 USB 连接电脑，点击下方开启；在 Windows「显示设置」中选择"
-             "「扩展」。支持触摸，支持播放电脑声音。",
+             "「扩展」。支持画面传输和触摸，系统音频保持原有通路。",
              false);
-    add_step("4", "分辨率 720×720。开启后短按电源键可退出副屏。", true);
+    add_step("4", "分辨率 720×720。画面右上角 X 可关闭副屏。", true);
 }
 
 void BuildSettingsTab(lv_obj_t *tab)
@@ -485,8 +494,9 @@ void BuildTabView(lv_obj_t *parent)
 void OnUnload(lv_event_t *e)
 {
     (void)e;
-    if (usb_extend::is_running())
-        usb_extend::stop();
+    usb_extend::stop();
+    UsbSecondary::Attach(nullptr);
+    if(s_ui.state_timer)lv_timer_delete(s_ui.state_timer);
     s_ui = {};
 }
 
@@ -506,6 +516,12 @@ lv_obj_t *SecondaryScreen::CreateStatic()
 
     s_ui.screen = scr;
     s_ui.starting = false;
+    UsbSecondary::Attach(scr);
+    s_ui.state_timer=lv_timer_create([](lv_timer_t *timer){
+        static int previous=-1;
+        const int state=UsbVirtualDisk::GetInstance().IsDisplayActive()?2:UsbVirtualDisk::GetInstance().IsDisplayRequested()?1:0;
+        if(state!=previous){previous=state;s_ui.starting=false;RefreshUi();}
+    },250,nullptr);
     usb_extend::set_stopped_cb(OnStoppedUi, nullptr);
     RefreshUi();
 
@@ -529,7 +545,6 @@ void SecondaryScreen::LifecycleCallback(screen_lifecycle_event_t event)
     else
     {
         ESP_LOGI(TAG, "unload");
-        if (usb_extend::is_running())
-            usb_extend::stop();
+        usb_extend::stop();
     }
 }

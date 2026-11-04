@@ -21,6 +21,7 @@
  */
 
 #include "calendar_screen.h"
+#include "lunar_date.h"
 #include "i18n.h"
 #include "esp_log_shim.h"
 #include "home_screen/home_screen.h"
@@ -28,6 +29,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <ctime>
+#include <string>
 
 #include "lvgl.h"
 
@@ -68,7 +70,7 @@ constexpr int32_t kColumns          = 7;
 constexpr int32_t kRows             = 6;
 constexpr int32_t kGridLeftPad      = 36;
 constexpr int32_t kGridRightPad     = 36;
-constexpr int32_t kCellHeight       = 72;
+constexpr int32_t kCellHeight       = 62;
 constexpr int32_t kRowGap           = 4;
 constexpr int32_t kWeekdayRowHeight = 36;
 constexpr int32_t kWeekdayMarginTop = 18;
@@ -203,7 +205,8 @@ void BuildHeaderRow(lv_obj_t* content, int year, int month, int mday,
                                 LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_LEFT_MID, kHeaderInnerPadX + 22, 0);
 
-    BuildTodayBadge(header, month, mday, wday);
+    time_t badge_now=time(nullptr);struct tm today{};localtime_r(&badge_now,&today);
+    BuildTodayBadge(header, today.tm_mon+1, today.tm_mday, today.tm_wday);
 
     // Divider line below the header.
     lv_obj_t* divider = lv_obj_create(content);
@@ -238,7 +241,7 @@ void BuildWeekdayRow(lv_obj_t* content, int32_t inner_w) {
     }
 }
 
-void BuildDayCell(lv_obj_t* content, int row, int col, int day_num,
+void BuildDayCell(lv_obj_t* content, int row, int col, int day_num, int year, int month,
                   bool is_today, bool is_other_month, bool is_weekend,
                   int32_t cell_w, int32_t grid_top) {
     const int32_t x = kGridLeftPad + col * cell_w;
@@ -281,7 +284,11 @@ void BuildDayCell(lv_obj_t* content, int row, int col, int day_num,
     lv_obj_set_style_text_color(lbl, lv_color_hex(color), LV_PART_MAIN);
     lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_width(lbl, cell_w);
-    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -11);
+    char lunar[32];HiOSLunar::Format(year,month,day_num,lunar,sizeof(lunar));
+    auto *lunar_label=lv_label_create(cell);lv_label_set_text(lunar_label,lunar);
+    lv_obj_set_style_text_font(lunar_label,&font_puhui_20_4,0);lv_obj_set_style_text_color(lunar_label,lv_color_hex(color),0);
+    lv_obj_align(lunar_label,LV_ALIGN_CENTER,0,19);
 
     if (is_today) {
         lv_obj_t* mk = lv_obj_create(cell);
@@ -336,71 +343,66 @@ void BuildCalendarGrid(lv_obj_t* content, int year, int month, int today_mday,
             is_other_month = true;
         }
 
-        BuildDayCell(content, row, col, day_num, is_today, is_other_month,
+        BuildDayCell(content, row, col, day_num,
+                     idx<first_wday?prev_year:(idx>=first_wday+days?(month==12?year+1:year):year),
+                     idx<first_wday?prev_month:(idx>=first_wday+days?(month==12?1:month+1):month), is_today, is_other_month,
                      is_weekend, cell_w, grid_top);
     }
 }
 
-}  // namespace
+struct CalendarView {
+    lv_obj_t *root=nullptr,*content=nullptr,*overlay=nullptr,*year_roll=nullptr,*month_roll=nullptr,*day_roll=nullptr;
+    int year=2026,month=1,day=1;
+};
+void RenderMonth(CalendarView *v) {
+    lv_obj_clean(v->content);
+    v->day=std::min(v->day,days_in_month(v->year,v->month));
+    BuildHeaderRow(v->content,v->year,v->month,v->day,first_weekday_of_month(v->year,v->month));
+    BuildWeekdayRow(v->content,kScreenWidth-kCardMarginX*2);
+    BuildCalendarGrid(v->content,v->year,v->month,v->day,kScreenWidth-kCardMarginX*2);
+    char lunar[64],text[120];HiOSLunar::Format(v->year,v->month,v->day,lunar,sizeof(lunar),true);
+    snprintf(text,sizeof(text),"%04d-%02d-%02d  %s",v->year,v->month,v->day,lunar);
+    auto *footer=lv_label_create(v->content);lv_label_set_text(footer,text);lv_obj_set_style_text_font(footer,&font_puhui_20_4,0);
+    lv_obj_set_style_text_color(footer,lv_color_hex(kColorAccent),0);lv_obj_align(footer,LV_ALIGN_TOP_MID,0,600);
+    screen_make_input_passive(v->content);
+}
+lv_obj_t *CalendarButton(lv_obj_t *parent,const char *title,int x,int y,int width,lv_event_cb_t cb,void *data) {
+    auto *button=lv_button_create(parent);lv_obj_set_pos(button,x,y);lv_obj_set_size(button,width,46);
+    lv_obj_set_style_radius(button,12,0);lv_obj_set_style_bg_color(button,lv_color_hex(kColorBadgeBg),0);
+    screen_swipe_back_ignore(button,true);lv_obj_add_event_cb(button,cb,LV_EVENT_CLICKED,data);
+    auto *label=lv_label_create(button);lv_label_set_text(label,title);lv_obj_set_style_text_font(label,&font_puhui_20_4,0);lv_obj_center(label);return button;
+}
+void CloseDatePicker(CalendarView *v) {if(v->overlay){lv_obj_delete(v->overlay);v->overlay=nullptr;}}
+void ShowDatePicker(CalendarView *v) {
+    if(v->overlay)return;
+    auto *panel=v->overlay=lv_obj_create(v->root);lv_obj_set_size(panel,650,520);lv_obj_center(panel);
+    lv_obj_set_style_bg_color(panel,lv_color_hex(kColorBadgeBg),0);lv_obj_set_style_border_width(panel,1,0);
+    lv_obj_set_style_radius(panel,24,0);lv_obj_remove_flag(panel,LV_OBJ_FLAG_SCROLLABLE);screen_swipe_back_ignore(panel,true);
+    auto *title=lv_label_create(panel);lv_label_set_text(title,"查找日期");lv_obj_set_style_text_font(title,&font_puhui_30_4,0);lv_obj_align(title,LV_ALIGN_TOP_MID,0,12);
+    std::string years,months,days;char text[20];
+    for(int y=1901;y<=2049;y++){snprintf(text,sizeof(text),"%d 年",y);if(!years.empty())years+='\n';years+=text;}
+    for(int m=1;m<=12;m++){snprintf(text,sizeof(text),"%d 月",m);if(!months.empty())months+='\n';months+=text;}
+    for(int d=1;d<=31;d++){snprintf(text,sizeof(text),"%d 日",d);if(!days.empty())days+='\n';days+=text;}
+    lv_obj_t **rollers[]={&v->year_roll,&v->month_roll,&v->day_roll};const std::string *options[]={&years,&months,&days};int values[]={v->year-1901,v->month-1,v->day-1};
+    for(int i=0;i<3;i++){auto *roll=*rollers[i]=lv_roller_create(panel);lv_roller_set_options(roll,options[i]->c_str(),LV_ROLLER_MODE_NORMAL);lv_roller_set_visible_row_count(roll,5);
+        lv_obj_set_size(roll,180,290);lv_obj_set_pos(roll,12+i*195,85);lv_obj_set_style_text_font(roll,&font_puhui_30_4,LV_PART_MAIN);lv_obj_set_style_text_font(roll,&font_puhui_30_4,LV_PART_SELECTED);
+        lv_roller_set_selected(roll,std::max(0,values[i]),LV_ANIM_OFF);screen_swipe_back_ignore(roll,true);}
+    CalendarButton(panel,"取消",40,405,220,[](lv_event_t *e){CloseDatePicker((CalendarView*)lv_event_get_user_data(e));},v);
+    CalendarButton(panel,"跳转",330,405,220,[](lv_event_t *e){auto*v=(CalendarView*)lv_event_get_user_data(e);
+        v->year=1901+lv_roller_get_selected(v->year_roll);v->month=1+lv_roller_get_selected(v->month_roll);v->day=std::min(1+(int)lv_roller_get_selected(v->day_roll),days_in_month(v->year,v->month));CloseDatePicker(v);RenderMonth(v);},v);
+}
+} // namespace
 
 lv_obj_t* CalendarScreen::CreateStatic() {
-    lv_obj_t* scr = lv_obj_create(NULL);
-    screen_strip_obj_chrome(scr);
-    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Vertical gradient background.
-    lv_obj_set_style_bg_color(scr, lv_color_hex(kColorBg), LV_PART_MAIN);
-    lv_obj_set_style_bg_grad_color(scr, lv_color_hex(kColorBgGrad),
-                                   LV_PART_MAIN);
-    lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
-
-    // Transparent content container that adds outer padding around the
-    // header / grid. All other widgets are positioned relative to it.
-    lv_obj_t* content = lv_obj_create(scr);
-    lv_obj_set_size(content, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_pad_all(content, 0, LV_PART_MAIN);
-    lv_obj_set_style_margin_all(content, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_left(content, kCardMarginX, LV_PART_MAIN);
-    lv_obj_set_style_pad_right(content, kCardMarginX, LV_PART_MAIN);
-    lv_obj_set_style_pad_top(content, kCardMarginTop, LV_PART_MAIN);
-    lv_obj_set_style_pad_bottom(content, kCardMarginBottom, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_border_width(content, 0, LV_PART_MAIN);
-    lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
-
-    time_t now = time(nullptr);
-    struct tm tm_now = {};
-    localtime_r(&now, &tm_now);
-    const int year  = tm_now.tm_year + 1900;
-    const int month = tm_now.tm_mon + 1;
-    const int mday  = tm_now.tm_mday;
-    const int wday  = tm_now.tm_wday;
-
-    const int32_t inner_w = kScreenWidth - kCardMarginX * 2;
-    BuildHeaderRow(content, year, month, mday, wday);
-    BuildWeekdayRow(content, inner_w);
-    BuildCalendarGrid(content, year, month, mday, inner_w);
-
-    // "右滑返回" hint along the bottom.
-    lv_obj_t* hint = lv_label_create(content);
-    lv_label_set_text(hint, I18n::T("右滑返回"));
-    lv_obj_set_style_text_font(hint, &font_puhui_20_4, LV_PART_MAIN);
-    lv_obj_set_style_text_color(hint, lv_color_hex(kColorSubtleText),
-                                LV_PART_MAIN);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -10);
-
-    // Make the entire content tree input-passive so PRESSED/RELEASED events
-    // bubble up to the screen-level swipe-back handler.
-    screen_make_input_passive(content);
-    screen_attach_swipe_back(scr, OnSwipeBack);
-
-    return scr;
+    auto *v=new CalendarView;auto *scr=v->root=lv_obj_create(nullptr);screen_strip_obj_chrome(scr);lv_obj_remove_flag(scr,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(scr,lv_color_hex(kColorBg),0);lv_obj_set_style_bg_grad_color(scr,lv_color_hex(kColorBgGrad),0);lv_obj_set_style_bg_grad_dir(scr,LV_GRAD_DIR_VER,0);
+    auto *content=v->content=lv_obj_create(scr);screen_strip_obj_chrome(content);lv_obj_set_size(content,664,630);lv_obj_set_pos(content,28,28);
+    lv_obj_set_style_bg_opa(content,LV_OPA_TRANSP,0);lv_obj_remove_flag(content,LV_OBJ_FLAG_SCROLLABLE);
+    time_t now=time(nullptr);struct tm today{};localtime_r(&now,&today);v->year=std::max(1901,std::min(2049,today.tm_year+1900));v->month=today.tm_mon+1;v->day=today.tm_mday;RenderMonth(v);
+    CalendarButton(scr,"上月",28,663,148,[](lv_event_t *e){auto*v=(CalendarView*)lv_event_get_user_data(e);if(v->year==1901&&v->month==1)return;if(--v->month==0){v->month=12;--v->year;}RenderMonth(v);},v);
+    CalendarButton(scr,"下月",196,663,148,[](lv_event_t *e){auto*v=(CalendarView*)lv_event_get_user_data(e);if(v->year==2049&&v->month==12)return;if(++v->month==13){v->month=1;++v->year;}RenderMonth(v);},v);
+    CalendarButton(scr,"今天",364,663,148,[](lv_event_t *e){auto*v=(CalendarView*)lv_event_get_user_data(e);time_t now=time(nullptr);struct tm t{};localtime_r(&now,&t);v->year=std::max(1901,std::min(2049,t.tm_year+1900));v->month=t.tm_mon+1;v->day=t.tm_mday;RenderMonth(v);},v);
+    CalendarButton(scr,"查找日期",532,663,160,[](lv_event_t *e){ShowDatePicker((CalendarView*)lv_event_get_user_data(e));},v);
+    screen_attach_swipe_back(scr,OnSwipeBack);lv_obj_add_event_cb(scr,[](lv_event_t *e){if(lv_event_get_target(e)==((CalendarView*)lv_event_get_user_data(e))->root)delete (CalendarView*)lv_event_get_user_data(e);},LV_EVENT_DELETE,v);return scr;
 }
-
-lv_obj_t* CalendarScreen::Create()
-{
-    root_ = CreateStatic();
-    return root_;
-}
+lv_obj_t* CalendarScreen::Create(){root_=CreateStatic();return root_;}

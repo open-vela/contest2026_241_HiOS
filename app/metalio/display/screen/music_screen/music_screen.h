@@ -46,4 +46,6 @@ public:
     static void PushSong(const std::string &text);
     static void PushLyric(const std::string &text);
     static void PushPlayState(bool playing);
+    // Worker/application thread: pause Bluetooth music before local voice.
+    static void PauseForVoice();
 };

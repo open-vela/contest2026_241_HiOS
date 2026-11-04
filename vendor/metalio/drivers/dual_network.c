@@ -16,6 +16,8 @@ enum metalio_net_path_e
 };
 
 static enum metalio_net_path_e g_path = METALIO_NET_WIFI;
+extern int metalio_app_select_data_path(int cellular) weak_function;
+extern int metalio_app_active_data_path(void) weak_function;
 
 int metalio_dual_network_initialize(void)
 {
@@ -42,16 +44,27 @@ int metalio_dual_network_initialize(void)
 
 int metalio_dual_network_select(int cellular)
 {
+  int ret = OK;
+  if (metalio_app_select_data_path != NULL)
+    {
+      ret = metalio_app_select_data_path(cellular != 0);
+    }
+  else if (cellular)
+    {
+      return -ENOSYS;
+    }
+  if (ret < 0)
+    {
+      return ret;
+    }
   if (cellular)
     {
       g_path = METALIO_NET_CELLULAR;
-      metalio_tca9555_write_pin(BOARD_IOEXP_PA_SWITCH, false); /* 4G audio path */
       syslog(LOG_INFO, "dual-net: switched to cellular\n");
     }
   else
     {
       g_path = METALIO_NET_WIFI;
-      metalio_tca9555_write_pin(BOARD_IOEXP_PA_SWITCH, true);
       syslog(LOG_INFO, "dual-net: switched to Wi-Fi\n");
     }
 
@@ -60,5 +73,10 @@ int metalio_dual_network_select(int cellular)
 
 int metalio_dual_network_path(void)
 {
+  if (metalio_app_active_data_path != NULL)
+    {
+      int active = metalio_app_active_data_path();
+      return active;
+    }
   return (int)g_path;
 }

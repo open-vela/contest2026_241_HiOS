@@ -1,3 +1,4 @@
+#include "hi_input_method.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -5,22 +6,8 @@
  * GpsScreen — ported from MetalioClaw4
  * main/display/screen/gps_screen/gps_screen.cc (2766 lines).
  *
- * 适配说明详见 gps_screen.h。本文件保留上游的完整 UI 树（tabview /
- * GPS 信息卡 / WiFi 卡 / 基站卡 / 地图全屏窗口 / 模拟定位弹框 / 缩放
- * 控件），把以下平台依赖替换为 stub：
- *
- *   - GpsService → 返回 demo snapshot（fix_valid=true，纬度 39.908823 /
- *     经度 116.397470，天安门），UI 立即展示完整数据。
- *   - HTTP /location/report/cell + static-map 下载 → stub：永远走失败
- *     分支，UI 显示「查询失败：未返回定位数据」。地图区域显示错误 pill。
- *   - Nt26Board AT+ECWIFISCAN / AT+ECBCINFO → stub：返回空响应，
- *     BuildWifiLocateBody / BuildCellLocateBody 走 「无结果」 分支。
- *   - IOExpander::GPS_POWER → no-op（NuttX IO 扩展器尚未端口化）。
- *   - LvglAllocatedImage / heap_caps_malloc → malloc + 不渲染（地图 PNG
- *     永远走 stub 失败路径，所以解码逻辑保留但实际不会触发）。
- *   - esp_lv_adapter_lock / unlock → lv_lock / lv_unlock。
- *   - portMUX_TYPE → std::mutex（更稳，开销可忽略）。
- *   - <cmath> → __builtin_* 内置。
+ * Uses the NuttX GPS snapshot, serialized NT26 location queries and
+ * the socket/TLS HTTP client. LVGL UI and map parsing follow upstream.
  */
 
 #include "gps_screen.h"
@@ -33,6 +20,11 @@
 #include "system_info.h"
 #include "home_screen/home_screen.h"
 #include "screen_util.h"
+#include "lvgl_image.h"
+#include "ota.h"
+#define LODEPNG_NO_COMPILE_CPP
+#include "src/libs/lodepng/lodepng.h"
+#include <sys/stat.h>
 #include <metalio/metalio.h>
 
 #include "cJSON_compat.h"
@@ -162,6 +154,7 @@ struct TabLocState {
     bool location_loading = false;
     bool has_map          = false;
     bool has_locate_result = false;
+    std::unique_ptr<LvglAllocatedImage> map_image_holder;
     double result_lat     = 0.0;
     double result_lon     = 0.0;
     double result_acc     = 0.0;
@@ -289,34 +282,33 @@ inline Snapshot GetSnapshot() {
     Snapshot s;
     s.started = true;
 
-    int fix_quality = 0;
-    int sats = 0;
-    double lat = 0.0;
-    double lon = 0.0;
-    if (metalio_gps_get_snapshot(&fix_quality, &sats, &lat, &lon) < 0) {
-        // No GGA sentence received yet.
-        return s;
-    }
-
-    s.fix_quality = static_cast<uint8_t>(fix_quality);
-    s.satellites_used = static_cast<uint16_t>(sats);
-    s.satellites_view = static_cast<uint16_t>(sats);
-    if (fix_quality > 0 && (lat != 0.0 || lon != 0.0)) {
-        s.fix_valid = true;
-        s.latitude_deg = lat;
-        s.longitude_deg = lon;
-    }
+    metalio_gps_snapshot_s raw{};
+    if(metalio_gps_get_snapshot_ex(&raw)<0) return s;
+    s.fix_quality=raw.fix_quality;s.fix_valid=raw.position_valid;
+    s.latitude_deg=raw.latitude;s.longitude_deg=raw.longitude;
+    s.satellites_used=raw.sats;s.satellites_view=raw.satellites_view;
+    s.altitude_m=raw.altitude_valid?raw.altitude_m:__builtin_nan("");
+    s.hdop=raw.hdop;s.speed_kmh=raw.speed_valid?raw.speed_kmh:__builtin_nan("");
+    std::snprintf(s.utc_time,sizeof(s.utc_time),"%s",raw.utc_time);
     return s;
 }
 
 }  // namespace GpsService
 
 // ---------------------------------------------------------------------------
-// Device info stubs (replace Nt26Board AT+CGSN + SystemInfo MAC)
+// Device identity is obtained from the same modem used for cell location.
 // ---------------------------------------------------------------------------
 std::string GetDeviceImei() {
-    // Stub IMEI — openvela does not yet expose a 4G modem AT shim.
-    return "000000000000000";
+    char response[256] = {};
+    if (metalio_nt26_location_query("AT+CGSN", response, sizeof(response)) < 0) return {};
+    const char *p = response;
+    while (*p) {
+        if (*p < '0' || *p > '9') { ++p; continue; }
+        const char *start = p;
+        while (*p >= '0' && *p <= '9') ++p;
+        if (p - start == 15) return std::string(start, 15);
+    }
+    return {};
 }
 
 std::string CurrentUnixTimeStr() {
@@ -597,7 +589,7 @@ void RefreshGpsTabFromService() {
     lv_label_set_text(tab.value_labels[kRowLon], lon_buf);
 
     char alt_buf[24];
-    if (snap.fix_valid) {
+    if (snap.fix_valid && !GpsIsNan(snap.altitude_m)) {
         std::snprintf(alt_buf, sizeof(alt_buf), "%.1f m", snap.altitude_m);
     } else {
         std::snprintf(alt_buf, sizeof(alt_buf), "--");
@@ -623,7 +615,7 @@ void RefreshGpsTabFromService() {
     lv_label_set_text(tab.value_labels[kRowHdop], hdop_buf);
 
     char speed_buf[24];
-    if (snap.fix_valid) {
+    if (snap.fix_valid && !GpsIsNan(snap.speed_kmh)) {
         std::snprintf(speed_buf, sizeof(speed_buf), "%.1f km/h",
                       snap.speed_kmh);
     } else {
@@ -678,6 +670,9 @@ struct LocationReportResult {
     uint32_t    session = 0;
     LocMode     mode    = LocMode::kGps;
     bool        zoom_refresh_only = false;
+    MapViewParams view;
+    bool cached_coordinates = false;
+    double cached_latitude = 0, cached_longitude = 0, cached_accuracy = 0;
     bool        ok      = false;
     std::string address;
     double      latitude  = 0.0;
@@ -685,6 +680,7 @@ struct LocationReportResult {
     double      accuracy  = 0.0;
     void       *map_data = nullptr;
     size_t      map_size = 0;
+    int map_width = 0, map_height = 0;
     std::string err;
     std::string map_err;
 };
@@ -770,10 +766,8 @@ void SetMapStatus(const char *text, MapStatusStyle style) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP / static-map stub. The original streams an HTTP response body to PSRAM
-// and decodes it as PNG; the openvela port does not yet expose an HTTP client,
-// so we keep the BinaryDownloadOutcome shape and return failure. UI then
-// shows the "查询失败" / map-error path.
+// HTTP / static-map download. Keep downloaded bytes bounded, then hand their
+// ownership to the LVGL image wrapper on the LVGL thread.
 // ---------------------------------------------------------------------------
 struct BinaryDownloadOutcome {
     bool        ok   = false;
@@ -782,9 +776,60 @@ struct BinaryDownloadOutcome {
     std::string err;
 };
 
-BinaryDownloadOutcome DownloadBinary(void * /*http*/, const std::string & /*url*/) {
+BinaryDownloadOutcome DownloadBinary(Http *http, const std::string &url) {
     BinaryDownloadOutcome out;
-    out.err = I18n::T("HTTP 不可用");
+    if(http) http->SetDeadlineMs(35000);
+    if (http == nullptr || url.empty()) {
+        out.err = I18n::T("HTTP 不可用");
+        return out;
+    }
+
+    http->SetHeader("Accept", "image/png, image/*;q=0.9, */*;q=0.5");
+    http->SetHeader("Connection", "close");
+    http->SetHeader("User-Agent", "metalio-claw-4/1.0");
+    if (!http->Open("GET", url)) {
+        out.err = I18n::T("Open 失败");
+        return out;
+    }
+    const int status = http->GetStatusCode();
+    if (status != 200) {
+        char msg[32];
+        std::snprintf(msg, sizeof(msg), "HTTP %d", status);
+        out.err = msg;
+        http->Close();
+        return out;
+    }
+
+    constexpr size_t kReadChunk = 4096;
+    std::vector<uint8_t> bytes;
+    bytes.reserve(64 * 1024);
+    uint8_t chunk[kReadChunk];
+    bool failed = false;
+    while (true) {
+        const int n = http->Read(reinterpret_cast<char *>(chunk), sizeof(chunk));
+        if (n == 0) break;
+        if (n < 0 || bytes.size() + static_cast<size_t>(n) > kMapMaxBytes) {
+            failed = true;
+            break;
+        }
+        bytes.insert(bytes.end(), chunk, chunk + n);
+    }
+    http->Close();
+    if (failed || bytes.size() < 8 || bytes[0] != 0x89 || bytes[1] != 'P' ||
+        bytes[2] != 'N' || bytes[3] != 'G') {
+        out.err = failed ? I18n::T("地图读取失败") : I18n::T("服务器未返回 PNG");
+        return out;
+    }
+
+    void *data = std::malloc(bytes.size());
+    if (data == nullptr) {
+        out.err = I18n::T("内存不足");
+        return out;
+    }
+    std::memcpy(data, bytes.data(), bytes.size());
+    out.ok = true;
+    out.data = data;
+    out.size = bytes.size();
     return out;
 }
 
@@ -954,10 +999,22 @@ std::string ExtractDataAddressField(const std::string &resp_json,
     return TrimAscii(out);
 }
 
-std::string ReadHttpTextBody(void * /*http*/, size_t max_bytes = 256 * 1024) {
-    // Stub — no HTTP client. Always returns empty body.
-    (void)max_bytes;
-    return {};
+std::string ReadHttpTextBody(Http *http, size_t max_bytes = 256 * 1024) {
+    if (http == nullptr || http->GetBodyLength() > max_bytes) {
+        return {};
+    }
+    std::string body;
+    body.reserve(std::min<size_t>(http->GetBodyLength(), 4096));
+    char chunk[2048];
+    while (true) {
+        const int n = http->Read(chunk, sizeof(chunk));
+        if (n == 0) break;
+        if (n < 0 || body.size() + static_cast<size_t>(n) > max_bytes) {
+            return {};
+        }
+        body.append(chunk, static_cast<size_t>(n));
+    }
+    return body;
 }
 
 void SetAddressLabelText(LocMode mode, TabLocState &tab,
@@ -1029,7 +1086,7 @@ bool ParseLocationResponse(const std::string &resp, LocationReportResult *res,
     }
 
     const bool has_coords =
-        !GpsIsNan(res->latitude) && !GpsIsNan(res->longitude);
+        !GpsIsNan(res->latitude) && !GpsIsNan(res->longitude) && !GpsIsInf(res->latitude) && !GpsIsInf(res->longitude) && GpsFabs(res->latitude)<=90 && GpsFabs(res->longitude)<=180;
     const bool has_addr = !res->address.empty();
 
     if (!has_coords && !has_addr) {
@@ -1072,22 +1129,32 @@ void LogLocateHttpJson(LocMode mode, const std::string &req_json, int http_statu
              safe_resp.empty() ? "(empty)" : safe_resp.c_str());
 }
 
-bool DownloadMapForResult(void * /*network*/,
-                          const std::string &static_map_url,
-                          LocationReportResult *res) {
-    if (static_map_url.empty()) {
-        res->map_err = I18n::T("未返回 staticMapUrl");
-        return false;
+#include "gps_direct.inc"
+
+void ApplyMapImage(LocMode mode, void *data, size_t size,
+                   std::string &err_out, int width, int height) {
+    if (data == nullptr || size == 0) {
+        err_out = I18n::T("地图数据为空");
+        return;
     }
-    BinaryDownloadOutcome map_dl =
-        DownloadBinary(nullptr, static_map_url);
-    if (!map_dl.ok) {
-        res->map_err = map_dl.err.empty() ? I18n::T("地图下载失败") : map_dl.err;
-        return false;
+
+    auto image = width > 0 ? std::make_unique<LvglAllocatedImage>(data, size, width, height, width * 2, LV_COLOR_FORMAT_RGB565) : std::make_unique<LvglAllocatedImage>(data, size);
+    if (image->image_dsc() == nullptr || image->image_dsc()->data == nullptr) {
+        // The wrapper released invalid input data while probing the PNG.
+        err_out = I18n::T("地图 PNG 解码失败");
+        return;
     }
-    res->map_data = map_dl.data;
-    res->map_size = map_dl.size;
-    return true;
+
+    auto &tab = TabState(mode);
+    tab.map_image_holder = std::move(image);
+    tab.has_map = true;
+    UpdateMapEntryState(mode);
+    if (s_map_win.visible && s_active_tab == mode &&
+        s_map_win.map_image != nullptr) {
+        lv_image_set_src(s_map_win.map_image, tab.map_image_holder->image_dsc());
+        lv_obj_remove_flag(s_map_win.map_image, LV_OBJ_FLAG_HIDDEN);
+        SetMapStatus("", kMapStatusHidden);
+    }
 }
 
 // lv_async_call wraps a lambda/function pointer + arg and runs it on the
@@ -1174,9 +1241,13 @@ void OnLocationReportDone(void *user_data) {
     }
 
     if (res->map_data != nullptr && res->map_size > 0) {
-        // No real PNG decoder wired up yet — just free the buffer.
-        free(res->map_data);
+        std::string map_err;
+        ApplyMapImage(res->mode, res->map_data, res->map_size, map_err, res->map_width, res->map_height);
         res->map_data = nullptr;
+        if (!map_err.empty() && s_map_win.visible &&
+            s_active_tab == res->mode) {
+            SetMapStatus(map_err.c_str(), kMapStatusError);
+        }
     }
     if (!res->map_err.empty() && s_map_win.visible &&
         s_active_tab == res->mode) {
@@ -1186,6 +1257,20 @@ void OnLocationReportDone(void *user_data) {
         SetMapStatus("", kMapStatusHidden);
     }
 
+    delete res;
+}
+
+void PostLocationReportDone(LocationReportResult *res) {
+    if (res == nullptr) {
+        return;
+    }
+    if (lv_async_call(OnLocationReportDone, res) == LV_RESULT_OK) {
+        return;
+    }
+    /* Async queue allocation can fail under memory pressure. Keep ownership
+     * with the worker until LVGL accepts the result, and release its map
+     * payload here if posting fails. */
+    free(res->map_data);
     delete res;
 }
 
@@ -1273,6 +1358,7 @@ bool BuildWifiLocateBody(const std::string &at_resp, const MapViewParams &view,
                   return a.rssi > b.rssi;
               });
 
+    if (aps.size() > 32) aps.resize(32);
     std::string macs;
     for (const auto &ap : aps) {
         std::string mac = ap.mac;
@@ -1282,25 +1368,8 @@ bool BuildWifiLocateBody(const std::string &at_resp, const MapViewParams &view,
         macs += part;
     }
 
-    const WifiApEntry &main_ap = aps.front();
-    std::string main_mac = main_ap.mac;
-    ToLowerInPlace(main_mac);
-    char mmac[160];
-    std::snprintf(mmac, sizeof(mmac), "%s,%d,%s,0", main_mac.c_str(),
-                  main_ap.rssi,
-                  main_ap.ssid.empty() ? "" : main_ap.ssid.c_str());
-
-    const std::string device_id = SystemInfo::GetMacAddress();
-    const std::string imei      = GetDeviceImei();
-    const std::string ctime     = CurrentUnixTimeStr();
     char body[2048];
-    std::snprintf(body, sizeof(body),
-                  "{\"deviceId\":\"%s\",\"imei\":\"%s\",\"accesstype\":1,"
-                  "\"ctime\":\"%s\",\"macs\":\"%s\",\"mmac\":\"%s\","
-                  "\"coor\":\"GCJ02\",\"needRgc\":\"Y\",\"zoom\":%d,"
-                  "\"width\":%d,\"height\":%d}",
-                  device_id.c_str(), imei.c_str(), ctime.c_str(),
-                  macs.c_str(), mmac, view.zoom, view.width, view.height);
+    std::snprintf(body, sizeof(body), "{\"accesstype\":1,\"macs\":\"%s\"}", macs.c_str());
     body_out = body;
     return true;
 }
@@ -1349,17 +1418,8 @@ bool BuildCellLocateBody(const std::string &at_resp, const MapViewParams &view,
     std::snprintf(bts, sizeof(bts), "%s,%d,%lu,%lu,%d", mcc.c_str(), mnc_num,
                   lac_dec, ci_dec, rssi);
 
-    const std::string device_id = SystemInfo::GetMacAddress();
-    const std::string imei      = GetDeviceImei();
-    const std::string ctime     = CurrentUnixTimeStr();
-    char body[512];
-    std::snprintf(body, sizeof(body),
-                  "{\"deviceId\":\"%s\",\"imei\":\"%s\",\"accesstype\":0,"
-                  "\"ctime\":\"%s\",\"bts\":\"%s\",\"network\":\"LTE\","
-                  "\"cdma\":0,\"coor\":\"GCJ02\",\"needRgc\":\"Y\","
-                  "\"zoom\":%d,\"width\":%d,\"height\":%d}",
-                  device_id.c_str(), imei.c_str(), ctime.c_str(), bts,
-                  view.zoom, view.width, view.height);
+    char body[256];
+    std::snprintf(body, sizeof(body), "{\"accesstype\":0,\"bts\":\"%s\"}", bts);
     body_out = body;
     return true;
 }
@@ -1391,11 +1451,9 @@ bool TabHasCachedCoords(const TabLocState &tab) {
 
 std::string BuildStaticMapUrl(double lat_deg, double lon_deg,
                               const MapViewParams &view) {
-    char url[512];
-    std::snprintf(url, sizeof(url),
-                  "%s%s?latitude=%.6f&longitude=%.6f&coordtype=gcj02&width=%d&height=%d&zoom=%d",
-                  api::kHost, api::kGpsStaticMap, lat_deg, lon_deg, view.width,
-                  view.height, view.zoom);
+    char url[128];
+    std::snprintf(url, sizeof(url), "hios-map://%.7f/%.7f/%d/%d/%d",
+                  lat_deg, lon_deg, view.zoom, view.width, view.height);
     return url;
 }
 
@@ -1410,69 +1468,51 @@ bool BuildGpsLocateBody(double lon_deg, double lat_deg, int radius_m,
     std::snprintf(gps_field, sizeof(gps_field), "%.4f|%.4f|%d", lon_deg,
                   lat_deg, radius_m);
 
-    const std::string device_id = SystemInfo::GetMacAddress();
-    const std::string imei      = GetDeviceImei();
-    const std::string ctime     = CurrentUnixTimeStr();
-    char body[512];
-    std::snprintf(body, sizeof(body),
-                  "{\"deviceId\":\"%s\",\"imei\":\"%s\",\"accesstype\":2,"
-                  "\"ctime\":\"%s\",\"gps\":\"%s\",\"coor\":\"GCJ02\","
-                  "\"needRgc\":\"Y\",\"zoom\":%d,\"width\":%d,\"height\":%d}",
-                  device_id.c_str(), imei.c_str(), ctime.c_str(), gps_field,
-                  view.zoom, view.width, view.height);
+    char body[128];
+    std::snprintf(body, sizeof(body), "{\"accesstype\":2,\"gps\":\"%s\"}", gps_field);
     body_out = body;
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// SubmitLocationReport — stubbed. The original POSTs req_json to
-// /location/report/cell, parses the JSON, then downloads the static-map PNG.
-// openvela does not yet expose an HTTP client; we always go through the
-// failure path. UI shows "查询失败：HTTP 不可用" / "未返回定位数据".
+// Submit the GPS report using the port's BSD-socket HTTP client, parse the
+// response and fetch the returned static map before handing both to LVGL.
 // ---------------------------------------------------------------------------
 void SubmitLocationReport(LocationReportResult *res,
                           const std::string &req_json) {
-    // No HTTP client available — record the failure and ship the result
-    // back to the LVGL thread via lv_async_call. The original flow (HTTP
-    // POST → JSON parse → PNG download) is preserved below as comments for
-    // whoever wires up the real network stack.
-    (void)req_json;
-    res->err = I18n::T("HTTP 不可用");
-    LogLocateHttpJson(res->mode, req_json, 0, "(no http client)");
-    lv_async_call(OnLocationReportDone, res);
-    vTaskDelete(nullptr);
+    if (DirectLocate(req_json, res)) {
+        const auto view = res->view;
+        DownloadMapForResult(nullptr, BuildStaticMapUrl(res->latitude, res->longitude, view), res);
+    }
+    PostLocationReportDone(res);
 }
 
 void MapZoomRefreshTask(void *arg) {
     auto *res = static_cast<LocationReportResult *>(arg);
-    auto &tab = TabState(res->mode);
-    if (!TabHasCachedCoords(tab)) {
+    if (!res->cached_coordinates) {
         res->err = I18n::T("无缓存坐标");
-        lv_async_call(OnLocationReportDone, res);
-        vTaskDelete(nullptr);
+        PostLocationReportDone(res);
         return;
     }
 
-    const MapViewParams view = GetMapViewParams();
+    const MapViewParams view = res->view;
     const std::string map_url =
-        BuildStaticMapUrl(tab.result_lat, tab.result_lon, view);
-    ESP_LOGI(TAG, "locate[%s] map zoom GET (stub)", LocModeName(res->mode));
+        BuildStaticMapUrl(res->cached_latitude, res->cached_longitude, view);
+    ESP_LOGI(TAG, "locate[%s] map zoom GET", LocModeName(res->mode));
 
     if (!DownloadMapForResult(nullptr, map_url, res)) {
         if (res->err.empty()) {
             res->err = res->map_err.empty() ? I18n::T("地图下载失败") : res->map_err;
         }
-        lv_async_call(OnLocationReportDone, res);
-        vTaskDelete(nullptr);
+        PostLocationReportDone(res);
         return;
     }
 
     res->ok        = true;
-    res->latitude  = tab.result_lat;
-    res->longitude = tab.result_lon;
-    res->accuracy  = tab.result_acc;
-    lv_async_call(OnLocationReportDone, res);
-    vTaskDelete(nullptr);
+    res->latitude  = res->cached_latitude;
+    res->longitude = res->cached_longitude;
+    res->accuracy  = res->cached_accuracy;
+    PostLocationReportDone(res);
 }
 
 void GpsLocationReportTask(void *arg) {
@@ -1482,21 +1522,19 @@ void GpsLocationReportTask(void *arg) {
     const GpsService::Snapshot snap = GetEffectiveSnapshot();
     if (!snap.fix_valid) {
         res->err = I18n::T("尚未定位");
-        lv_async_call(OnLocationReportDone, res);
-        vTaskDelete(nullptr);
+        PostLocationReportDone(res);
         return;
     }
 
     std::string body;
     std::string build_err;
-    const MapViewParams view = GetMapViewParams();
+    const MapViewParams view = res->view;
     if (!BuildGpsLocateBody(snap.longitude_deg, snap.latitude_deg,
                             EstimateGpsRadiusM(snap), view, body, build_err)) {
         res->err = build_err.empty() ? I18n::T("组装请求失败") : build_err;
         ESP_LOGI(TAG, "locate[gps] request json=(build failed: %s)",
                  res->err.c_str());
-        lv_async_call(OnLocationReportDone, res);
-        vTaskDelete(nullptr);
+        PostLocationReportDone(res);
         return;
     }
 
@@ -1506,16 +1544,31 @@ void GpsLocationReportTask(void *arg) {
 void NetLocationReportTask(void *arg) {
     auto *res = static_cast<LocationReportResult *>(arg);
 
-    // Nt26Board 4G 模块未端口化 — 直接走失败路径。
-    auto &tab = TabState(res->mode);
-    const char *at_cmd =
-        (res->mode == LocMode::kWifi) ? "AT+ECWIFISCAN" : "AT+ECBCINFO";
-    ESP_LOGI(TAG, "AT %s (stub: no 4G modem)", at_cmd);
-
-    res->err = I18n::T("未检测到 4G 模块");
-    tab.cached_at_resp.clear();
-    lv_async_call(OnLocationReportDone, res);
-    vTaskDelete(nullptr);
+    const char *command = res->mode == LocMode::kWifi ? "AT+ECWIFISCAN" : "AT+ECBCINFO";
+    char response[4096] = {};
+    int err = metalio_nt26_location_query(command, response, sizeof(response));
+    std::string at_response(response);
+    if (err == 0 && res->mode == LocMode::kWifi && !AtRespHasWifiScan(at_response)) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        err = metalio_nt26_location_query(command, response, sizeof(response));
+        at_response = response;
+    }
+    if (err < 0) {
+        res->err = I18n::T("AT 指令失败");
+        PostLocationReportDone(res);
+        return;
+    }
+    std::string body, build_err;
+    const MapViewParams view = res->view;
+    const bool built = res->mode == LocMode::kWifi
+        ? BuildWifiLocateBody(at_response, view, body, build_err)
+        : BuildCellLocateBody(at_response, view, body, build_err);
+    if (!built || body.empty()) {
+        res->err = build_err.empty() ? I18n::T("组装请求失败") : build_err;
+        PostLocationReportDone(res);
+        return;
+    }
+    SubmitLocationReport(res, body);
 }
 
 void StartLocationReport(LocMode mode, bool zoom_refresh_only = false) {
@@ -1552,6 +1605,13 @@ void StartLocationReport(LocMode mode, bool zoom_refresh_only = false) {
     auto *res = new LocationReportResult{};
     res->mode = mode;
     res->zoom_refresh_only = zoom_refresh_only;
+    // Capture UI-owned state before dispatch. A network request may outlive
+    // this page or finish after another tab/window has replaced its state.
+    res->view = GetMapViewParams();
+    res->cached_coordinates = TabHasCachedCoords(tab);
+    res->cached_latitude = tab.result_lat;
+    res->cached_longitude = tab.result_lon;
+    res->cached_accuracy = tab.result_acc;
     res->session =
         s_location_session.fetch_add(1, std::memory_order_acq_rel) + 1;
 
@@ -1685,6 +1745,16 @@ void ShowMapWindow() {
     auto &tab = ActiveTabState();
     if (!tab.has_map) {
         return;
+    }
+    if (!lv_obj_get_user_data(s_map_win.map_image)) {
+        auto *credit = lv_label_create(lv_obj_get_parent(s_map_win.map_image));
+        lv_label_set_text(credit, "© OpenStreetMap contributors");
+        lv_obj_set_style_text_font(credit, &font_puhui_20_4, 0);
+        lv_obj_set_style_text_color(credit, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_bg_color(credit, lv_color_hex(0x18202A), 0);
+        lv_obj_set_style_bg_opa(credit, LV_OPA_COVER, 0);
+        lv_obj_align(credit, LV_ALIGN_BOTTOM_RIGHT, -4, -4);
+        lv_obj_set_user_data(s_map_win.map_image, credit);
     }
     s_map_win.visible = true;
     lv_obj_remove_flag(s_map_win.overlay, LV_OBJ_FLAG_HIDDEN);
@@ -1822,7 +1892,7 @@ void OnMockKeyboardEvent(lv_event_t *e) {
 void OnMockTaFocused(lv_event_t *e) {
     auto *ta = lv_event_get_target_obj(e);
     if (s_state.mock_dlg.keyboard != nullptr) {
-        lv_keyboard_set_textarea(s_state.mock_dlg.keyboard, ta);
+        HiInputMethod_SetTextArea(s_state.mock_dlg.keyboard, ta);
     }
     lv_obj_add_state(ta, LV_STATE_FOCUSED);
 }
@@ -1970,13 +2040,13 @@ void OpenMockDialog() {
              (kBtnW + kBtnGap) * 2);
 
     constexpr int32_t kKbH = kPanelSize - kCardH - 24 - 12;
-    lv_obj_t *kb = lv_keyboard_create(mask);
+    lv_obj_t *kb = HiInputMethod_Create(mask);
     s_state.mock_dlg.keyboard = kb;
     lv_obj_set_size(kb, kPanelSize, kKbH);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+
     StyleDarkKeyboard(kb);
-    lv_keyboard_set_textarea(kb, lat_ta);
+    HiInputMethod_SetTextArea(kb, lat_ta);
     lv_obj_add_event_cb(kb, OnMockKeyboardEvent, LV_EVENT_READY, nullptr);
     lv_obj_add_event_cb(kb, OnMockKeyboardEvent, LV_EVENT_CANCEL, nullptr);
 
@@ -2006,7 +2076,8 @@ void OnBackClicked(lv_event_t * /*e*/) { GoBackToHome(); }
 
 void OnSwipeBack() { GoBackToHome(); }
 
-void OnScreenUnloaded(lv_event_t * /*e*/) {
+void OnScreenUnloaded(lv_event_t *e) {
+    if (lv_event_get_target_obj(e) != s_state.screen) return;
     if (s_state.refresh_timer != nullptr) {
         lv_timer_delete(s_state.refresh_timer);
         s_state.refresh_timer = nullptr;

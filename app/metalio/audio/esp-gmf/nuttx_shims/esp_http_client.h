@@ -141,6 +141,16 @@ esp_err_t                 esp_http_client_set_redirection (esp_http_client_handl
 int                       esp_http_client_get_errno    (esp_http_client_handle_t client);
 int                       esp_http_client_get_socket   (esp_http_client_handle_t client);
 
+/* NuttX opt-in: a stream owner can cancel connect/TLS/read waits without
+ * closing or freeing a client from another thread. Unset clients retain
+ * their existing blocking behavior. The callback must not block. */
+esp_err_t esp_http_client_set_cancel_cb(esp_http_client_handle_t client,
+                                       bool (*cancelled)(void *), void *ctx);
+
+/* Optional per-client TCP MSS, set before connect. Zero retains the socket
+ * default. Radio alone opts in for the UART-backed cellular transport. */
+esp_err_t esp_http_client_set_transport_mss(esp_http_client_handle_t client, int bytes);
+
 /* Returns bytes read / written, or 0 for EOF, or -1 for error. */
 int                       esp_http_client_read         (esp_http_client_handle_t client, char *buf, int len);
 int                       esp_http_client_write        (esp_http_client_handle_t client, const char *buf, int len);

@@ -11,8 +11,7 @@
  *   mode 2: AT+TX=1 / AT+MODE=2  (pair / scan)
  *   mode 3: AT+RX=1 / AT+MODE=3  (music receive)
  *
- * The original talks to the BT chip over SimpleUart; openvela does not
- * yet expose that UART helper, so the AT commands are stubbed (TODO).
+ * Uses the board UART observer and acknowledged SCO profile commands.
  */
 
 #pragma once
@@ -37,4 +36,16 @@ public:
     // Send AT+RX=2 / AT+MODE=1 at boot to default the BT module to
     // receive mode. Safe to call before LVGL is up.
     static void ApplyDefaultMode();
+    static bool IsVoiceModeForeground();
+    static bool IsHeadsetConnected();
+    static void BeginPhoneAudio();
+    static void EndPhoneAudio();
+    // Worker-only switch; route: 0 pending, 1 speaker, 2 confirmed headset.
+    static int SelectPhoneOutput(bool headset);
+    static int PhoneAudioRoute();
+    static void CancelPhoneOutputRequest();
+    static void InitAudioObserver();
+    static int PrepareVoiceRoute();
+    static int PreparePlaybackRoute();
+    static bool IsHeadsetCaptureReady();
 };

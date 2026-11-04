@@ -8,15 +8,8 @@
  * Adaptations for openvela/NuttX:
  *   - ESP-IDF headers (esp_log / esp_event / esp_netif / esp_wifi /
  *     freertos) → NuttX shims (esp_log_shim.h / freertos_shim.h).
- *   - esp_wifi_* / SsidManager / WifiStation / DualNetworkBoard /
- *     Nt26Board are not exposed on openvela. They are hidden behind a
- *     NetworkScreenBackend interface with a default
- *     StubNetworkScreenBackend that returns empty scan results and
- *     fails connect / clear / switch operations. The full UI flow
- *     (scan button, list rebuild, password popup, connecting spinner,
- *     success / failure cards, network-switch + SIM-switch reboot
- *     countdown) is preserved verbatim and exercises end-to-end
- *     against the stub.
+ *   - Wi-Fi, data-path and SIM operations use the real ESP-Hosted/NT26
+ *     board drivers through NetworkService on background workers.
  *   - wifi_auth_mode_t / wifi_ap_record_t / WIFI_REASON_* constants
  *     are mirrored as local enums / structs so the rest of the code
  *     reads identically to the reference.
@@ -52,11 +45,16 @@
 #include "esp_err_shim.h"
 #include "freertos_shim.h"
 #include "home_screen/home_screen.h"
+#include "hi_input_method.h"
 
 #include "application.h"
 #include "settings.h"
+#include "network_service.h"
+extern "C" int metalio_app_select_sim(int slot);
 
 #include <algorithm>
+#include <atomic>
+#include <new>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -149,16 +147,8 @@ constexpr int kSimSlotInternal = 1;
 // ---------------------------------------------------------------------------
 // Backend interface
 //
-// 把所有硬件 / 系统依赖集中到这一个接口里，方便后续 openvela 把真实
-// 的 wifi / ssid_manager / dual_network_board / nt26_board 接进来时
-// 只换一份实现。默认 StubNetworkScreenBackend 行为：
-//   - 扫描立即返回空列表（"未发现网络"）
-//   - 连接永远失败（"network stack not yet wired"）
-//   - 已保存网络列表为空
-//   - 网络类型默认 WiFi、SIM 槽位默认外置
-//   - SwitchNetworkType / SwitchSimSlot 立即返回 false
-// UI 流程因此能完整跑通：扫描 -> 空列表 -> 输密码 -> 连接失败弹窗 ->
-// 关闭回到密码键盘。当真实 backend 落地后，所有路径自动生效。
+// Hardware operations are isolated from LVGL and dispatched to workers.
+// The fallback below is used only when ESP-Hosted is disabled in Kconfig.
 // ---------------------------------------------------------------------------
 struct ApItem {
     std::string ssid;
@@ -175,6 +165,17 @@ struct ConnectResult {
     bool ok = false;
     std::string err;  // 失败原因（"密码错误" / "未找到该 WiFi" / ...）
 };
+
+const char *CellularFailureText(int error) {
+    if (error == -EACCES) return I18n::T("SIM 卡已锁定，需要 PIN / PUK 解锁");
+    if (error == -EPERM) return I18n::T("请先关闭飞行模式");
+    if (error == -ENODEV) return I18n::T("未检测到可用的 SIM 卡");
+    if (error == -EBUSY) return I18n::T("正在通话，请结束后重试");
+    if (error == -ESTALE) return I18n::T("SIM 卡已切换，请重新打开");
+    if (error == -ETIMEDOUT) return I18n::T("4G 连接超时，请检查信号和 APN");
+    if (error == -EADDRNOTAVAIL) return I18n::T("4G 获取 IP 失败，请检查 APN");
+    return I18n::T("4G 连接失败，请检查 SIM 卡、信号和套餐");
+}
 
 class NetworkScreenBackend {
 public:
@@ -204,6 +205,7 @@ public:
     // 切换 SIM 槽位（AT+CFUN=0 / AT+ECSIMCFG=SimSlot,X / AT+CFUN=1）。
     // 返回 false 表示当前不在 4G 模式 / 没检测到 4G 模组。
     virtual bool SwitchSimSlot(int target_slot) = 0;
+    virtual int LastSwitchError() const { return 0; }
 };
 
 class StubNetworkScreenBackend : public NetworkScreenBackend {
@@ -231,16 +233,16 @@ public:
 
     int GetNetworkType() override { return kNetTypeWifi; }
     bool SwitchNetworkType(int /*target_type*/) override { return false; }
-
     int GetSimSlot() override { return kSimSlotExternal; }
     bool SwitchSimSlot(int /*target_slot*/) override { return false; }
 };
 
 // 真实 backend：接 P4 SDIO Host + esp-hosted RPC，调用板级 metalio_esp_hosted_*
-// 完成扫描 / 连接 / 状态反馈。已保存列表 / 网络切换 / SIM 切换在当前单 WiFi
-// 板子上仍为 no-op，保持与 stub 一致。
+// 完成扫描、连接、已保存网络、双网络及 NT26 SIM 切换。
 class EspHostedNetworkScreenBackend : public NetworkScreenBackend {
+    std::atomic<int> last_error_{0};
 public:
+    int LastSwitchError() const override { return last_error_.load(); }
     bool Scan(std::vector<ApItem> &out, std::string &err) override {
         out.clear();
 
@@ -250,17 +252,29 @@ public:
             return false;
         }
 
-        ret = metalio_esp_hosted_start_wifi();
+        ret = metalio_esp_hosted_ensure_wifi_ready();
         if (ret < 0) {
-            err = "WiFi 未就绪：请插入 microSD 后重试扫描";
+            /* C5 lives on SDIO slot 1. A missing microSD is not the
+             * failure. Bounce the link once and try again. */
+            usleep(200 * 1000);
+            (void)metalio_esp_hosted_initialize();
+            ret = metalio_esp_hosted_ensure_wifi_ready();
+        }
+        if (ret < 0) {
+            err = "WiFi 正在启动，请再点一次扫描";
             return false;
         }
 
         struct metalio_wifi_ap_s aps[METALIO_WIFI_MAX_AP];
         int n = metalio_esp_hosted_scan(aps, METALIO_WIFI_MAX_AP);
+        if (n == -ENETDOWN) {
+            usleep(200 * 1000);
+            (void)metalio_esp_hosted_initialize();
+            n = metalio_esp_hosted_scan(aps, METALIO_WIFI_MAX_AP);
+        }
         if (n < 0) {
             if (n == -ENETDOWN) {
-                err = "WiFi 链路未就绪：请确认已插入 microSD";
+                err = "WiFi 链路未就绪，请再点一次扫描";
             } else if (n == -ETIMEDOUT) {
                 err = "扫描超时：请稍后重试";
             } else {
@@ -282,74 +296,15 @@ public:
     ConnectResult Connect(const std::string &ssid,
                           const std::string &password) override {
         ConnectResult r;
-        write(1, "BK0\n", 4);
-
-        int ret = metalio_esp_hosted_initialize();
-        if (ret < 0) {
-            r.ok = false;
-            r.err = "WiFi 驱动初始化失败";
-            return r;
-        }
-
-        const char *pass = password.empty() ? nullptr : password.c_str();
-        write(1, "BK1\n", 4);
-        ret = metalio_esp_hosted_connect(ssid.c_str(), pass);
-        write(1, "BK2\n", 4);
-        if (ret < 0) {
-            r.ok = false;
-            r.err = "连接请求失败";
-            return r;
-        }
-
-        // 轮询 STA 关联，最长 15 秒
-        bool associated = false;
-        for (int i = 0; i < 300; i++) {
-            if (metalio_esp_hosted_is_connected()) {
-                associated = true;
-                break;
-            }
-            usleep(50 * 1000);
-        }
-        if (!associated) {
-            r.ok = false;
-            r.err = "连接超时或密码错误";
-            return r;
-        }
-
-        /* Claw4 waits for IP; on NuttX the host runs DHCP on eth0. Without
-         * this step the radio is up but xiaozhi.me MQTT/DNS cannot work. */
-        if (netlib_ifup("eth0") < 0) {
-            r.ok = false;
-            r.err = "网卡启动失败";
-            return r;
-        }
-
-        int dhcp_ret = netlib_obtain_ipv4addr("eth0");
-        if (dhcp_ret < 0) {
-            r.ok = false;
+        NetworkService network;
+        const int ret = network.StartWifi(ssid.c_str(), password.empty() ? nullptr : password.c_str());
+        r.ok = ret == 0;
+        if (ret == -ETIMEDOUT || ret == -ENOTCONN)
+            r.err = "连接超时，请检查网络名称、密码和信号";
+        else if (ret == -EADDRNOTAVAIL)
             r.err = "获取 IP 失败，请检查路由器";
-            return r;
-        }
-
-        {
-            struct in_addr gw;
-            memset(&gw, 0, sizeof(gw));
-            if (netlib_get_dripv4addr("eth0", &gw) == 0 && gw.s_addr != 0) {
-                struct sockaddr_in fb;
-                memset(&fb, 0, sizeof(fb));
-                fb.sin_family = AF_INET;
-                fb.sin_addr = gw;
-                dns_add_nameserver((const struct sockaddr *)&fb, sizeof(fb));
-            }
-
-            struct sockaddr_in pub;
-            memset(&pub, 0, sizeof(pub));
-            pub.sin_family = AF_INET;
-            inet_pton(AF_INET, "223.5.5.5", &pub.sin_addr);
-            dns_add_nameserver((const struct sockaddr *)&pub, sizeof(pub));
-        }
-
-        r.ok = true;
+        else if (ret < 0)
+            r.err = "WiFi 连接失败，请稍后重试";
         return r;
     }
 
@@ -384,11 +339,59 @@ public:
         wifi.EraseKey("password");
     }
 
-    int GetNetworkType() override { return kNetTypeWifi; }
-    bool SwitchNetworkType(int /*target_type*/) override { return false; }
+    int GetNetworkType() override {
+        int active = metalio_dual_network_path();
+        if (active == 0 || active == 1) return active;
+        Settings network("network", false);
+        return network.GetInt("type", kNetTypeWifi);
+    }
 
-    int GetSimSlot() override { return kSimSlotExternal; }
-    bool SwitchSimSlot(int /*target_slot*/) override { return false; }
+    bool SwitchNetworkType(int target_type) override {
+        if (target_type != kNetTypeWifi && target_type != kNetTypeCellular)
+            return false;
+#ifndef CONFIG_METALIO_NT26_4G
+        if (target_type == kNetTypeCellular) return false;
+#endif
+        const int result = metalio_dual_network_select(target_type == kNetTypeCellular);
+        last_error_.store(result);
+        if (result < 0)
+            return false;
+        Settings network("network", true);
+        const char *keys[] = {"type", "cellular", "wifi_enabled", "airplane"};
+        const int32_t values[] = {target_type, target_type == kNetTypeCellular,
+                                 target_type == kNetTypeWifi, 0};
+        if(!network.SetInts(keys, values, 4))
+            ESP_LOGW(TAG,"Data path is connected; network preference save remains pending");
+        return true; // A storage retry is not a failed cellular connection.
+    }
+
+    int GetSimSlot() override {
+        const int actual = metalio_nt26_get_sim_slot();
+        if (actual == kSimSlotExternal || actual == kSimSlotInternal)
+            return actual;
+        return -1; // A saved preference is not a confirmed modem slot.
+    }
+
+    bool SwitchSimSlot(int target_slot) override {
+#ifdef CONFIG_METALIO_NT26_4G
+        if (target_slot != kSimSlotExternal && target_slot != kSimSlotInternal)
+            return false;
+        // A locked/absent current card must not prevent selecting the other
+        // slot while WiFi remains the active or restored data path.
+        const int result = metalio_app_select_sim(target_slot);
+        last_error_.store(result);
+        if (result < 0) return false;
+        Settings network("network", true);
+        const char *keys[] = {"sim_slot", "type", "cellular", "wifi_enabled", "airplane"};
+        const int32_t values[] = {target_slot, kNetTypeCellular, 1, 0, 0};
+        if(!network.SetInts(keys, values, 5))
+            ESP_LOGW(TAG,"SIM data path is connected; preference save remains pending");
+        return true;
+#else
+        (void)target_slot;
+        return false;
+#endif
+    }
 };
 
 NetworkScreenBackend *g_network_backend = nullptr;
@@ -422,6 +425,8 @@ struct UiState {
     lv_obj_t *sim_tab       = nullptr;
     lv_obj_t *nearby_list   = nullptr;
     lv_obj_t *nearby_spinner = nullptr;
+    lv_obj_t *nearby_search = nullptr;
+    lv_obj_t *nearby_keyboard = nullptr;
     lv_obj_t *saved_list    = nullptr;
     lv_obj_t *clear_btn     = nullptr;
     lv_obj_t *network_wifi_btn    = nullptr;
@@ -434,6 +439,15 @@ struct UiState {
     lv_obj_t *sim_internal_btn    = nullptr;
     lv_obj_t *sim_internal_lbl    = nullptr;
     lv_obj_t *sim_current_lbl     = nullptr;
+    lv_obj_t *apn_overlay = nullptr;
+    lv_obj_t *apn_fields[3] = {};
+    lv_obj_t *apn_auth = nullptr;
+    lv_obj_t *apn_keyboard = nullptr;
+    lv_obj_t *pin_overlay = nullptr;
+    lv_obj_t *pin_field = nullptr;
+    lv_obj_t *pin_keyboard = nullptr;
+    lv_obj_t *pin_hint = nullptr;
+    int pin_slot = -1;
     lv_obj_t *pwd_overlay   = nullptr;
     lv_obj_t *pwd_textarea  = nullptr;
     lv_obj_t *pwd_keyboard  = nullptr;
@@ -444,11 +458,19 @@ struct UiState {
 };
 
 UiState s_ui;
+metalio_sim_profile_s s_edit_profile{};
+int s_locked_slot = -1;
 
 std::vector<ApItem>  s_scan_results;
+std::string          s_nearby_filter;
 bool                 s_screen_active = false;
+unsigned             s_screen_session = 0;
+std::atomic<bool>    s_scan_worker_busy{false};
+std::atomic<bool>    s_connect_worker_busy{false};
+std::atomic<bool>    s_switch_worker_busy{false};
 bool                 s_scan_in_progress = false;
 bool                 s_connect_in_progress = false;
+bool                 s_auto_scan_on_next_load = false;
 std::string          s_pending_ssid;
 WifiAuthMode         s_pending_authmode = WIFI_AUTH_OPEN;
 
@@ -507,6 +529,7 @@ bool IsCellularMode() {
 }
 
 const char *SimSlotName(int slot) {
+    if (slot != kSimSlotInternal && slot != kSimSlotExternal) return I18n::T("未知");
     return (slot == kSimSlotInternal) ? I18n::T("内置卡") : I18n::T("外置卡");
 }
 
@@ -522,11 +545,12 @@ inline lv_style_selector_t Sel(lv_part_t part, lv_state_t state) {
 struct AsyncStatusMsg {
     char text[160];
     uint32_t color;
+    unsigned session;
 };
 
 void async_update_status(void *user_data) {
     auto *msg = static_cast<AsyncStatusMsg *>(user_data);
-    if (screen_alive() && s_ui.status_label != nullptr) {
+    if (msg->session == s_screen_session && screen_alive() && s_ui.status_label != nullptr) {
         lv_label_set_text(s_ui.status_label, msg->text);
         lv_obj_set_style_text_color(s_ui.status_label, lv_color_hex(msg->color), LV_PART_MAIN);
     }
@@ -538,7 +562,8 @@ void post_status(const char *text, uint32_t color) {
     auto *msg = new AsyncStatusMsg{};
     snprintf(msg->text, sizeof(msg->text), "%s", text);
     msg->color = color;
-    lv_async_call(async_update_status, msg);
+    msg->session = s_screen_session;
+    if (lv_async_call(async_update_status, msg) != LV_RESULT_OK) delete msg;
 }
 
 void async_rebuild_nearby(void * /*user_data*/) {
@@ -561,6 +586,29 @@ void refresh_nearby_list() {
 void refresh_saved_list() {
     if (!s_screen_active) return;
     lv_async_call(async_rebuild_saved, nullptr);
+}
+
+bool ContainsSearchText(const std::string &value, const std::string &query) {
+    if (query.empty()) return true;
+    if (value.find(query) != std::string::npos) return true;
+    std::string folded_value(value), folded_query(query);
+    std::transform(folded_value.begin(), folded_value.end(), folded_value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(folded_query.begin(), folded_query.end(), folded_query.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return folded_value.find(folded_query) != std::string::npos;
+}
+
+void on_nearby_search_changed(lv_event_t *e) {
+    auto *ta = lv_event_get_target_obj(e);
+    s_nearby_filter = lv_textarea_get_text(ta) ? lv_textarea_get_text(ta) : "";
+    rebuild_nearby_list_now();
+}
+
+void on_nearby_search_focused(lv_event_t *e) {
+    if (s_ui.nearby_keyboard != nullptr)
+        HiInputMethod_SetTextArea(s_ui.nearby_keyboard,
+                                  lv_event_get_target_obj(e), true);
 }
 
 void async_set_scan_btn_enabled(void *user_data) {
@@ -632,6 +680,24 @@ void post_close_password_popup() {
     lv_async_call(async_close_password, nullptr);
 }
 
+void async_return_home(void * /*user_data*/) {
+    if (s_restart_timer != nullptr) {
+        lv_timer_delete(s_restart_timer);
+        s_restart_timer = nullptr;
+    }
+    s_restart_remaining = 0;
+    if (screen_alive()) {
+        close_status_popup();
+        close_password_popup();
+    }
+    HomeScreen::SwitchToHome();
+    HomeScreen::RefreshStatusBar();
+}
+
+void post_return_home() {
+    lv_async_call(async_return_home, nullptr);
+}
+
 struct AsyncFailureMsg {
     std::string title;
     std::string detail;
@@ -660,74 +726,67 @@ void post_show_failure(const std::string &title, const std::string &detail,
 // stub backend 的 Scan() 是同步的，但 task 结构保留——方便真实 backend
 // 落地后直接换实现而无需改 UI 层。
 // ---------------------------------------------------------------------------
-void scan_task(void * /*arg*/) {
-    s_scan_in_progress = true;
-    post_scan_btn_enabled(false);
-    post_nearby_spinner(true);
-    refresh_nearby_list();
-
-    post_status(I18n::T("正在扫描附近 WiFi…"), kColorScanning);
-
+struct ScanResultMsg {
+    unsigned session;
+    bool ok;
     std::vector<ApItem> results;
-    std::string err;
-    bool ok = GetBackend()->Scan(results, err);
-
-    if (!ok) {
-        post_status(err.c_str(), kColorError);
+    std::string error;
+};
+void async_scan_done(void *data) {
+    auto *msg = static_cast<ScanResultMsg *>(data);
+    if (msg->session == s_screen_session && screen_alive()) {
         s_scan_in_progress = false;
-        refresh_nearby_list();
-        post_nearby_spinner(false);
-        post_scan_btn_enabled(true);
-        vTaskDelete(nullptr);
-        return;
+        if (msg->ok) {
+            std::vector<int> order;
+            for (size_t i=0; i<msg->results.size(); ++i) order.push_back(i);
+            std::sort(order.begin(), order.end(), [msg](int a, int b) {
+                return msg->results[a].rssi > msg->results[b].rssi;
+            });
+            // Only the LVGL thread owns the vector used by list callbacks.
+            s_scan_results.clear();
+            for (int i : order) {
+                const auto &ap = msg->results[i];
+                if (ap.ssid.empty()) continue;
+                bool duplicate = false;
+                for (const auto &existing : s_scan_results)
+                    if (existing.ssid == ap.ssid) { duplicate = true; break; }
+                if (!duplicate) s_scan_results.push_back(ap);
+            }
+            char status[64];
+            snprintf(status, sizeof(status), I18n::T("扫描完成，共 %d 个网络"),
+                     static_cast<int>(s_scan_results.size()));
+            post_status(status, kColorSuccess);
+        } else post_status(msg->error.c_str(), kColorError);
+        rebuild_nearby_list_now();
+        async_set_nearby_spinner(nullptr);
+        async_set_scan_btn_enabled(reinterpret_cast<void *>(1));
     }
-
-    // 排序：RSSI 降序。只排序下标，避免对含 std::string 的元素做
-    // move/swap（uClibc++ 下 std::string move 已知会导致堆破坏）。
-    std::vector<int> order;
-    order.reserve(results.size());
-    for (size_t i = 0; i < results.size(); i++) order.push_back((int)i);
-    std::sort(order.begin(), order.end(), [&](int a, int b) {
-        return results[a].rssi > results[b].rssi;
-    });
-
-    // 去重（同名只保留信号最强的）。用 copy 而非 move，进一步规避
-    // std::string 移动语义问题。
-    s_scan_results.clear();
-    s_scan_results.reserve(results.size());
-    for (int idx : order) {
-        const ApItem &r = results[idx];
-        if (r.ssid.empty()) continue;
-        bool dup = false;
-        for (auto &existing : s_scan_results) {
-            if (existing.ssid == r.ssid) { dup = true; break; }
-        }
-        if (dup) continue;
-        s_scan_results.push_back(r);
+    msg->~ScanResultMsg(); free(msg);
+}
+void scan_task(void *data) {
+    auto *msg = static_cast<ScanResultMsg *>(data);
+    msg->ok = GetBackend()->Scan(msg->results, msg->error);
+    s_scan_worker_busy.store(false);
+    if (lv_async_call(async_scan_done, msg) != LV_RESULT_OK) {
+        msg->~ScanResultMsg(); free(msg);
     }
-
-    char status[64];
-    snprintf(status, sizeof(status), I18n::T("扫描完成，共 %d 个网络"),
-             static_cast<int>(s_scan_results.size()));
-    post_status(status, kColorSuccess);
-
-    s_scan_in_progress = false;
-    refresh_nearby_list();
-    post_nearby_spinner(false);
-    post_scan_btn_enabled(true);
     vTaskDelete(nullptr);
 }
-
 void schedule_scan() {
-    if (s_scan_in_progress) {
-        ESP_LOGW(TAG, "scan already in progress");
-        return;
-    }
-    if (s_connect_in_progress) {
-        post_status(I18n::T("正在连接，请稍后再扫描"), kColorScanning);
-        return;
-    }
-    if (xTaskCreate(scan_task, "wifi_scan", 8192, nullptr, 5, nullptr) != pdPASS) {
+    if (s_connect_worker_busy.load() || s_scan_worker_busy.exchange(true)) return;
+    void *mem = malloc(sizeof(ScanResultMsg));
+    if (!mem) { s_scan_worker_busy.store(false); return; }
+    auto *msg = new (mem) ScanResultMsg{};
+    msg->session = s_screen_session;
+    s_scan_in_progress = true;
+    async_set_scan_btn_enabled(nullptr);
+    async_set_nearby_spinner(reinterpret_cast<void *>(1));
+    post_status(I18n::T("正在扫描附近 WiFi…"), kColorScanning);
+    if (xTaskCreateLegacy(scan_task, "wifi_scan", 8192, msg, 5, nullptr) != pdPASS) {
+        msg->~ScanResultMsg(); free(msg);
+        s_scan_worker_busy.store(false); s_scan_in_progress = false;
+        async_set_scan_btn_enabled(reinterpret_cast<void *>(1));
+        async_set_nearby_spinner(nullptr);
         post_status(I18n::T("无法启动扫描任务"), kColorError);
     }
 }
@@ -738,52 +797,38 @@ void schedule_scan() {
 struct ConnectCtx {
     std::string ssid;
     std::string password;
+    unsigned session;
+    ConnectResult result;
 };
-
+void async_connect_done(void *data) {
+    auto *ctx = static_cast<ConnectCtx *>(data);
+    if (ctx->session == s_screen_session && screen_alive()) {
+        s_connect_in_progress = false;
+        if (ctx->result.ok) {
+            close_status_popup(); close_password_popup();
+            HomeScreen::SwitchToHome(); HomeScreen::RefreshStatusBar();
+        } else {
+            show_failure_in_status_popup(I18n::T("连接失败"), ctx->result.err, 2500);
+        }
+    }
+    delete ctx;
+}
 void connect_task(void *arg) {
     auto *ctx = static_cast<ConnectCtx *>(arg);
-    write(1, "CT0\n", 4);
-
-    char buf[128];
-    snprintf(buf, sizeof(buf), I18n::T("正在连接 %s …"), ctx->ssid.c_str());
-    write(1, "CT1\n", 4);
-    post_status(buf, kColorScanning);
-
-    write(1, "CT2\n", 4);
-    ConnectResult res = GetBackend()->Connect(ctx->ssid, ctx->password);
-    write(1, "CT3\n", 4);
-
-    if (res.ok) {
-        /* Persist for next boot (best-effort; Settings may be /tmp-backed). */
-        {
-            Settings wifi("wifi", true);
-            wifi.SetString("ssid", ctx->ssid);
-            wifi.SetString("password", ctx->password);
-        }
-        snprintf(buf, sizeof(buf), I18n::T("连接 %s 成功"), ctx->ssid.c_str());
-        post_status(buf, kColorSuccess);
-        refresh_saved_list();
-        post_close_password_popup();
-        /* Keep a modal up: OTA CheckVersion needs the new IP to mint the
-         * 6-digit xiaozhi.me code — closing immediately hid the result. */
-        post_open_activation_wait(ctx->ssid);
+    ctx->result = GetBackend()->Connect(ctx->ssid, ctx->password);
+    if (ctx->result.ok) {
+        Settings wifi("wifi", true);
+        wifi.SetString("ssid", ctx->ssid);
+        wifi.SetString("password", ctx->password);
         Application::GetInstance().OnWifiLinkReady();
-    } else {
-        std::string detail = res.err.empty() ? I18n::T("连接失败") : res.err;
-        snprintf(buf, sizeof(buf), I18n::T("连接 %s 失败：%s"),
-                 ctx->ssid.c_str(), detail.c_str());
-        post_status(buf, kColorError);
-        // 失败弹窗保留 2.5 秒让用户看清原因，然后自动收起回到密码键盘
-        post_show_failure(I18n::T("连接失败"), detail);
     }
-
-    s_connect_in_progress = false;
-    delete ctx;
+    s_connect_worker_busy.store(false);
+    if (lv_async_call(async_connect_done, ctx) != LV_RESULT_OK) delete ctx;
     vTaskDelete(nullptr);
 }
 
 void schedule_connect(const std::string &ssid, const std::string &password) {
-    if (s_connect_in_progress) {
+    if (s_connect_worker_busy.load() || s_scan_worker_busy.load()) {
         post_status(I18n::T("已有正在进行的连接任务"), kColorScanning);
         return;
     }
@@ -795,15 +840,17 @@ void schedule_connect(const std::string &ssid, const std::string &password) {
         post_status(I18n::T("密码超长"), kColorError);
         return;
     }
-    auto *ctx = new ConnectCtx{ssid, password};
+    auto *ctx = new ConnectCtx{ssid, password, s_screen_session, {}};
+    s_connect_worker_busy.store(true);
     write(1, "SC0\n", 4);
     s_connect_in_progress = true;
     // 立刻弹出转圈遮罩，覆盖密码键盘，让用户得到「我点了连接」的视觉反馈。
     open_connecting_popup(ssid);
     write(1, "SC1\n", 4);
-    if (xTaskCreate(connect_task, "wifi_connect", 8192, ctx, 5, nullptr) != pdPASS) {
+    if (xTaskCreateLegacy(connect_task, "wifi_connect", 8192, ctx, 5, nullptr) != pdPASS) {
         write(1, "SC2\n", 4);
         delete ctx;
+        s_connect_worker_busy.store(false);
         s_connect_in_progress = false;
         post_status(I18n::T("无法启动连接任务"), kColorError);
         close_status_popup();
@@ -841,12 +888,18 @@ void rebuild_nearby_list_now() {
         }
     }
 
-    if (s_scan_results.empty()) {
+    size_t visible_count = 0;
+    for (const auto &ap : s_scan_results)
+        if (ContainsSearchText(ap.ssid, s_nearby_filter)) ++visible_count;
+
+    if (visible_count == 0) {
         if (s_scan_in_progress) {
             return;
         }
         lv_obj_t *hint = lv_label_create(s_ui.nearby_list);
-        lv_label_set_text(hint, I18n::T("未发现网络，点右上「扫描」试试"));
+        lv_label_set_text(hint, s_nearby_filter.empty()
+            ? I18n::T("未发现网络，点右上「扫描」试试")
+            : I18n::T("没有匹配的 WiFi 网络"));
         lv_obj_set_style_text_color(hint, lv_color_hex(kColorSubtle), LV_PART_MAIN);
         lv_obj_set_style_text_font(hint, &font_puhui_20_4, LV_PART_MAIN);
         lv_obj_set_width(hint, LV_PCT(100));
@@ -855,6 +908,7 @@ void rebuild_nearby_list_now() {
     }
 
     for (auto &ap : s_scan_results) {
+        if (!ContainsSearchText(ap.ssid, s_nearby_filter)) continue;
         lv_obj_t *item = lv_button_create(s_ui.nearby_list);
         lv_obj_set_width(item, LV_PCT(100));
         lv_obj_set_height(item, 60);
@@ -862,8 +916,10 @@ void rebuild_nearby_list_now() {
         lv_obj_set_style_bg_color(item, lv_color_hex(kColorItem), LV_PART_MAIN);
         lv_obj_set_style_bg_color(item, lv_color_hex(kColorItemSel),
                                   Sel(LV_PART_MAIN, LV_STATE_PRESSED));
-        lv_obj_set_style_pad_hor(item, 14, LV_PART_MAIN);
-        lv_obj_set_style_shadow_width(item, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(item, 0, LV_PART_MAIN);
+    lv_obj_set_style_outline_width(item, 0, LV_PART_MAIN);
+    lv_obj_set_style_outline_opa(item, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(item, 0, LV_PART_MAIN);
 
         auto *ctx = new NearbyClickCtx{};
         snprintf(ctx->ssid, sizeof(ctx->ssid), "%s", ap.ssid.c_str());
@@ -958,6 +1014,8 @@ void rebuild_saved_list_now() {
         lv_obj_set_style_radius(row, 12, LV_PART_MAIN);
         lv_obj_set_style_bg_color(row, lv_color_hex(kColorItem), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
+        lv_obj_set_style_outline_width(row, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_hor(row, 14, LV_PART_MAIN);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -982,6 +1040,8 @@ void rebuild_saved_list_now() {
         lv_obj_align(def_btn, LV_ALIGN_RIGHT_MID, -120, 0);
         lv_obj_set_style_radius(def_btn, 12, LV_PART_MAIN);
         lv_obj_set_style_bg_color(def_btn, lv_color_hex(kColorBtnAccent), LV_PART_MAIN);
+        lv_obj_set_style_border_width(def_btn, 0, LV_PART_MAIN);
+        lv_obj_set_style_outline_width(def_btn, 0, LV_PART_MAIN);
         lv_obj_set_style_shadow_width(def_btn, 0, LV_PART_MAIN);
         auto *def_ctx = new SavedActionCtx{static_cast<int>(i)};
         lv_obj_add_event_cb(def_btn, on_saved_set_default, LV_EVENT_CLICKED, def_ctx);
@@ -999,6 +1059,8 @@ void rebuild_saved_list_now() {
         lv_obj_align(del_btn, LV_ALIGN_RIGHT_MID, 0, 0);
         lv_obj_set_style_radius(del_btn, 12, LV_PART_MAIN);
         lv_obj_set_style_bg_color(del_btn, lv_color_hex(kColorBtnDanger), LV_PART_MAIN);
+        lv_obj_set_style_border_width(del_btn, 0, LV_PART_MAIN);
+        lv_obj_set_style_outline_width(del_btn, 0, LV_PART_MAIN);
         lv_obj_set_style_shadow_width(del_btn, 0, LV_PART_MAIN);
         auto *del_ctx = new SavedActionCtx{static_cast<int>(i)};
         lv_obj_add_event_cb(del_btn, on_saved_remove, LV_EVENT_CLICKED, del_ctx);
@@ -1014,20 +1076,6 @@ void rebuild_saved_list_now() {
 // ---------------------------------------------------------------------------
 // 密码输入弹窗（模态遮罩 + 文本框 + 键盘）
 // ---------------------------------------------------------------------------
-void on_kb_event(lv_event_t *e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    lv_obj_t *kb = lv_event_get_target_obj(e);
-
-    if (code == LV_EVENT_CANCEL) {
-        close_password_popup();
-    } else if (code == LV_EVENT_READY) {
-        lv_obj_t *ta = lv_keyboard_get_textarea(kb);
-        const char *pwd = (ta != nullptr) ? lv_textarea_get_text(ta) : "";
-        // 开放网络若用户没输入密码也允许（password 留空）
-        schedule_connect(s_pending_ssid, pwd ? pwd : "");
-    }
-}
-
 void on_show_pwd_changed(lv_event_t *e) {
     lv_obj_t *chk = lv_event_get_target_obj(e);
     if (s_ui.pwd_textarea == nullptr) return;
@@ -1037,6 +1085,8 @@ void on_show_pwd_changed(lv_event_t *e) {
 
 void on_pwd_connect_btn(lv_event_t * /*e*/) {
     if (s_ui.pwd_textarea == nullptr) return;
+    if (s_ui.pwd_keyboard != nullptr &&
+        !HiInputMethod_Flush(s_ui.pwd_keyboard)) return;
     const char *pwd = lv_textarea_get_text(s_ui.pwd_textarea);
     schedule_connect(s_pending_ssid, pwd ? pwd : "");
 }
@@ -1094,7 +1144,7 @@ void open_password_popup(const std::string &ssid, WifiAuthMode authmode) {
     lv_obj_align_to(hint, title, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 12);
 
     // 密码输入框
-    lv_obj_t *ta = lv_textarea_create(card);
+    lv_obj_t *ta = lv_textarea_create(card);HiInputMethod_Bind(ta,false);
     s_ui.pwd_textarea = ta;
     lv_obj_set_size(ta, kPanelW - 60 - 40, 60);
     lv_obj_align(ta, LV_ALIGN_TOP_LEFT, 0, 92);
@@ -1148,15 +1198,17 @@ void open_password_popup(const std::string &ssid, WifiAuthMode authmode) {
     lv_obj_center(connect_lbl);
     screen_swipe_back_ignore(connect, true);
 
-    // 屏幕底部键盘（吃满底部 ~390px）
-    lv_obj_t *kb = lv_keyboard_create(mask);
+    // Reuse the same phone-style pinyin panel used by OpenClaw and weather.
+    lv_obj_t *kb = HiInputMethod_Create(mask);
+    if (kb == nullptr) return;
     s_ui.pwd_keyboard = kb;
-    lv_obj_set_size(kb, kPanelW, 390);
+    lv_obj_set_size(kb, kPanelW, 350);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_keyboard_set_textarea(kb, ta);
-    lv_obj_add_event_cb(kb, on_kb_event, LV_EVENT_READY, nullptr);
-    lv_obj_add_event_cb(kb, on_kb_event, LV_EVENT_CANCEL, nullptr);
+    HiInputMethod_SetTextArea(kb, ta, false);
+    lv_obj_add_event_cb(ta, [](lv_event_t *e) {
+        if (s_ui.pwd_keyboard != nullptr)
+            HiInputMethod_SetTextArea(s_ui.pwd_keyboard, lv_event_get_target_obj(e), false);
+    }, LV_EVENT_CLICKED, nullptr);
     screen_swipe_back_ignore(kb, true);
 }
 
@@ -1376,7 +1428,7 @@ void restart_timer_cb(lv_timer_t * /*timer*/) {
     if (s_ui.status_message_lbl != nullptr) {
         lv_label_set_text(s_ui.status_message_lbl, I18n::T("正在重启…"));
     }
-    xTaskCreate(reboot_task, "wifi_reboot", 2048, nullptr, 5, nullptr);
+    xTaskCreateLegacy(reboot_task, "wifi_reboot", 2048, nullptr, 5, nullptr);
 }
 
 // 失败提示自动关闭：复用 s_restart_timer 槽位，到期回调里只做收掉遮罩。
@@ -1520,6 +1572,7 @@ void on_swipe_back() {
 void on_back_clicked(lv_event_t * /*e*/) { on_swipe_back(); }
 
 void on_screen_unloaded(lv_event_t * /*e*/) {
+    ++s_screen_session;
     s_screen_active = false;
     s_ui.screen        = nullptr;
     s_ui.status_label  = nullptr;
@@ -1533,6 +1586,8 @@ void on_screen_unloaded(lv_event_t * /*e*/) {
     s_ui.sim_tab         = nullptr;
     s_ui.nearby_list     = nullptr;
     s_ui.nearby_spinner  = nullptr;
+    s_ui.nearby_search   = nullptr;
+    s_ui.nearby_keyboard = nullptr;
     s_ui.saved_list      = nullptr;
     s_ui.clear_btn       = nullptr;
     s_ui.network_wifi_btn    = nullptr;
@@ -1545,7 +1600,18 @@ void on_screen_unloaded(lv_event_t * /*e*/) {
     s_ui.sim_internal_btn = nullptr;
     s_ui.sim_internal_lbl = nullptr;
     s_ui.sim_current_lbl  = nullptr;
+    s_ui.apn_overlay = nullptr;
+    for (auto &field : s_ui.apn_fields) field = nullptr;
+    s_ui.apn_auth = nullptr;
+    s_ui.apn_keyboard = nullptr;
+    s_ui.pin_overlay = nullptr;
+    s_ui.pin_field = nullptr;
+    s_ui.pin_keyboard = nullptr;
+    s_ui.pin_hint = nullptr;
+    s_ui.pin_slot = -1;
+    s_locked_slot = -1;
     s_network_switch_pending = false;
+    s_sim_switch_pending = false;
     s_ui.pwd_overlay   = nullptr;
     s_ui.pwd_textarea  = nullptr;
     s_ui.pwd_keyboard  = nullptr;
@@ -1561,19 +1627,47 @@ void on_screen_unloaded(lv_event_t * /*e*/) {
     s_restart_headline.clear();
     s_pending_ssid.clear();
     s_scan_results.clear();
+    s_nearby_filter.clear();
 }
 
 // ---------------------------------------------------------------------------
 // 网络切换（WiFi <-> 4G）
 // ---------------------------------------------------------------------------
-void switch_network_task(void *arg) {
-    int target = static_cast<int>(reinterpret_cast<intptr_t>(arg));
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    bool ok = GetBackend()->SwitchNetworkType(target);
-    if (!ok) {
-        ESP_LOGE(TAG, "SwitchNetworkType failed, reboot anyway");
+struct NetworkSwitchJob {
+    int target;
+    unsigned session;
+    bool success;
+    int error;
+};
+void async_network_switch_done(void *data) {
+    auto *job = static_cast<NetworkSwitchJob *>(data);
+    if (job->session == s_screen_session && screen_alive()) {
+        if(!job->success && metalio_dual_network_path()==job->target && NetworkService::Available())
+            job->success=true;
+        s_network_switch_pending = false;
+        close_status_popup();
+        if (job->success) {
+            if (job->target == kNetTypeCellular) s_locked_slot = -1;
+            post_status(I18n::T("网络切换成功"), kColorBtnAccent);
+        } else {
+            if (job->target == kNetTypeCellular && job->error == -EACCES)
+                s_locked_slot = GetBackend()->GetSimSlot();
+            post_status(job->target == kNetTypeCellular ?
+                CellularFailureText(job->error) :
+                I18n::T("WiFi 连接失败，请检查已保存的网络"), kColorError);
+        }
+        refresh_network_switch_ui();
     }
-    Application::GetInstance().Reboot();
+    free(job);
+}
+void switch_network_task(void *arg) {
+    auto *job = static_cast<NetworkSwitchJob *>(arg);
+    job->success = GetBackend()->SwitchNetworkType(job->target);
+    job->error = GetBackend()->LastSwitchError();
+    lv_lock();
+    if (lv_async_call(async_network_switch_done, job) != LV_RESULT_OK) free(job);
+    lv_unlock();
+    s_switch_worker_busy.store(false);
     vTaskDelete(nullptr);
 }
 
@@ -1625,25 +1719,28 @@ void open_switch_reboot_popup(const char *target_name) {
 }
 
 void schedule_network_switch(int target_type) {
-    if (s_network_switch_pending) {
+    if (s_network_switch_pending || s_sim_switch_pending || s_switch_worker_busy.load()) {
         return;
     }
     if (target_type != kNetTypeWifi && target_type != kNetTypeCellular) {
         return;
     }
-    if (GetBackend()->GetNetworkType() == target_type) {
+    if (metalio_dual_network_path() == target_type && NetworkService::Available()) {
         return;
     }
 
+    if (s_switch_worker_busy.exchange(true)) return;
     s_network_switch_pending = true;
-    const char *target = target_type == kNetTypeCellular ? "4G" : "WiFi";
     post_status(target_type == kNetTypeCellular ? I18n::T("准备切换到 4G…")
                                                  : I18n::T("准备切换到 WiFi…"),
                 kColorScanning);
-    open_switch_reboot_popup(target);
-    if (xTaskCreate(switch_network_task, "net_switch", 4096,
-                    reinterpret_cast<void *>(static_cast<intptr_t>(target_type)), 5,
-                    nullptr) != pdPASS) {
+    refresh_network_switch_ui();
+    auto *job = static_cast<NetworkSwitchJob *>(calloc(1, sizeof(NetworkSwitchJob)));
+    if (job) { job->target = target_type; job->session = s_screen_session; }
+    if (!job || xTaskCreateLegacy(switch_network_task, "net_switch", 8192,
+                            job, 5, nullptr) != pdPASS) {
+        free(job);
+        s_switch_worker_busy.store(false);
         s_network_switch_pending = false;
         post_status(I18n::T("无法启动切换任务"), kColorError);
         close_status_popup();
@@ -1698,14 +1795,173 @@ void refresh_sim_slot_ui() {
                                                        : kColorBtn),
                               LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_ui.sim_internal_btn,
-                              lv_color_hex(is_external ? kColorBtn
-                                                       : kColorBtnActive),
+                              lv_color_hex(slot == kSimSlotInternal ? kColorBtnActive : kColorBtn),
                               LV_PART_MAIN);
 
     if (s_ui.sim_current_lbl != nullptr) {
         char buf[64];
         snprintf(buf, sizeof(buf), I18n::T("当前：%s"), SimSlotName(slot));
         lv_label_set_text(s_ui.sim_current_lbl, buf);
+    }
+}
+
+void close_apn_popup() {
+    if (s_ui.apn_overlay) lv_obj_delete(s_ui.apn_overlay);
+    s_ui.apn_overlay = nullptr;
+    for (auto &field : s_ui.apn_fields) field = nullptr;
+    s_ui.apn_keyboard = nullptr;
+    s_ui.apn_auth = nullptr;
+}
+
+struct ApnApplyCtx {
+    metalio_sim_profile_s profile;
+    unsigned session;
+    int result;
+};
+
+void apn_apply_task(void *arg) {
+    auto *ctx = static_cast<ApnApplyCtx *>(arg);
+    ctx->result = metalio_app_configure_sim_profile(&ctx->profile);
+    if (lv_async_call([](void *data) {
+        auto *result = static_cast<ApnApplyCtx *>(data);
+        if (result->session == s_screen_session && screen_alive()) {
+            s_sim_switch_pending = false;
+            post_status(result->result == 0 ? I18n::T("已连接") :
+                        CellularFailureText(result->result),
+                        result->result == 0 ? kColorBtnAccent : kColorError);
+            refresh_sim_slot_ui();
+        }
+        free(result);
+    }, ctx) != LV_RESULT_OK) free(ctx);
+    s_switch_worker_busy.store(false);
+    vTaskDelete(nullptr);
+}
+
+void on_apn_save(lv_event_t *) {
+    if (!s_ui.apn_overlay || !s_ui.apn_keyboard ||
+        !HiInputMethod_Flush(s_ui.apn_keyboard) ||
+        s_switch_worker_busy.exchange(true)) return;
+    auto *ctx = static_cast<ApnApplyCtx *>(calloc(1, sizeof(ApnApplyCtx)));
+    if (!ctx) { s_switch_worker_busy.store(false); return; }
+    ctx->profile = s_edit_profile;
+    snprintf(ctx->profile.apn, sizeof(ctx->profile.apn), "%s",
+             lv_textarea_get_text(s_ui.apn_fields[0]));
+    snprintf(ctx->profile.username, sizeof(ctx->profile.username), "%s",
+             lv_textarea_get_text(s_ui.apn_fields[1]));
+    snprintf(ctx->profile.password, sizeof(ctx->profile.password), "%s",
+             lv_textarea_get_text(s_ui.apn_fields[2]));
+    ctx->profile.auth = lv_dropdown_get_selected(s_ui.apn_auth);
+    ctx->session = s_screen_session;
+    close_apn_popup();
+    s_sim_switch_pending = true;
+    post_status(I18n::T("正在连接…"), kColorScanning);
+    if (xTaskCreateLegacy(apn_apply_task, "sim_apn", 8192, ctx, 5, nullptr) != pdPASS) {
+        free(ctx); s_sim_switch_pending = false; s_switch_worker_busy.store(false);
+        post_status(I18n::T("系统忙"), kColorError);
+    }
+}
+
+void show_apn_popup();
+
+void on_apn_clicked(lv_event_t *) {
+    if (!screen_alive() || s_switch_worker_busy.exchange(true)) return;
+    auto *ctx = static_cast<ApnApplyCtx *>(calloc(1, sizeof(ApnApplyCtx)));
+    if (!ctx) { s_switch_worker_busy.store(false); return; }
+    ctx->session = s_screen_session;
+    post_status(I18n::T("正在读取 SIM 卡…"), kColorScanning);
+    if (xTaskCreateLegacy([](void *arg) {
+        auto *ctx = static_cast<ApnApplyCtx *>(arg);
+        ctx->result = metalio_app_read_sim_profile(&ctx->profile);
+        if (lv_async_call([](void *data) {
+            auto *result = static_cast<ApnApplyCtx *>(data);
+            if (result->session == s_screen_session && screen_alive()) {
+                if (result->result == 0) {
+                    s_edit_profile = result->profile;
+                    post_status("", kColorSubtle);
+                    show_apn_popup();
+                } else post_status(CellularFailureText(result->result), kColorError);
+            }
+            free(result);
+        }, ctx) != LV_RESULT_OK) free(ctx);
+        s_switch_worker_busy.store(false);
+        vTaskDelete(nullptr);
+    }, "sim_read", 8192, ctx, 5, nullptr) != pdPASS) {
+        free(ctx); s_switch_worker_busy.store(false);
+        post_status(I18n::T("系统忙"), kColorError);
+    }
+}
+
+void show_apn_popup() {
+    close_apn_popup();
+    auto *mask = lv_obj_create(s_ui.screen);
+    s_ui.apn_overlay = mask;
+    screen_strip_obj_chrome(mask);
+    lv_obj_set_size(mask, kPanelW, kPanelH);
+    lv_obj_set_pos(mask, 0, 0);
+    lv_obj_set_style_bg_color(mask, lv_color_hex(kColorBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(mask, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_remove_flag(mask, LV_OBJ_FLAG_SCROLLABLE);
+    screen_swipe_back_ignore(mask, true);
+    auto *card = lv_obj_create(mask);
+    screen_strip_obj_chrome(card);
+    lv_obj_set_pos(card, 20, 10);
+    lv_obj_set_size(card, kPanelW-40, 330);
+    lv_obj_set_style_pad_all(card, 12, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(card, lv_color_hex(kColorCard), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    auto *title = lv_label_create(card);
+    lv_label_set_text(title, I18n::T("APN 设置（留空为自动）"));
+    lv_obj_set_style_text_font(title, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_hex(kColorText), LV_PART_MAIN);
+    const char *hints[] = {"APN", I18n::T("用户名"), I18n::T("密码")};
+    const char *values[] = {s_edit_profile.apn, s_edit_profile.username, s_edit_profile.password};
+    for (int i = 0; i < 3; ++i) {
+        auto *field = lv_textarea_create(card);HiInputMethod_Bind(field,false);
+        s_ui.apn_fields[i] = field;
+        lv_obj_set_pos(field, 0, 34+i*48);
+        lv_obj_set_size(field, kPanelW-64, 44);
+        lv_textarea_set_one_line(field, true);
+        lv_textarea_set_max_length(field, i == 0 ? METALIO_APN_MAX-1 : METALIO_APN_USER_MAX-1);
+        lv_textarea_set_placeholder_text(field, hints[i]);
+        lv_textarea_set_password_mode(field, i == 2);
+        lv_textarea_set_text(field, values[i]);
+        lv_obj_set_style_text_font(field, &font_puhui_20_4, LV_PART_MAIN);
+        lv_obj_add_event_cb(field, [](lv_event_t *e) {
+            if (s_ui.apn_keyboard)
+                HiInputMethod_SetTextArea(s_ui.apn_keyboard, lv_event_get_target_obj(e), false);
+        }, LV_EVENT_CLICKED, nullptr);
+        screen_swipe_back_ignore(field, true);
+    }
+    auto *auth = lv_dropdown_create(card);
+    s_ui.apn_auth = auth;
+    lv_obj_set_pos(auth, 0, 180); lv_obj_set_size(auth, kPanelW-64, 44);
+    lv_dropdown_set_options(auth, "No authentication\nPAP\nCHAP\nPAP / CHAP");
+    lv_dropdown_set_selected(auth, s_edit_profile.auth);
+    lv_obj_set_style_text_font(auth, &font_puhui_20_4, LV_PART_MAIN);
+    screen_swipe_back_ignore(auth, true);
+    const char *buttons[] = {I18n::T("取消"), I18n::T("自动"), I18n::T("保存并连接")};
+    for (int i = 0; i < 3; ++i) {
+        auto *btn = lv_button_create(card);
+        lv_obj_set_pos(btn, i*216, 244); lv_obj_set_size(btn, 202, 50);
+        auto *label = lv_label_create(btn);
+        lv_label_set_text(label, buttons[i]);
+        lv_obj_set_style_text_font(label, &font_puhui_20_4, LV_PART_MAIN);
+        lv_obj_center(label); screen_swipe_back_ignore(btn, true);
+        if (i == 0) lv_obj_add_event_cb(btn, [](lv_event_t *) { close_apn_popup(); }, LV_EVENT_CLICKED, nullptr);
+        else if (i == 1) lv_obj_add_event_cb(btn, [](lv_event_t *) {
+            if (s_ui.apn_keyboard) (void)HiInputMethod_Flush(s_ui.apn_keyboard);
+            for (auto *field : s_ui.apn_fields) if (field) lv_textarea_set_text(field, "");
+            if (s_ui.apn_auth) lv_dropdown_set_selected(s_ui.apn_auth, 0);
+        }, LV_EVENT_CLICKED, nullptr);
+        else lv_obj_add_event_cb(btn, on_apn_save, LV_EVENT_CLICKED, nullptr);
+    }
+    s_ui.apn_keyboard = HiInputMethod_Create(mask);
+    if (s_ui.apn_keyboard) {
+        lv_obj_set_size(s_ui.apn_keyboard, kPanelW, 350);
+        lv_obj_align(s_ui.apn_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+        HiInputMethod_SetTextArea(s_ui.apn_keyboard, s_ui.apn_fields[0], false);
+        screen_swipe_back_ignore(s_ui.apn_keyboard, true);
     }
 }
 
@@ -1761,66 +2017,68 @@ void open_sim_switching_popup(int target_slot) {
 
 struct SimSwitchCtx {
     int target_slot;
+    unsigned session;
+    bool success;
+    const char *detail;
+    int error;
 };
-
-struct SimSwitchResultMsg {
-    bool        success;
-    int         target_slot;
-    std::string detail;
-};
+using SimSwitchResultMsg = SimSwitchCtx;
 
 void async_sim_switch_done(void *user_data) {
     auto *msg = static_cast<SimSwitchResultMsg *>(user_data);
-    if (screen_alive()) {
+    if (msg->session == s_screen_session && screen_alive()) {
         s_sim_switch_pending = false;
         if (msg->success) {
+            s_locked_slot = -1;
             char buf[96];
             snprintf(buf, sizeof(buf), I18n::T("已切换到%s"),
                      SimSlotName(msg->target_slot));
-            open_restart_countdown_popup(buf);
-            refresh_sim_slot_ui();
+            close_status_popup();
+            post_status(buf, kColorBtnAccent);
+            refresh_sim_slot_ui(); refresh_network_switch_ui();
         } else {
             close_status_popup();
-            post_status(msg->detail.c_str(), kColorError);
-            show_failure_in_status_popup(I18n::T("SIM 卡切换失败"), msg->detail, 3000);
-            refresh_sim_slot_ui();
+            if (msg->error == -EACCES) s_locked_slot = msg->target_slot;
+            post_status(msg->detail, kColorError);
+
+            refresh_sim_slot_ui(); refresh_network_switch_ui();
         }
-    } else {
-        s_sim_switch_pending = false;
     }
-    delete msg;
+    free(msg);
 }
 
 void sim_switch_task(void *arg) {
     auto *ctx = static_cast<SimSwitchCtx *>(arg);
-    auto *result = new SimSwitchResultMsg{};
-    result->target_slot = ctx->target_slot;
+    auto *result = ctx;
     result->success = GetBackend()->SwitchSimSlot(ctx->target_slot);
+    result->error = GetBackend()->LastSwitchError();
     if (!result->success) {
-        result->detail = I18n::T("当前不在 4G 模式 / 未检测到 4G 模块");
+        result->detail = CellularFailureText(result->error);
     }
-    lv_async_call(async_sim_switch_done, result);
-    delete ctx;
+    lv_lock();
+    if (lv_async_call(async_sim_switch_done, result) != LV_RESULT_OK) free(result);
+    lv_unlock();
+    s_switch_worker_busy.store(false);
     vTaskDelete(nullptr);
 }
 
 void schedule_sim_switch(int target_slot) {
-    if (s_sim_switch_pending) {
+    if (s_sim_switch_pending || s_network_switch_pending || s_switch_worker_busy.load()) {
         return;
     }
     if (target_slot != kSimSlotExternal && target_slot != kSimSlotInternal) {
         return;
     }
-    if (GetBackend()->GetSimSlot() == target_slot) {
-        return;
-    }
+    // Selecting the current slot explicitly retries service after a card change.
 
+    if (s_switch_worker_busy.exchange(true)) return;
     s_sim_switch_pending = true;
-    auto *ctx = new SimSwitchCtx{target_slot};
-    open_sim_switching_popup(target_slot);
-    if (xTaskCreate(sim_switch_task, "sim_switch", 4096, ctx, 5, nullptr) !=
-        pdPASS) {
-        delete ctx;
+    auto *ctx = static_cast<SimSwitchCtx *>(calloc(1, sizeof(SimSwitchCtx)));
+    if (ctx) { ctx->target_slot = target_slot; ctx->session = s_screen_session; }
+    post_status(I18n::T("正在切换 SIM 卡…"), kColorScanning);
+    if (!ctx || xTaskCreateLegacy(sim_switch_task, "sim_switch", 8192, ctx, 5, nullptr) != pdPASS) {
+        free(ctx);
+        s_switch_worker_busy.store(false);
         s_sim_switch_pending = false;
         close_status_popup();
         post_status(I18n::T("无法启动 SIM 切换任务"), kColorError);
@@ -1833,6 +2091,118 @@ void on_sim_external_clicked(lv_event_t * /*e*/) {
 
 void on_sim_internal_clicked(lv_event_t * /*e*/) {
     schedule_sim_switch(kSimSlotInternal);
+}
+
+struct SimPinJob {
+    char pin[9];
+    int slot;
+    int result;
+    unsigned session;
+};
+
+void close_pin_popup() {
+    if (s_ui.pin_field) lv_textarea_set_text(s_ui.pin_field, "");
+    if (s_ui.pin_overlay) lv_obj_delete(s_ui.pin_overlay);
+    s_ui.pin_overlay = s_ui.pin_field = s_ui.pin_keyboard = nullptr;
+    s_ui.pin_hint = nullptr;
+    s_ui.pin_slot = -1;
+}
+
+void on_pin_submit(lv_event_t *) {
+    if (!s_ui.pin_field || s_switch_worker_busy.load()) return;
+    const char *pin = lv_textarea_get_text(s_ui.pin_field);
+    const size_t length = strlen(pin);
+    if (length < 4 || length > 8) {
+        if (s_ui.pin_hint) lv_label_set_text(s_ui.pin_hint, I18n::T("请输入 4 到 8 位正确的 PIN"));
+        return;
+    }
+    auto *job = static_cast<SimPinJob *>(calloc(1, sizeof(SimPinJob)));
+    if (!job) return;
+    snprintf(job->pin, sizeof(job->pin), "%s", pin);
+    job->slot = s_ui.pin_slot; job->session = s_screen_session;
+    close_pin_popup();
+    if (s_switch_worker_busy.exchange(true)) {
+        for (volatile char *p = job->pin; p < job->pin + sizeof(job->pin); ++p) *p = 0;
+        free(job); return;
+    }
+    s_sim_switch_pending = true;
+    post_status(I18n::T("正在连接…"), kColorScanning);
+    if (xTaskCreateLegacy([](void *arg) {
+        auto *job = static_cast<SimPinJob *>(arg);
+        job->result = metalio_app_unlock_sim(job->pin, job->slot);
+        for (volatile char *p = job->pin; p < job->pin + sizeof(job->pin); ++p) *p = 0;
+        if (lv_async_call([](void *data) {
+            auto *job = static_cast<SimPinJob *>(data);
+            if (job->session == s_screen_session && screen_alive()) {
+                s_sim_switch_pending = false;
+                if (job->result == 0) s_locked_slot = -1;
+                post_status(job->result == 0 ? I18n::T("已连接") : CellularFailureText(job->result),
+                            job->result == 0 ? kColorBtnAccent : kColorError);
+                refresh_sim_slot_ui(); refresh_network_switch_ui();
+            }
+            free(job);
+        }, job) != LV_RESULT_OK) free(job);
+        s_switch_worker_busy.store(false);
+        vTaskDelete(nullptr);
+    }, "sim_pin", 8192, job, 5, nullptr) != pdPASS) {
+        for (volatile char *p = job->pin; p < job->pin + sizeof(job->pin); ++p) *p = 0;
+        free(job); s_sim_switch_pending = false; s_switch_worker_busy.store(false);
+        post_status(I18n::T("系统忙"), kColorError);
+    }
+}
+
+void on_pin_clicked(lv_event_t *) {
+    if (!screen_alive() || s_switch_worker_busy.load()) return;
+    close_pin_popup();
+    s_ui.pin_slot = s_locked_slot >= 0 ? s_locked_slot : GetBackend()->GetSimSlot();
+    if (s_ui.pin_slot != 0 && s_ui.pin_slot != 1) {
+        post_status(I18n::T("未检测到可用的 SIM 卡"), kColorError); return;
+    }
+    auto *mask = lv_obj_create(s_ui.screen); s_ui.pin_overlay = mask;
+    screen_strip_obj_chrome(mask); lv_obj_set_size(mask, kPanelW, kPanelH);
+    lv_obj_set_pos(mask, 0, 0); lv_obj_remove_flag(mask, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(mask, lv_color_hex(kColorBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(mask, LV_OPA_COVER, LV_PART_MAIN);
+    screen_swipe_back_ignore(mask, true);
+    auto *title = lv_label_create(mask);
+    char heading[64]; snprintf(heading, sizeof(heading), "%s SIM PIN", SimSlotName(s_ui.pin_slot));
+    lv_label_set_text(title, heading);
+    lv_obj_set_pos(title, 30, 20); lv_obj_set_style_text_font(title, &font_puhui_30_4, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_hex(kColorText), LV_PART_MAIN);
+    auto *hint = lv_label_create(mask); s_ui.pin_hint = hint;
+    lv_label_set_text(hint, I18n::T("解锁成功后自动记忆此卡 PIN。\n需要 PUK 时请联系运营商。"));
+    lv_obj_set_pos(hint, 30, 70); lv_obj_set_width(hint, 660);
+    lv_obj_set_style_text_font(hint, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hint, lv_color_hex(kColorSubtle), LV_PART_MAIN);
+    auto *field = lv_textarea_create(mask);HiInputMethod_Bind(field,false); s_ui.pin_field = field;
+    lv_obj_set_pos(field, 30, 146); lv_obj_set_size(field, 660, 64);
+    lv_textarea_set_one_line(field, true); lv_textarea_set_password_mode(field, true);
+    lv_textarea_set_accepted_chars(field, "0123456789"); lv_textarea_set_max_length(field, 8);
+    lv_textarea_set_placeholder_text(field, "PIN");
+    lv_obj_set_style_text_font(field, &font_puhui_30_4, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(field, lv_color_hex(kColorCard), LV_PART_MAIN);
+    lv_obj_set_style_text_color(field, lv_color_hex(kColorText), LV_PART_MAIN);
+    screen_swipe_back_ignore(field, true);
+    const char *labels[] = {I18n::T("取消"), I18n::T("连接")};
+    for (int i = 0; i < 2; ++i) {
+        auto *button = lv_button_create(mask); lv_obj_set_pos(button, 30+i*340, 244);
+        lv_obj_set_size(button, 320, 60); screen_swipe_back_ignore(button, true);
+        auto *label = lv_label_create(button); lv_label_set_text(label, labels[i]);
+        lv_obj_set_style_text_font(label, &font_puhui_20_4, LV_PART_MAIN); lv_obj_center(label);
+        if (i == 0) lv_obj_add_event_cb(button, [](lv_event_t *) { close_pin_popup(); }, LV_EVENT_CLICKED, nullptr);
+        else lv_obj_add_event_cb(button, on_pin_submit, LV_EVENT_CLICKED, nullptr);
+    }
+    auto *keyboard = HiInputMethod_Create(mask); s_ui.pin_keyboard = keyboard;
+    lv_obj_set_style_bg_color(keyboard, lv_color_hex(kColorBg), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(keyboard, lv_color_hex(kColorBtn), LV_PART_ITEMS);
+    lv_obj_set_style_text_color(keyboard, lv_color_hex(kColorText), LV_PART_ITEMS);
+    static lv_font_t pin_keyboard_font;
+    pin_keyboard_font = font_puhui_20_4;
+    pin_keyboard_font.fallback = LV_FONT_DEFAULT;
+    lv_obj_set_style_text_font(keyboard, &pin_keyboard_font, LV_PART_ITEMS);
+
+    lv_obj_set_size(keyboard, kPanelW, 350); lv_obj_align(keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    HiInputMethod_SetTextArea(keyboard, field, false); screen_swipe_back_ignore(keyboard, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,8 +2257,15 @@ void build_tabview(lv_obj_t *parent) {
     lv_obj_set_style_bg_color(tv, lv_color_hex(kColorBg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(tv, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_width(tv, 0, LV_PART_MAIN);
+    lv_obj_set_style_outline_width(tv, 0, LV_PART_MAIN);
 
     lv_obj_t *bar = lv_tabview_get_tab_bar(tv);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(kColorCard), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_outline_width(bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bar, 0, LV_PART_ITEMS);
+    lv_obj_set_style_outline_width(bar, 0, LV_PART_ITEMS);
     lv_obj_set_style_bg_color(bar, lv_color_hex(kColorCard), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_text_color(bar, lv_color_hex(kColorText), LV_PART_MAIN);
@@ -1902,7 +2279,7 @@ void build_tabview(lv_obj_t *parent) {
     screen_swipe_back_ignore(content, true);
 
     // 4G 模式下没有 WiFi 列表 / 扫描概念，直接跳过这两个 Tab。
-    const bool show_wifi_tabs = !IsCellularMode();
+    const bool show_wifi_tabs = true;
 
     if (show_wifi_tabs) {
         // Tab 1：附近 WiFi
@@ -1923,9 +2300,29 @@ void build_tabview(lv_obj_t *parent) {
 
         lv_obj_t *nearby_hint = lv_label_create(nearby_toolbar);
         lv_label_set_text(nearby_hint, I18n::T("扫描附近可用网络"));
+        lv_obj_set_width(nearby_hint, 250);
+        lv_label_set_long_mode(nearby_hint, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_color(nearby_hint, lv_color_hex(kColorSubtle), LV_PART_MAIN);
         lv_obj_set_style_text_font(nearby_hint, &font_puhui_20_4, LV_PART_MAIN);
         lv_obj_align(nearby_hint, LV_ALIGN_LEFT_MID, 0, 0);
+
+        lv_obj_t *search = lv_textarea_create(nearby_toolbar);HiInputMethod_Bind(search,true);
+        s_ui.nearby_search = search;
+        lv_obj_set_size(search, 270, 44);
+        lv_obj_align(search, LV_ALIGN_RIGHT_MID, -150, 0);
+        lv_textarea_set_one_line(search, true);
+        lv_textarea_set_max_length(search, 32);
+        lv_textarea_set_placeholder_text(search, I18n::T("搜索 WiFi 名称"));
+        lv_obj_set_style_radius(search, 12, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(search, lv_color_hex(0x121726), LV_PART_MAIN);
+        lv_obj_set_style_text_color(search, lv_color_hex(kColorText), LV_PART_MAIN);
+        lv_obj_set_style_text_font(search, &font_puhui_20_4, LV_PART_MAIN);
+        lv_obj_add_event_cb(search, on_nearby_search_focused, LV_EVENT_FOCUSED,
+                            nullptr);
+        lv_obj_add_event_cb(search, on_nearby_search_focused, LV_EVENT_CLICKED, nullptr);
+        lv_obj_add_event_cb(search, on_nearby_search_changed,
+                            LV_EVENT_VALUE_CHANGED, nullptr);
+        screen_swipe_back_ignore(search, true);
 
         lv_obj_t *scan = lv_button_create(nearby_toolbar);
         s_ui.scan_btn = scan;
@@ -1933,6 +2330,8 @@ void build_tabview(lv_obj_t *parent) {
         lv_obj_align(scan, LV_ALIGN_RIGHT_MID, 0, 0);
         lv_obj_set_style_radius(scan, 12, LV_PART_MAIN);
         lv_obj_set_style_bg_color(scan, lv_color_hex(kColorBtnActive), LV_PART_MAIN);
+        lv_obj_set_style_border_width(scan, 0, LV_PART_MAIN);
+        lv_obj_set_style_outline_width(scan, 0, LV_PART_MAIN);
         lv_obj_set_style_bg_color(scan, lv_color_hex(kColorBtn),
                                   Sel(LV_PART_MAIN, LV_STATE_DISABLED));
         lv_obj_set_style_shadow_width(scan, 0, LV_PART_MAIN);
@@ -2067,7 +2466,7 @@ void build_tabview(lv_obj_t *parent) {
 
         lv_obj_t *hint3 = lv_label_create(card);
         lv_label_set_text(hint3,
-                          I18n::T("选择上网方式。切换后设备将自动重启生效。"));
+                          I18n::T("选择上网方式。切换后自动连接，无需重启设备。"));
         lv_obj_set_width(hint3, LV_PCT(100));
         lv_label_set_long_mode(hint3, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(hint3, lv_color_hex(kColorSubtle),
@@ -2090,6 +2489,8 @@ void build_tabview(lv_obj_t *parent) {
             lv_obj_set_style_radius(btn, 16, LV_PART_MAIN);
             lv_obj_set_style_bg_color(btn, lv_color_hex(kColorBtn),
                                       LV_PART_MAIN);
+            lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+            lv_obj_set_style_outline_width(btn, 0, LV_PART_MAIN);
             lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
             lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
             screen_swipe_back_ignore(btn, true);
@@ -2116,13 +2517,23 @@ void build_tabview(lv_obj_t *parent) {
         lv_obj_set_style_text_font(cur, &font_puhui_20_4, LV_PART_MAIN);
 
         refresh_network_switch_ui();
+#ifdef CONFIG_METALIO_NT26_4G
+        auto *apn_btn = lv_button_create(card);
+        lv_obj_set_size(apn_btn, LV_PCT(100), 52);
+        lv_obj_add_event_cb(apn_btn, on_apn_clicked, LV_EVENT_CLICKED, nullptr);
+        screen_swipe_back_ignore(apn_btn, true);
+        auto *apn_label = lv_label_create(apn_btn);
+        lv_label_set_text(apn_label, I18n::T("APN 设置"));
+        lv_obj_set_style_text_font(apn_label, &font_puhui_20_4, LV_PART_MAIN);
+        lv_obj_center(apn_label);
+#endif
     };
 
     auto build_sim_switch_tab = [&]() {
         lv_obj_t *tab4 = lv_tabview_add_tab(tv, I18n::T("SIM 卡切换"));
         s_ui.sim_tab = tab4;
         lv_obj_set_style_pad_all(tab4, 24, LV_PART_MAIN);
-        lv_obj_remove_flag(tab4, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(tab4, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *sim_card = lv_obj_create(tab4);
         screen_strip_obj_chrome(sim_card);
@@ -2146,7 +2557,7 @@ void build_tabview(lv_obj_t *parent) {
 
         lv_obj_t *sim_hint = lv_label_create(sim_card);
         lv_label_set_text(sim_hint,
-                          I18n::T("选择 4G 模组使用的 SIM 卡。\n切换后设备将自动重启生效。"));
+                          I18n::T("选择 4G 模组使用的 SIM 卡。\n更换卡后自动连接，无需重启设备。"));
         lv_obj_set_width(sim_hint, LV_PCT(100));
         lv_label_set_long_mode(sim_hint, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(sim_hint, lv_color_hex(kColorSubtle),
@@ -2169,6 +2580,8 @@ void build_tabview(lv_obj_t *parent) {
             lv_obj_set_style_radius(btn, 16, LV_PART_MAIN);
             lv_obj_set_style_bg_color(btn, lv_color_hex(kColorBtn),
                                       LV_PART_MAIN);
+            lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+            lv_obj_set_style_outline_width(btn, 0, LV_PART_MAIN);
             lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
             lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
             screen_swipe_back_ignore(btn, true);
@@ -2197,9 +2610,28 @@ void build_tabview(lv_obj_t *parent) {
                                     LV_PART_MAIN);
         lv_obj_set_style_text_font(sim_cur, &font_puhui_20_4, LV_PART_MAIN);
 
+        lv_obj_t *apn_btn = lv_button_create(sim_card);
+        lv_obj_set_size(apn_btn, LV_PCT(100), 52);
+        lv_obj_set_style_bg_color(apn_btn, lv_color_hex(kColorBtn), LV_PART_MAIN);
+        lv_obj_set_style_radius(apn_btn, 12, LV_PART_MAIN);
+        lv_obj_add_event_cb(apn_btn, on_apn_clicked, LV_EVENT_CLICKED, nullptr);
+        screen_swipe_back_ignore(apn_btn, true);
+        lv_obj_t *apn_label = lv_label_create(apn_btn);
+        lv_label_set_text(apn_label, I18n::T("APN 设置"));
+        lv_obj_set_style_text_font(apn_label, &font_puhui_20_4, LV_PART_MAIN);
+        lv_obj_center(apn_label);
+
+        auto *pin_button = lv_button_create(sim_card);
+        lv_obj_set_size(pin_button, LV_PCT(100), 52);
+        lv_obj_add_event_cb(pin_button, on_pin_clicked, LV_EVENT_CLICKED, nullptr);
+        screen_swipe_back_ignore(pin_button, true);
+        auto *pin_label = lv_label_create(pin_button);
+        lv_label_set_text(pin_label, I18n::T("PIN 解锁"));
+        lv_obj_set_style_text_font(pin_label, &font_puhui_20_4, LV_PART_MAIN);
+        lv_obj_center(pin_label);
+
         lv_obj_t *sim_tip = lv_label_create(sim_card);
-        lv_label_set_text(sim_tip,
-                          I18n::T("AT 命令序列：\n  AT+CFUN=0\n  AT+ECSIMCFG=SimSlot,X\n  AT+CFUN=1"));
+        lv_label_set_text(sim_tip, I18n::T("切换 SIM 卡后将重新连接移动网络，无需重启设备。"));
         lv_obj_set_width(sim_tip, LV_PCT(100));
         lv_label_set_long_mode(sim_tip, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(sim_tip, lv_color_hex(kColorSubtle),
@@ -2210,12 +2642,8 @@ void build_tabview(lv_obj_t *parent) {
     };
 
     // 4G 模式：「SIM 卡切换」放在「网络切换」前面；WiFi 模式：只挂「网络切换」。
-    if (IsCellularMode()) {
-        build_sim_switch_tab();
-        build_network_switch_tab();
-    } else {
-        build_network_switch_tab();
-    }
+    build_network_switch_tab();
+    build_sim_switch_tab();
 }
 
 }  // namespace
@@ -2223,6 +2651,10 @@ void build_tabview(lv_obj_t *parent) {
 // ===========================================================================
 // 公共接口
 // ===========================================================================
+void NetworkScreen::RequestAutoScanOnNextLoad() {
+    s_auto_scan_on_next_load = true;
+}
+
 lv_obj_t *NetworkScreen::CreateStatic() {
     s_screen_active = true;
     s_scan_in_progress = false;
@@ -2239,11 +2671,31 @@ lv_obj_t *NetworkScreen::CreateStatic() {
 
     build_header(scr);
     build_tabview(scr);
+    // Status belongs to the whole network page. Keeping this label inside
+    // the nearby-WiFi tab hid SIM/PIN failures while the SIM tab was selected.
+    if (s_ui.status_label) {
+        lv_obj_set_parent(s_ui.status_label, scr);
+        lv_obj_set_pos(s_ui.status_label, 104, 64);
+        lv_obj_set_width(s_ui.status_label, kPanelW - 120);
+        lv_label_set_long_mode(s_ui.status_label, LV_LABEL_LONG_DOT);
+    }
+
+    s_nearby_filter.clear();
+    if (s_ui.nearby_search != nullptr) lv_textarea_set_text(s_ui.nearby_search, "");
+    if (s_ui.nearby_tab != nullptr) {
+        s_ui.nearby_keyboard = HiInputMethod_Create(scr);
+        if (s_ui.nearby_keyboard != nullptr) {
+            lv_obj_add_flag(s_ui.nearby_keyboard, LV_OBJ_FLAG_HIDDEN);
+            screen_swipe_back_ignore(s_ui.nearby_keyboard, true);
+        }
+    }
 
     rebuild_nearby_list_now();
     rebuild_saved_list_now();
 
+    screen_kill_theme_chrome(scr);
     screen_attach_swipe_back(scr, on_swipe_back);
+    screen_attach_left_edge_back(scr, kHeaderH, on_swipe_back);
     lv_obj_add_event_cb(scr, on_screen_unloaded, LV_EVENT_SCREEN_UNLOADED,
                         nullptr);
     return scr;
@@ -2258,9 +2710,12 @@ void NetworkScreen::LifecycleCallback(screen_lifecycle_event_t event) {
     if (event == SCREEN_LIFECYCLE_LOAD) {
         ESP_LOGI(TAG, "load: network_screen");
         if (!IsCellularMode()) {
-            // 不再自动扫描——等用户主动点「扫描」。
             post_status("", kColorSubtle);
             refresh_saved_list();
+            if (s_auto_scan_on_next_load) {
+                s_auto_scan_on_next_load = false;
+                schedule_scan();
+            }
         }
         refresh_network_switch_ui();
         refresh_sim_slot_ui();

@@ -5,11 +5,7 @@
  * WiFi-required dialog — ported from MetalioClaw4
  * main/display/screen/wifi_required_dialog.cc.
  *
- * The original reads the saved network type (WiFi vs 4G) via
- * DualNetworkBoard::LoadNetworkTypeFromSettings and checks
- * WifiStation::GetInstance().IsConnected(). openvela does not yet have
- * those classes; the blocker falls back to a Settings key
- * ("network/type": 0=WiFi, 1=4G) and an always-connected stub.
+ * Keep the legacy entry-point names, but accept either live data transport.
  */
 
 #include "wifi_required_dialog.h"
@@ -17,8 +13,7 @@
 #include "i18n.h"
 #include "screen_util.h"
 #include "esp_log_shim.h"
-#include "settings.h"
-#include <metalio/metalio.h>
+#include "network_service.h"
 
 LV_FONT_DECLARE(font_puhui_20_4);
 LV_FONT_DECLARE(font_puhui_30_4);
@@ -28,22 +23,7 @@ namespace {
 constexpr int kPanelSize = 720;
 
 lv_obj_t *s_overlay = nullptr;
-
-// Real STA state from the esp-hosted netdev.  The C5 sets priv->sta_connected
-// on the Event_StaConnected(775) RPC, so this reflects the actual association
-// instead of a Settings stub.
-bool WifiStationConnected()
-{
-    return metalio_esp_hosted_is_connected();
-}
-
-// This openvela port is WiFi-only (NT26 4G is not wired up yet), so the
-// effective network type is always WiFi(0).  Any app that requires network
-// therefore blocks until the STA has actually connected.
-int SavedNetworkType()
-{
-    return 0;
-}
+lv_timer_t *s_connection_timer = nullptr;
 
 void CloseDialog()
 {
@@ -62,14 +42,13 @@ void OnOkClicked(lv_event_t * /*e*/)
 
 bool WifiRequired_ShouldBlock()
 {
-    if (SavedNetworkType() != 0) {  // not WiFi mode
-        return false;
-    }
-    return !WifiStationConnected();
+    return !NetworkService::Available();
 }
 
 void WifiRequired_ShowDialog(const char *hint_msgid)
 {
+    // A connection can complete between the initial guard and this call.
+    if (!WifiRequired_ShouldBlock()) return;
     lv_obj_t *scr = lv_screen_active();
     if (scr == nullptr) {
         return;
@@ -92,6 +71,18 @@ void WifiRequired_ShowDialog(const char *hint_msgid)
     lv_obj_add_flag(mask, LV_OBJ_FLAG_CLICKABLE);
     screen_swipe_back_ignore(mask, true);
     s_overlay = mask;
+    lv_obj_add_event_cb(mask, [](lv_event_t *event) {
+        if (lv_event_get_target_obj(event) == s_overlay) {
+            s_overlay = nullptr;
+            if (s_connection_timer) {
+                lv_timer_delete(s_connection_timer);
+                s_connection_timer = nullptr;
+            }
+        }
+    }, LV_EVENT_DELETE, nullptr);
+    s_connection_timer = lv_timer_create([](lv_timer_t *) {
+        if (!WifiRequired_ShouldBlock()) CloseDialog();
+    }, 1000, nullptr);
 
     lv_obj_t *card = lv_obj_create(mask);
     lv_obj_remove_style_all(card);
@@ -106,7 +97,7 @@ void WifiRequired_ShowDialog(const char *hint_msgid)
     screen_swipe_back_ignore(card, true);
 
     lv_obj_t *title = lv_label_create(card);
-    lv_label_set_text(title, I18n::T("未连接 WiFi"));
+    lv_label_set_text(title, I18n::T("未连接网络"));
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_set_style_text_font(title, &font_puhui_30_4, LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
@@ -114,7 +105,7 @@ void WifiRequired_ShowDialog(const char *hint_msgid)
 
     const char *hint = (hint_msgid != nullptr && hint_msgid[0] != '\0')
                             ? hint_msgid
-                            : "请先连接 WiFi 后再使用该应用";
+                            : "请先连接 WiFi 或 4G 后再使用该应用";
     lv_obj_t *body = lv_label_create(card);
     lv_label_set_text(body, I18n::T(hint));
     lv_obj_set_width(body, kCardW - 56);

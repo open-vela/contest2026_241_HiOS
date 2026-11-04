@@ -1,3 +1,4 @@
+#include "hi_task_cpp.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -15,10 +16,15 @@
 
 #include "mcp_server.h"
 #include "application.h"
+#include "../chat_local_cmd.h"
+#include "system_chrome/system_chrome.h"
 #include "board_shim.h"
 #include "settings.h"
 #include "home_screen/home_screen.h"
+#include "../hiapp/registry.h"
 #include "chat_screen/chat_screen.h"
+#include "camera_screen/camera_screen.h"
+#include "smart_home/smart_home.h"
 #include "metalio_claw_4_board.h"
 
 #include <metalio/metalio.h>
@@ -29,6 +35,9 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <atomic>
+#include <pthread.h>
+#include <sched.h>
 #include <mutex>
 #include <condition_variable>
 #include <map>
@@ -325,7 +334,7 @@ static void DlAcceptLoop()
         int client = accept(srv, nullptr, nullptr);
         if (client < 0) continue;
         write(1, "DL_CONN\n", 8);
-        std::thread(DlConnLoop, client).detach();
+        HiTask::LegacyThread(DlConnLoop, client).detach();
     }
 }
 
@@ -333,7 +342,7 @@ static void DlStart()
 {
     if (g_dl_started) return;
     g_dl_started = true;
-    std::thread(DlAcceptLoop).detach();
+    HiTask::LegacyThread(DlAcceptLoop).detach();
 }
 
 #ifndef BOARD_NAME
@@ -357,13 +366,42 @@ void McpServer::AddCommonTools()
     auto original_tools = std::move(tools_);
     auto &board = Board::GetInstance();
 
+    AddTool("self.camera.take_photo",
+        "Hi视界是HiOS内置相机问答，已安装。画面/眼前物体问题调用此工具并回答返回结果；普通聊天直接回答，无须拍照。不要声称Hi视界未安装。",
+        PropertyList({Property("question", kPropertyTypeString,
+                               std::string("请描述摄像头拍到的当前画面。"))}),
+        [](const PropertyList &properties) -> ReturnValue {
+            const std::string question =
+                properties["question"].value<std::string>();
+            std::string answer;
+            std::string error;
+            if (!CameraScreen::CaptureAndExplain(question, answer, error)) {
+                return ToolError{error};
+            }
+            return answer;
+        });
+
     /* Keep local-control tool JSON SHORT so tools/list page-1 always
      * includes 开应用/音量/背光/蓝牙. Long descriptions used to push them
      * past the payload cap; cloud never paginated → text-only replies. */
 
+    AddTool("self.phone.call",
+        "Dial a contact or number from the live contact book. MUST call for 打电话给/打给/呼叫/拨打.",
+        PropertyList({
+            Property("name", kPropertyTypeString, std::string(""))
+        }),
+        [](const PropertyList &properties) -> ReturnValue {
+            const std::string name = properties["name"].value<std::string>();
+            if (name.empty())
+                return std::string("要打给谁？");
+            if (!ChatLocalCmd_CallContact(name))
+                return std::string("没有可拨打的联系人或号码。");
+            return std::string("已按当前通讯录拨号。");
+        });
+
     AddTool("self.app.open",
-        "Open a local HiOS app. MUST call for 打开相机/音乐/日历/设置/天气/"
-        "电台/蓝牙/网络/录音/计算器/背光/…. Pass Chinese name or id.",
+        "Open any installed local HiOS app by its name or id, including SD-card apps (hiapp:id) and built-in Hi视界/嗨世界/看一看/vision. MUST call for 打开相机/音乐/日历/设置/天气/"
+        "电台/蓝牙/网络/录音/计算器/背光/…. Pass Chinese name or id. Hi视界仅在用户明确要求打开时打开。",
         PropertyList({
             Property("name", kPropertyTypeString, std::string("")),
             Property("id", kPropertyTypeString, std::string(""))
@@ -375,8 +413,21 @@ void McpServer::AddCommonTools()
                                : (!id.empty() ? id.c_str() : nullptr);
             if (query == nullptr)
                 return std::string("Missing name or id");
+            if (ChatLocalCmd_IsVisionAppName(query)) {
+                if (!CameraScreen::IsLookAndSeeMode() &&
+                    !ChatLocalCmd_ConsumeVisionOpenRequest())
+                    return std::string("当前为普通语音对话，请继续聆听并回答用户；没有执行打开应用操作，无需说明工具限制。");
+                lv_lock();
+                const bool opened=CameraScreen::IsLookAndSeeMode() ||
+                    lv_async_call([](void *) { CameraScreen::OpenLookAndSee(false); }, nullptr)==LV_RESULT_OK;
+                lv_unlock();
+                if (!opened)
+                    return std::string("Hi视界已内置，但当前无法创建界面，请稍后再试。");
+                return std::string("Hi视界是已安装的内置功能，已打开。可用self.camera.take_photo回答画面问题，也可正常聊天。");
+            }
             /* Soft-stop chat voice on Application thread BEFORE LVGL swap. */
-            if (ChatScreen::IsActive())
+            bool music_request=strstr(query,"音乐")||strstr(query,"music");
+            if (ChatScreen::IsActive()||(music_request&&SystemChrome_FloatAiOpen()))
             {
                 write(1, "MCP_LEAVE_CHAT\n", 15);
                 Application::GetInstance().SetVoiceUiDesired(false);
@@ -391,7 +442,7 @@ void McpServer::AddCommonTools()
         });
 
     AddTool("self.app.list",
-        "List local HiOS apps (id + Chinese name).",
+        "List all installed local HiOS apps, including built-in and SD-card apps (id + Chinese name).",
         PropertyList(),
         [](const PropertyList & /*properties*/) -> ReturnValue {
             cJSON *arr = cJSON_CreateArray();
@@ -406,6 +457,16 @@ void McpServer::AddCommonTools()
                 cJSON_AddBoolToObject(o, "available", info.available);
                 cJSON_AddItemToArray(arr, o);
             }
+            for(const auto& record:HiApp::RegistrySnapshot()) {
+                cJSON* o=cJSON_CreateObject();const auto id="hiapp:"+record.id;
+                cJSON_AddStringToObject(o,"id",id.c_str());cJSON_AddStringToObject(o,"name",record.name.c_str());
+                cJSON_AddBoolToObject(o,"available",true);cJSON_AddItemToArray(arr,o);
+            }
+            cJSON *vision = cJSON_CreateObject();
+            cJSON_AddStringToObject(vision,"id","vision");
+            cJSON_AddStringToObject(vision,"name","Hi 视界");
+            cJSON_AddBoolToObject(vision,"available",true);
+            cJSON_AddItemToArray(arr,vision);
             return arr;
         });
 
@@ -420,7 +481,8 @@ void McpServer::AddCommonTools()
             if (vol < 0) vol = 0;
             if (vol > 100) vol = 100;
             /* Same path as SettingsScreen::ApplyVolume. */
-            Application::GetInstance().GetAudioService().SetVolume(vol);
+            /* No KV flash during voice/chat — flash write solid-blues LVGL. */
+            Application::GetInstance().GetAudioService().SetVolume(vol, false);
             write(1, "VOL_SET\n", 8);
             return true;
         });
@@ -439,9 +501,41 @@ void McpServer::AddCommonTools()
             int vol = audio.GetVolume() + delta;
             if (vol < 0) vol = 0;
             if (vol > 100) vol = 100;
-            audio.SetVolume(vol);
+            audio.SetVolume(vol, false);
             write(1, "VOL_ADJ\n", 8);
             return vol;
+        });
+
+    AddTool("self.battery.get",
+        "This device's battery. MUST call for 电量/还有多少电/电池/充没充电. Speak the returned sentence.",
+        PropertyList(),
+        [](const PropertyList &) -> ReturnValue {
+            int level = 0, charging = 0, discharging = 0;
+            if (!metalio_board_peek_battery(&level, &charging, &discharging) &&
+                !metalio_board_get_battery(&level, &charging, &discharging))
+                return std::string("暂时读不到电量。");
+            char buf[64];
+            if (charging)
+                std::snprintf(buf, sizeof(buf), "当前电量 %d%%，正在充电。", level);
+            else
+                std::snprintf(buf, sizeof(buf), "当前电量 %d%%。", level);
+            write(1, "MCP_BAT\n", 8);
+            return std::string(buf);
+        });
+
+    AddTool("self.home.command",
+        "Control Hi 家 devices already on this panel. MUST call for 客厅灯/窗帘/空调/风扇/插座/所有灯/离家/回家了. "
+        "Pass the user sentence as text. Bare 开灯/关灯 is GPIO48, not this tool.",
+        PropertyList({
+            Property("text", kPropertyTypeString, std::string(""))
+        }),
+        [](const PropertyList &properties) -> ReturnValue {
+            const std::string text = properties["text"].value<std::string>();
+            char reply[192];
+            if (!SmartHome_VoiceCommand(text.c_str(), reply, sizeof(reply)))
+                return std::string("这句话没有对应的 Hi 家设备。");
+            write(1, "MCP_HOME\n", 9);
+            return std::string(reply);
         });
 
     AddTool("self.screen.set_brightness",
@@ -506,32 +600,33 @@ void McpServer::AddCommonTools()
         });
 
     AddTool("self.get_device_status",
-        "Read local volume/brightness/battery/network. Call before relative adjust.",
+        "Read local volume/brightness/battery/network. MUST call for 电量/还有多少电/电池.",
         PropertyList(),
         [&board](const PropertyList & /*properties*/) -> ReturnValue {
             cJSON *json = cJSON_CreateObject();
             cJSON_AddStringToObject(json, "board", board.GetBoardType().c_str());
             cJSON_AddStringToObject(json, "firmware", board.GetFirmwareVersion().c_str());
 
-            /* Chat/Speaking: skip gauge I2C + hosted link probe — both raced
-             * LVGL / MQTT and froze after MCP_BAT_SKIP. */
+            /* Voice chat must not start a fuel-gauge I2C read on this thread.
+             * The monitor task keeps the cache current. */
             auto &app = Application::GetInstance();
             const bool chat_light =
                 app.GetDeviceState() == kDeviceStateSpeaking ||
                 ChatScreen::IsActive();
             int level = 0, charging = 0, discharging = 0;
-            if (!chat_light)
-                metalio_board_get_battery(&level, &charging, &discharging);
-            else
-                write(1, "MCP_BAT_SKIP\n", 13);
+            const bool have_battery =
+                metalio_board_peek_battery(&level, &charging, &discharging) ||
+                (!chat_light &&
+                 metalio_board_get_battery(&level, &charging, &discharging));
             cJSON *battery = cJSON_CreateObject();
-            cJSON_AddNumberToObject(battery, "level", level);
-            cJSON_AddBoolToObject(battery, "charging", charging != 0);
-            cJSON_AddBoolToObject(battery, "discharging", discharging != 0);
+            cJSON_AddBoolToObject(battery, "valid", have_battery);
+            cJSON_AddNumberToObject(battery, "level", have_battery ? level : -1);
+            cJSON_AddBoolToObject(battery, "charging", have_battery && charging != 0);
+            cJSON_AddBoolToObject(battery, "discharging",
+                                  have_battery && discharging != 0);
             cJSON_AddItemToObject(json, "battery", battery);
 
-            int volume = 0;
-            metalio_board_get_volume(&volume);
+            int volume = app.GetAudioService().GetVolume();
             cJSON_AddNumberToObject(json, "volume", volume);
 
             auto *bl = board.GetBacklight();
@@ -674,9 +769,17 @@ void McpServer::ParseMessage(const std::string &message)
 
 void McpServer::ParseCapabilities(const cJSON *capabilities)
 {
-    /* Hardware-specific capability parsing (camera vision URL, etc.) is a
-     * no-op in the openvela port until the camera HAL is wired up. */
-    (void)capabilities;
+    const cJSON *vision = cJSON_GetObjectItem(capabilities, "vision");
+    if (!cJSON_IsObject(vision)) return;
+
+    const cJSON *url = cJSON_GetObjectItem(vision, "url");
+    const cJSON *token = cJSON_GetObjectItem(vision, "token");
+    if (cJSON_IsString(url) && url->valuestring != nullptr) {
+        CameraScreen::SetVisionService(
+            url->valuestring,
+            cJSON_IsString(token) && token->valuestring != nullptr
+                ? token->valuestring : "");
+    }
 }
 
 void McpServer::ParseMessage(const cJSON *json)
@@ -1020,23 +1123,108 @@ void McpServer::DoToolCall(int id, const std::string &tool_name, const cJSON *to
     }
 
     auto &app = Application::GetInstance();
-    /* Device-control tools run inline on the Application thread (already
-     * inside DrainXiaozhiJsonQueue). Extra Schedule() has hung / delayed
-     * volume·蓝牙·开应用 on this port so the cloud saw no tool result. */
-    if (tool_name == "self.app.open" ||
-        tool_name == "self.app.list" ||
+    if(tool_name=="self.camera.take_photo") {
+        if (!CameraScreen::IsLookAndSeeMode()) {
+            ReplyResult(id,"当前为普通语音对话，请继续聆听并回答用户；没有执行拍照操作，无需说明工具限制。");
+            return;
+        }
+        // The AI event loop must keep draining ASR/TTS while the visual
+        // service uploads/analyzes an image. Allow one bounded job at a time.
+        if(vision_busy_.exchange(true)){ReplyError(id,"视觉分析正在进行，请稍候");return;}
+        SystemChrome_FloatAiSyncState();
+        const uint32_t generation=app.ProtocolGeneration();
+        const unsigned visit=CameraScreen::VisionVisit();
+        struct VisionJob {std::function<void()> run;};
+        auto *job=new VisionJob{[this,id,visit,generation,tool=*tool_iter,arguments](){
+            std::string result=tool->Call(arguments);
+            Application::GetInstance().Schedule([this,id,visit,generation,result](){
+                auto &app=Application::GetInstance();
+                // Opening the assistant during camera LOAD can change the
+                // voice UI epoch without changing the RPC connection. Always
+                // complete that connection's request, or explicitly cancel;
+                // silently dropping it makes a working camera look timed out.
+                if (app.ProtocolGeneration()==generation) {
+                    if (CameraScreen::IsLookAndSeeMode() && CameraScreen::VisionVisit()==visit) {
+                        ReplyResult(id,result);
+                        app.NotifyFloatAiDialogActivity();
+                    } else ReplyError(id,"本次Hi 视界识别已取消");
+                }
+                vision_busy_=false;
+                SystemChrome_FloatAiSyncState();
+            });
+        }};
+        pthread_t worker;pthread_attr_t attr;pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr,65536);
+        int rc=hi_task_create_legacy(&worker,&attr,[](void *arg)->void*{
+            int policy=0;sched_param priority{};
+            if(pthread_getschedparam(pthread_self(),&policy,&priority)==0){
+                priority.sched_priority=CONFIG_METALIO_APP_PRIORITY-1;
+                (void)pthread_setschedparam(pthread_self(),SCHED_RR,&priority);
+            }
+            std::unique_ptr<VisionJob> job(static_cast<VisionJob*>(arg));job->run();return nullptr;
+        },job);
+        pthread_attr_destroy(&attr);
+        if(rc==0)pthread_detach(worker);
+        else {delete job;vision_busy_=false;SystemChrome_FloatAiSyncState();ReplyError(id,"无法启动视觉分析，请重试");}
+        return;
+    }
+    const bool device_tool =
+        tool_name == "self.app.open" || tool_name == "self.app.list" ||
         tool_name == "self.screen.set_brightness" ||
         tool_name == "self.screen.adjust_brightness" ||
         tool_name == "self.audio_speaker.set_volume" ||
         tool_name == "self.audio_speaker.adjust_volume" ||
         tool_name == "self.bluetooth.set_power" ||
-        tool_name == "self.get_device_status")
-    {
-        write(1, "MCP_INLINE\n", 11);
+        tool_name == "self.battery.get" ||
+        tool_name == "self.home.command" ||
+        tool_name == "self.get_device_status";
+
+    const bool hw_only_in_chat =
+        tool_name == "self.screen.set_brightness" ||
+        tool_name == "self.screen.adjust_brightness" ||
+        tool_name == "self.audio_speaker.set_volume" ||
+        tool_name == "self.audio_speaker.adjust_volume" ||
+        tool_name == "self.battery.get" ||
+        tool_name == "self.home.command" ||
+        tool_name == "self.get_device_status";
+
+    auto run_tool = [this, id, tool_iter, arguments]() {
         std::string result = (*tool_iter)->Call(arguments);
         write(1, "MCP_CALLED\n", 11);
         ReplyResult(id, result);
         write(1, "MCP_REPLIED\n", 12);
+    };
+
+    /* In chat, defer UI-heavy device tools one main-loop turn so MCP does not
+     * run in the same DrainXiaozhiJson tick as SetChatMessage/TTS (blue LVGL).
+     * Volume/brightness apply hardware immediately so voice control works. */
+    if (device_tool && ChatScreen::IsActive() && !hw_only_in_chat)
+    {
+        write(1, "MCP_DEFER\n", 10);
+        const std::string name_copy = tool_name;
+        PropertyList args_copy = std::move(arguments);
+        app.Schedule([this, id, name_copy, args_copy]() {
+            auto it = std::find_if(tools_.begin(), tools_.end(),
+                                   [&name_copy](const McpTool *tool) {
+                                       return tool->name() == name_copy;
+                                   });
+            if (it == tools_.end())
+            {
+                ReplyError(id, "Unknown tool: " + name_copy);
+                return;
+            }
+            std::string result = (*it)->Call(args_copy);
+            write(1, "MCP_CALLED\n", 11);
+            ReplyResult(id, result);
+            write(1, "MCP_REPLIED\n", 12);
+        });
+        return;
+    }
+
+    if (device_tool)
+    {
+        write(1, "MCP_INLINE\n", 11);
+        run_tool();
         return;
     }
     app.Schedule([this, id, tool_iter, arguments = std::move(arguments)]() {
@@ -1089,7 +1277,7 @@ int McpServer::StartTcpServer(uint16_t port)
     }
 
     tcp_running_ = true;
-    tcp_thread_ = std::thread([this, port]() { this->TcpServerLoop(port); });
+    tcp_thread_ = HiTask::LegacyThread([this, port]() { this->TcpServerLoop(port); });
     ESP_LOGI(TAG, "MCP TCP server listening on port %u", port);
     return 0;
 }

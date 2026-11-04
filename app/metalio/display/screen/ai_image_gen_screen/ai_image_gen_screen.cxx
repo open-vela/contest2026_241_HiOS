@@ -30,6 +30,9 @@
  */
 
 #include "ai_image_gen_screen.h"
+#include "horde_protocol.h"
+#include "horde_webp.h"
+#include "image_prompt.h"
 #include "i18n.h"
 
 #include <atomic>
@@ -51,27 +54,37 @@
 #include "application.h"
 #include "audio_codec.h"
 #include "audio_service.h"
+#include "../../../audio/speech_capture.h"
 #include "board_shim.h"
 #include "device_state.h"
 #include "home_screen/home_screen.h"
+#include "bluetooth_screen/bluetooth_screen.h"
+#include "hi_music_screen/local_music_player.h"
+#include "radio_screen/radio_player.h"
+#include "music_screen/music_screen.h"
 #include "ota.h"
 #include "lvgl_image.h"
 #include "screen_util.h"
 #include "system_info.h"
+#include "input_method/hi_input_method.h"
 
 #include <unistd.h>
+#include <metalio/metalio.h>
 
 LV_FONT_DECLARE(font_puhui_20_4);
 LV_FONT_DECLARE(font_puhui_30_4);
+LV_FONT_DECLARE(font_awesome_20_4);
+LV_FONT_DECLARE(font_ai_slogan_32_bold);
 
 namespace {
 
-// freertos_shim.h does not provide xTaskGetCurrentTaskHandle; on NuttX
-// TaskHandle_t is pid_t, so getpid() is the direct equivalent. Used by
+// TaskHandle_t is the pthread ID. getpid() is the task-group ID on NuttX;
+// using it here leaves a completed worker handle permanently occupied.
+// Used by
 // clear_own_worker_handle() to confirm the caller is the worker task
 // before clearing the stored handle (preserves the original guard).
 static inline TaskHandle_t xTaskGetCurrentTaskHandle() {
-    return static_cast<TaskHandle_t>(getpid());
+    return static_cast<TaskHandle_t>(pthread_self());
 }
 
 constexpr const char* TAG = "AiImageGenScreen";
@@ -97,7 +110,7 @@ constexpr int32_t kGalleryH    = kBodyH - kPromptAreaH - 20;
 
 constexpr int   kPollIntervalMs      = 3000;
 constexpr int   kPollFirstDelayMs    = 1500;
-constexpr int   kMaxPollAttempts     = 60;
+constexpr int   kMaxPollAttempts     = 400;
 constexpr int   kMaxPollHttpFails    = 8;
 constexpr int   kHttpTimeoutMs       = 30000;
 constexpr size_t kImageMaxBytes      = 800 * 1024;
@@ -141,6 +154,17 @@ TaskHandle_t s_worker_task = 0;
 
 std::vector<std::unique_ptr<LvglAllocatedImage>> s_image_holders;
 
+// Image generation connects directly to Horde. Speech keeps its own ASR
+// endpoint so cloud migration never removes the required voice input mode.
+std::string cloud_asr_url() {
+    Settings config("imagegen");
+    std::string url=config.GetString("asr_url","");
+    if(url.empty())return HiSpeech::ImageAsrUrl(api::ServiceUrl(api::kXiaozhiAsrWav));
+    if(url.compare(0,8,"https://") || url.find_first_of("\r\n \t")!=std::string::npos)return {};
+    return url;
+}
+const char* idle_button_text() { return cloud_asr_url().empty()?"输入描述":"按住说话"; }
+void open_text_composer(lv_event_t*);
 bool screen_alive() { return s_screen != nullptr; }
 
 bool session_alive(uint32_t session) {
@@ -254,6 +278,9 @@ int selected_image_count() {
 
 // 状态文案写在底部按钮上（底部不再另放状态行）。
 void post_button_text(const char* text, uint32_t session) {
+#if defined(HI_SERVICES_PROBE) && HI_SERVICES_PROBE
+    printf("AI_IMAGE_STATUS %s\n",text);fflush(stdout);
+#endif
     if (text == nullptr) {
         return;
     }
@@ -280,7 +307,7 @@ void update_button_ui_locked(State st) {
             lv_obj_set_style_bg_color(s_record_btn,
                                       lv_color_hex(kColorRecordBtnIdle),
                                       LV_PART_MAIN);
-            lv_label_set_text(s_record_lbl, I18n::T("按住说话"));
+            lv_label_set_text(s_record_lbl, I18n::T(idle_button_text()));
             lv_obj_add_flag(s_record_btn, LV_OBJ_FLAG_CLICKABLE);
             if (s_n_dd != nullptr) {
                 lv_obj_remove_state(s_n_dd, LV_STATE_DISABLED);
@@ -354,8 +381,12 @@ void set_prompt_locked(const std::string& prompt) {
         return;
     }
     if (prompt.empty()) {
-        lv_label_set_text(s_prompt_lbl, I18n::T("按住说话，说出想画的内容"));
+        lv_obj_set_style_text_font(s_prompt_lbl,&font_ai_slogan_32_bold,0);
+        lv_obj_set_style_text_align(s_prompt_lbl,LV_TEXT_ALIGN_CENTER,0);
+        lv_label_set_text(s_prompt_lbl, "图片AI创意，由你定义！");
     } else {
+        lv_obj_set_style_text_font(s_prompt_lbl,&font_puhui_20_4,0);
+        lv_obj_set_style_text_align(s_prompt_lbl,LV_TEXT_ALIGN_LEFT,0);
         lv_label_set_text(s_prompt_lbl, prompt.c_str());
     }
 }
@@ -393,7 +424,7 @@ void tick_timer_cb(lv_timer_t* /*t*/) {
     if (st == State::Recording) {
         const int64_t start = s_record_start_us.load(std::memory_order_acquire);
         if (start <= 0) {
-            return;
+            lv_label_set_text(s_record_lbl,I18n::T("准备录音…"));return;
         }
         const int ms = static_cast<int>((esp_timer_get_time() - start) / 1000);
         char buf[32];
@@ -436,22 +467,25 @@ std::unique_ptr<Http> create_http_client(std::string& err_out) {
     }
     http->SetHeader("Accept", "*/*");
     http->SetHeader("Connection", "close");
-    http->SetHeader("X-Device-Id", device_id_header());
-    // TODO: Http class in ota/ota.h does not expose SetTimeout; the
-    // kHttpTimeoutMs constant is kept for parity with the original
-    // source. Wire a socket-level SO_RCVTIMEO when short timeouts are
-    // required.
-    (void)kHttpTimeoutMs;
+    http->SetDeadlineMs(kHttpTimeoutMs);
     return http;
 }
 
 HttpJsonResult http_exchange(const char* method, const std::string& url,
-                             std::string body, const char* content_type) {
+                             std::string body, const char* content_type, bool horde = false, bool public_service=false) {
     HttpJsonResult r;
     std::lock_guard<std::mutex> lock(s_http_mutex);
     auto http = create_http_client(r.err);
     if (http == nullptr) {
         return r;
+    }
+    if(!horde&&!public_service)http->SetHeader("X-Device-Id",device_id_header());
+#if defined(HI_SERVICES_PROBE) && HI_SERVICES_PROBE
+    if(!horde&&!public_service)http->SetHeader("X-HiOS-Diagnostic","image-speech");
+#endif
+    if(horde) {
+        http->SetHeader("apikey","0000000000");
+        http->SetHeader("Client-Agent","HiOS:1.1:personal");
     }
     if (content_type != nullptr && content_type[0] != '\0') {
         http->SetHeader("Content-Type", content_type);
@@ -472,15 +506,23 @@ HttpJsonResult http_exchange(const char* method, const std::string& url,
         return r;
     }
     r.status = http->GetStatusCode();
-    r.body = http->ReadAll();
+    char chunk[2048];
+    while(true) {
+        int count=http->Read(chunk,sizeof(chunk));
+        if(count==0) break;
+        if(count<0 || r.body.size()+count>64*1024) {r.err="响应失败或超过大小限制";http->Close();return r;}
+        r.body.append(chunk,count);
+    }
     if (std::strcmp(method, "GET") == 0) {
         api::LogHttpResponse(TAG, r.status, api::RedactClawUrlsForLog(r.body));
     } else {
         api::LogHttpResponse(TAG, r.status, r.body);
     }
     http->Close();
-    if (r.status != 200) {
-        r.err = r.body.empty() ? ("HTTP " + std::to_string(r.status)) : r.body;
+    if (r.status < 200 || r.status >= 300) {
+        cJSON* error=cJSON_Parse(r.body.c_str());
+        r.err="HTTP "+std::to_string(r.status)+": "+HiHorde::Message(error,"网络请求失败");
+        cJSON_Delete(error);
         return r;
     }
     r.ok = true;
@@ -504,6 +546,7 @@ struct BinaryDownload {
     bool ok = false;
     CapsBuffer data;
     size_t size = 0;
+    int width=0,height=0;
     std::string err;
 };
 
@@ -533,6 +576,9 @@ BinaryDownload download_image(const std::string& url) {
     if (http == nullptr) {
         return out;
     }
+    // Result storage is a separate HTTPS host. Its handshake and binary
+    // transfer need a budget independent of the small JSON polling calls.
+    http->SetDeadlineMs(90000);
     if (!http->Open("GET", url)) {
         out.err = "open failed";
         return out;
@@ -593,11 +639,20 @@ BinaryDownload download_image(const std::string& url) {
         std::memcpy(buf.get() + total, chunk.get(), n);
         total += static_cast<size_t>(n);
     }
+    const size_t expected=http->GetBodyLength();
+#if defined(HI_SERVICES_PROBE) && HI_SERVICES_PROBE
+    printf("AI_IMAGE_DOWNLOAD bytes=%u expected=%u error=%d\n",unsigned(total),unsigned(expected),http->GetLastError());fflush(stdout);
+#endif
     http->Close();
 
-    if (read_error || total == 0 || !looks_like_image(buf.get(), total)) {
+    if (read_error || (expected&&expected!=total) || total == 0 || !looks_like_image(buf.get(), total)) {
         out.err = read_error ? I18n::T("图片下载失败") : I18n::T("非图片响应");
         return out;
+    }
+    if(total>=12 && std::memcmp(buf.get(),"RIFF",4)==0 && std::memcmp(buf.get()+8,"WEBP",4)==0) {
+        uint8_t* pixels=HiHorde::DecodeWebP(buf.get(),total,out.width,out.height);
+        if(!pixels){out.err="图片解码失败";return out;}
+        out.data.reset(pixels);out.size=size_t(out.width)*out.height*4;out.ok=true;return out;
     }
     out.ok = true;
     out.data = std::move(buf);
@@ -638,111 +693,27 @@ bool parse_asr_text(const std::string& body, std::string& text_out,
     return true;
 }
 
-bool parse_create_task(const std::string& body, std::string& task_id_out,
-                       std::string& err_out) {
-    cJSON* root = cJSON_Parse(body.c_str());
-    if (root == nullptr) {
-        err_out = I18n::T("生图响应解析失败");
-        return false;
+using TaskPollResult=HiHorde::Status;
+// Release queued remote work on exit, timeout, or failed retrieval.
+struct HordeTask {
+    std::string id;
+    bool completed=false;
+    ~HordeTask() {
+        if(!completed&&!id.empty())http_exchange("DELETE",HiHorde::Url("status",id),{},nullptr,true);
     }
-    cJSON* code = cJSON_GetObjectItemCaseSensitive(root, "code");
-    if (!cJSON_IsNumber(code) || code->valueint != 0) {
-        cJSON* msg = cJSON_GetObjectItemCaseSensitive(root, "msg");
-        err_out = (cJSON_IsString(msg) && msg->valuestring != nullptr)
-                      ? msg->valuestring
-                      : I18n::T("生图请求失败");
-        cJSON_Delete(root);
-        return false;
-    }
-    cJSON* data = cJSON_GetObjectItemCaseSensitive(root, "data");
-    cJSON* task_id =
-        cJSON_IsObject(data)
-            ? cJSON_GetObjectItemCaseSensitive(data, "taskId")
-            : nullptr;
-    if (!cJSON_IsString(task_id) || task_id->valuestring == nullptr ||
-        task_id->valuestring[0] == '\0') {
-        err_out = I18n::T("缺少 taskId");
-        cJSON_Delete(root);
-        return false;
-    }
-    task_id_out = task_id->valuestring;
-    cJSON_Delete(root);
-    return true;
-}
-
-struct TaskPollResult {
-    bool ok = false;
-    bool finished = false;
-    bool succeeded = false;
-    std::vector<std::string> image_urls;
-    std::string err;
 };
 
-TaskPollResult parse_task_status(const std::string& body) {
-    TaskPollResult out;
-    cJSON* root = cJSON_Parse(body.c_str());
-    if (root == nullptr) {
-        out.err = I18n::T("任务状态解析失败");
-        return out;
-    }
-    cJSON* code = cJSON_GetObjectItemCaseSensitive(root, "code");
-    if (!cJSON_IsNumber(code) || code->valueint != 0) {
-        cJSON* msg = cJSON_GetObjectItemCaseSensitive(root, "msg");
-        out.err = (cJSON_IsString(msg) && msg->valuestring != nullptr)
-                      ? msg->valuestring
-                      : I18n::T("查询任务失败");
-        cJSON_Delete(root);
-        return out;
-    }
-    cJSON* data = cJSON_GetObjectItemCaseSensitive(root, "data");
-    if (!cJSON_IsObject(data)) {
-        out.err = I18n::T("任务状态解析失败");
-        cJSON_Delete(root);
-        return out;
-    }
-    cJSON* finished = cJSON_GetObjectItemCaseSensitive(data, "finished");
-    out.finished = cJSON_IsTrue(finished);
-    cJSON* status = cJSON_GetObjectItemCaseSensitive(data, "taskStatus");
-    const char* st =
-        (cJSON_IsString(status) && status->valuestring != nullptr)
-            ? status->valuestring
-            : "";
-    out.succeeded = (std::strcmp(st, "SUCCEEDED") == 0);
-    if (std::strcmp(st, "FAILED") == 0) {
-        cJSON* message = cJSON_GetObjectItemCaseSensitive(data, "message");
-        out.err = (cJSON_IsString(message) && message->valuestring != nullptr)
-                      ? message->valuestring
-                      : I18n::T("生图失败");
-        cJSON_Delete(root);
-        return out;
-    }
-    cJSON* urls = cJSON_GetObjectItemCaseSensitive(data, "imageUrls");
-    if (cJSON_IsArray(urls)) {
-        const int n = cJSON_GetArraySize(urls);
-        for (int i = 0; i < n; ++i) {
-            cJSON* u = cJSON_GetArrayItem(urls, i);
-            if (cJSON_IsString(u) && u->valuestring != nullptr &&
-                u->valuestring[0] != '\0') {
-                out.image_urls.emplace_back(u->valuestring);
-            }
-        }
-    }
-    out.ok = true;
-    cJSON_Delete(root);
-    return out;
-}
-
-void apply_images_ui(uint32_t session,
+bool apply_images_ui(uint32_t session,
                      std::vector<BinaryDownload>& images) {
     if (!session_alive(session)) {
         images.clear();
-        return;
+        return false;
     }
     lv_lock();
     if (!session_alive(session) || !screen_alive() || s_gallery == nullptr) {
         lv_unlock();
         images.clear();
-        return;
+        return false;
     }
 
     clear_gallery_locked();
@@ -761,7 +732,9 @@ void apply_images_ui(uint32_t session,
          * raw buffer and leaving image_dsc()->data == nullptr.  We test
          * that and skip the bad entries instead. */
         {
-            auto holder = std::make_unique<LvglAllocatedImage>(raw, img.size);
+            auto holder = img.width>0
+                ?std::make_unique<LvglAllocatedImage>(raw,img.size,img.width,img.height,img.width*4,LV_COLOR_FORMAT_ARGB8888)
+                :std::make_unique<LvglAllocatedImage>(raw,img.size);
             if (holder && holder->image_dsc() && holder->image_dsc()->data != nullptr) {
                 decoded.push_back(std::move(holder));
             }
@@ -772,14 +745,14 @@ void apply_images_ui(uint32_t session,
 
     if (decoded.empty()) {
         lv_unlock();
-        return;
+        return false;
     }
 
     if (decoded.size() == 1) {
         make_image_card(s_gallery, decoded[0].get());
         s_image_holders = std::move(decoded);
         lv_unlock();
-        return;
+        return true;
     }
 
     lv_obj_t* tv = lv_tabview_create(s_gallery);
@@ -826,16 +799,24 @@ void apply_images_ui(uint32_t session,
 
     s_image_holders = std::move(decoded);
     lv_unlock();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 // Worker: record → ASR → text2image → poll → download
 // ---------------------------------------------------------------------------
-void worker_task(void* /*arg*/) {
-    const uint32_t session = s_session.load(std::memory_order_acquire);
+struct GenerationRequest {uint32_t session;std::string prompt;};
+void worker_task(void* arg) {
+    std::unique_ptr<GenerationRequest> request(static_cast<GenerationRequest*>(arg));
+    const uint32_t session=request->session;
+    std::string prompt=std::move(request->prompt);request.reset();
+    if(!session_alive(session)){clear_own_worker_handle();/* Returning through the pthread shim releases C++/capture guards. */return;}
     auto& app = Application::GetInstance();
     auto& as = app.GetAudioService();
 
+    if (prompt.empty()) {
+    const std::string asr_url=cloud_asr_url();
+    if(asr_url.empty()){finish_worker(session,I18n::T("请用文字输入描述"));return;}
     CapsBuffer buffer = alloc_caps(kMaxRecordBytes);
     if (!buffer) {
         buffer = alloc_caps(kMaxRecordBytes / 4);
@@ -843,28 +824,51 @@ void worker_task(void* /*arg*/) {
     if (!buffer) {
         ESP_LOGE(TAG, "no memory for record buffer");
         finish_worker(session, I18n::T("内存不足"));
-        vTaskDelete(nullptr);
+        /* Returning through the pthread shim releases C++/capture guards. */
         return;
     }
 
     size_t written = 0;
     std::vector<int16_t> frame;
     frame.reserve(kSamplesPerFrame * 2);
-    const int64_t start_us = esp_timer_get_time();
-    s_record_start_us.store(start_us);
+    int64_t start_us = 0;
 
     {
+        HiSpeech::CaptureOwner<AudioService> capture(as);
+        if(!capture.Ready()){
+            finish_worker(session,I18n::T("麦克风忙，请重试"));/* Returning through the pthread shim releases C++/capture guards. */return;
+        }
         WakeWordGuard wake_guard(as);
+        if(metalio_nt26_get_call_state()!=METALIO_CALL_IDLE){finish_worker(session,"通话中无法录音");return;}
+        Application::GetInstance().RequestVoiceUiDesired(false);
+        LocalMusicPlayer::Instance().Stop();RadioPlayer::Instance().Pause();MusicScreen::PauseForVoice();
+        for(int i=0;i<300&&!as.LocalPlaybackSettled()&&session_alive(session)&&!s_stop_requested;++i)usleep(10000);
+        if(!as.LocalPlaybackSettled()||!session_alive(session)||s_stop_requested){finish_worker(session,"请等待播放停止后重新长按");return;}
+        as.ResetDecoder();
+        for(int i=0;i<300&&!as.VoicePlaybackSettled()&&session_alive(session)&&!s_stop_requested;++i)usleep(10000);
+        if(!as.VoicePlaybackSettled()||!session_alive(session)||s_stop_requested){finish_worker(session,"请等待播报结束后重新长按");return;}
+        if(metalio_nt26_get_call_state()!=METALIO_CALL_IDLE||BluetoothScreen::PrepareVoiceRoute()<0||
+           metalio_audio_select_local()<0||metalio_nt26_call_control(3,BluetoothScreen::IsHeadsetConnected()?0:1)<0){
+            finish_worker(session,"麦克风通路未就绪，请重试");return;
+        }
+        as.GetCodec()->EnableInput(true);capture.Configure();
+        {std::vector<int16_t> settle;for(int i=0;i<2;++i)if(!as.ReadAudioData(settle,kSampleRate,kSamplesPerFrame)){finish_worker(session,"麦克风未就绪，请重试");return;}}
+        start_us=esp_timer_get_time();s_record_start_us.store(start_us);
+#if defined(HI_SERVICES_PROBE) && HI_SERVICES_PROBE
+        int channel_peak[2]={0,0};uint64_t channel_nonzero[2]={0,0};
+        printf("AI_AUDIO_ROUTE headset=%d sco=%d voice_ready=%d\n",BluetoothScreen::IsHeadsetConnected(),BluetoothScreen::IsHeadsetCaptureReady(),metalio_bt_voice_ready());
+        printf("AI_SPEECH_READY channels=%d\n",capture.Channels());fflush(stdout);
+#endif
         while (!s_stop_requested.load(std::memory_order_acquire) &&
                session_alive(session)) {
             if (!as.ReadAudioData(frame, kSampleRate, kSamplesPerFrame)) {
                 vTaskDelayMs(5);
                 continue;
             }
-            AudioService* as_svc = Board::GetInstance().GetAudioService();
-            (void)as_svc;
-            /* Original ESP-IDF checked codec->input_channels()==2 here and
-             * down-mixed to mono. NuttX AudioService captures mono already. */
+#if defined(HI_SERVICES_PROBE) && HI_SERVICES_PROBE
+            for(size_t i=0;i<frame.size();++i){const int ch=capture.Channels()==2?i%2:0;channel_peak[ch]=std::max(channel_peak[ch],std::abs(int(frame[i])));channel_nonzero[ch]+=frame[i]!=0;}
+#endif
+            if(!HiSpeech::MicOnly(frame,capture.Channels()))continue;
             const size_t bytes = frame.size() * sizeof(int16_t);
             if (written + bytes > kMaxRecordBytes) {
                 break;
@@ -876,21 +880,28 @@ void worker_task(void* /*arg*/) {
                 break;
             }
         }
+#if defined(HI_SERVICES_PROBE) && HI_SERVICES_PROBE
+        printf("AI_CAPTURE_CHANNELS peak0=%d peak1=%d nz0=%llu nz1=%llu wall_ms=%lld voice_ready=%d\n",channel_peak[0],channel_peak[1],(unsigned long long)channel_nonzero[0],(unsigned long long)channel_nonzero[1],(long long)((esp_timer_get_time()-start_us)/1000),metalio_bt_voice_ready());fflush(stdout);
+#endif
     }
 
     if (!session_alive(session)) {
         clear_own_worker_handle();
-        vTaskDelete(nullptr);
+        /* Returning through the pthread shim releases C++/capture guards. */
         return;
     }
 
-    const int duration_ms =
-        static_cast<int>((esp_timer_get_time() - start_us) / 1000);
+    const int duration_ms = static_cast<int>(written*1000/(kSampleRate*kBytesPerSample));
     if (duration_ms < kMinRecordMs || written < 1024) {
         finish_worker(session, I18n::T("录音太短，再试一次"));
-        vTaskDelete(nullptr);
+        /* Returning through the pthread shim releases C++/capture guards. */
         return;
     }
+    auto level=HiSpeech::Normalize(reinterpret_cast<int16_t*>(buffer.get()),written/2);
+#if defined(HI_SERVICES_PROBE) && HI_SERVICES_PROBE
+    printf("AI_SPEECH_PCM ms=%d peak=%d rms=%d gain=%.1f\n",duration_ms,level.peak,level.rms,double(level.gain));fflush(stdout);
+#endif
+    if(level.peak<80||level.rms<12){finish_worker(session,"声音过轻，请靠近麦克风重试");return;}
 
     set_state_ui(State::Busy, session);
     post_button_text(I18n::T("识别中…"), session);
@@ -903,30 +914,31 @@ void worker_task(void* /*arg*/) {
     wav_body.append(reinterpret_cast<const char*>(buffer.get()), written);
     buffer.reset();
 
-    HttpJsonResult asr = http_post_binary(api::Url(api::kXiaozhiAsrWav),
+    HttpJsonResult asr = http_post_binary(asr_url,
                                           std::move(wav_body),
                                           "application/octet-stream");
     if (!session_alive(session)) {
         clear_own_worker_handle();
-        vTaskDelete(nullptr);
+        /* Returning through the pthread shim releases C++/capture guards. */
         return;
     }
     if (!asr.ok) {
         std::string msg = std::string(I18n::T("识别失败: ")) + asr.err;
         finish_worker(session, msg.c_str());
-        vTaskDelete(nullptr);
+        /* Returning through the pthread shim releases C++/capture guards. */
         return;
     }
 
-    std::string prompt;
     std::string parse_err;
     if (!parse_asr_text(asr.body, prompt, parse_err)) {
         finish_worker(session, parse_err.c_str());
-        vTaskDelete(nullptr);
+        /* Returning through the pthread shim releases C++/capture guards. */
         return;
     }
     asr.body.clear();
     asr.body.shrink_to_fit();
+    }
+    std::string parse_err;
 
     int n = 1;
     lv_lock();
@@ -940,52 +952,31 @@ void worker_task(void* /*arg*/) {
     s_gen_start_us.store(esp_timer_get_time(), std::memory_order_release);
     post_button_text(I18n::T("生成中… 已用时 0 秒"), session);
 
-    cJSON* req = cJSON_CreateObject();
-    if (req == nullptr) {
-        finish_worker(session, I18n::T("内存不足"));
-        vTaskDelete(nullptr);
-        return;
+    std::string generation_prompt=prompt;
+    if(HiImagePrompt::Chinese(prompt)){
+        post_button_text("正在理解中文描述…",session);generation_prompt.clear();
+        for(const auto& part:HiImagePrompt::Chunks(prompt)){
+            if(!session_alive(session)){clear_own_worker_handle();return;}
+            auto response=http_exchange("GET","https://api.mymemory.translated.net/get?langpair=zh-CN%7Cen&mt=1&q="+HiImagePrompt::Escape(part),{},nullptr,false,true);
+            std::string english;if(!response.ok||!HiImagePrompt::Translation(response.body,english)){finish_worker(session,"中文描述暂时无法理解，请稍后重试");return;}
+            if(!generation_prompt.empty())generation_prompt+=" ";generation_prompt+=english;
+        }
+        post_button_text("生成中…",session);
     }
-    cJSON_AddStringToObject(req, "prompt", prompt.c_str());
-    cJSON_AddStringToObject(req, "negativePrompt", "");
-    cJSON_AddStringToObject(req, "size", "1280*1280");
-    cJSON_AddNumberToObject(req, "n", n);
-    cJSON_AddBoolToObject(req, "promptExtend", true);
-    cJSON_AddBoolToObject(req, "watermark", false);
-    char* req_raw = cJSON_PrintUnformatted(req);
-    cJSON_Delete(req);
-    if (req_raw == nullptr) {
-        finish_worker(session, I18n::T("内存不足"));
-        vTaskDelete(nullptr);
-        return;
-    }
-    std::string req_json(req_raw);
-    cJSON_free(req_raw);
-
-    HttpJsonResult create =
-        http_post_json(api::Url(api::kText2Image), std::move(req_json));
-    if (!session_alive(session)) {
-        clear_own_worker_handle();
-        vTaskDelete(nullptr);
-        return;
-    }
-    if (!create.ok) {
-        std::string msg = std::string(I18n::T("生图失败: ")) + create.err;
-        finish_worker(session, msg.c_str());
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    std::string task_id;
-    if (!parse_create_task(create.body, task_id, parse_err)) {
-        finish_worker(session, parse_err.c_str());
-        vTaskDelete(nullptr);
-        return;
-    }
-    create.body.clear();
-    create.body.shrink_to_fit();
-    ESP_LOGI(TAG, "text2image taskId=%s n=%d prompt=%s", task_id.c_str(), n,
-             prompt.c_str());
+    std::string req_json=HiHorde::Request(generation_prompt,n);
+    if(req_json.empty()){finish_worker(session,I18n::T("描述过长或内存不足"));return;}
+    if(!session_alive(session)){clear_own_worker_handle();return;}
+    HttpJsonResult create=http_exchange("POST",std::string(HiHorde::kBase)+"async",std::move(req_json),"application/json",true);
+    if(!create.ok){finish_worker(session,(std::string("生图失败: ")+create.err).c_str());return;}
+    HordeTask task;
+    if(!HiHorde::Created(create.body,task.id,parse_err)){finish_worker(session,parse_err.c_str());return;}
+    // Parse before the session check so a request accepted during navigation is cancelled.
+    if(!session_alive(session)){clear_own_worker_handle();return;}
+    create.body.clear();create.body.shrink_to_fit();
+    const std::string& task_id=task.id;
+#if defined(HI_SERVICES_PROBE) && HI_SERVICES_PROBE
+    printf("AI_IMAGE_TASK %s\n",task_id.c_str());fflush(stdout);
+#endif
 
     std::vector<std::string> image_urls;
     int http_fails = 0;
@@ -993,37 +984,42 @@ void worker_task(void* /*arg*/) {
     for (int attempt = 0; attempt < kMaxPollAttempts; ++attempt) {
         if (!session_alive(session)) {
             clear_own_worker_handle();
-            vTaskDelete(nullptr);
+            /* Returning through the pthread shim releases C++/capture guards. */
             return;
         }
         vTaskDelayMs(attempt == 0 ? kPollFirstDelayMs : kPollIntervalMs);
         if (!session_alive(session)) {
             clear_own_worker_handle();
-            vTaskDelete(nullptr);
+            /* Returning through the pthread shim releases C++/capture guards. */
             return;
         }
 
-        HttpJsonResult poll = http_get_json(api::Text2ImageTaskUrl(task_id));
+        HttpJsonResult poll = http_exchange("GET",HiHorde::Url("check",task_id),{},nullptr,true);
         if (!poll.ok) {
             ++http_fails;
             ESP_LOGW(TAG, "poll failed (%d): %s", http_fails, poll.err.c_str());
             if (http_fails >= kMaxPollHttpFails) {
                 finish_worker(session, I18n::T("查询任务失败"));
-                vTaskDelete(nullptr);
+                /* Returning through the pthread shim releases C++/capture guards. */
                 return;
             }
             continue;
         }
-        http_fails = 0;
-
-        TaskPollResult st = parse_task_status(poll.body);
+        TaskPollResult st = HiHorde::Parse(poll.body);
+        if(st.ok&&st.finished&&st.err.empty()) {
+            auto full=http_exchange("GET",HiHorde::Url("status",task_id),{},nullptr,true);
+            if(!full.ok){if(++http_fails>=kMaxPollHttpFails){finish_worker(session,full.err.c_str());return;}continue;}
+            st=HiHorde::Parse(full.body,true);
+        }
         if (!st.ok) {
             finish_worker(session,
                           st.err.empty() ? I18n::T("查询任务失败")
                                          : st.err.c_str());
-            vTaskDelete(nullptr);
+            /* Returning through the pthread shim releases C++/capture guards. */
             return;
         }
+        http_fails=0;
+        if(st.finished)task.completed=true;
         if (!st.image_urls.empty()) {
             image_urls = std::move(st.image_urls);
             got_images = true;
@@ -1032,14 +1028,14 @@ void worker_task(void* /*arg*/) {
         if (st.finished && !st.succeeded) {
             finish_worker(session,
                           st.err.empty() ? I18n::T("生图失败") : st.err.c_str());
-            vTaskDelete(nullptr);
+            /* Returning through the pthread shim releases C++/capture guards. */
             return;
         }
     }
 
     if (!got_images || image_urls.empty()) {
         finish_worker(session, I18n::T("生成超时，请重试"));
-        vTaskDelete(nullptr);
+        /* Returning through the pthread shim releases C++/capture guards. */
         return;
     }
 
@@ -1053,10 +1049,11 @@ void worker_task(void* /*arg*/) {
     for (size_t i = 0; i < image_urls.size(); ++i) {
         if (!session_alive(session)) {
             clear_own_worker_handle();
-            vTaskDelete(nullptr);
+            /* Returning through the pthread shim releases C++/capture guards. */
             return;
         }
         BinaryDownload dl = download_image(image_urls[i]);
+        if(!dl.ok&&session_alive(session)){vTaskDelayMs(500);dl=download_image(image_urls[i]);}
         if (dl.ok) {
             ++ok_count;
         } else {
@@ -1068,21 +1065,25 @@ void worker_task(void* /*arg*/) {
 
     if (ok_count == 0) {
         finish_worker(session, I18n::T("图片下载失败"));
-        vTaskDelete(nullptr);
+        /* Returning through the pthread shim releases C++/capture guards. */
         return;
     }
 
-    apply_images_ui(session, images);
+    if(!apply_images_ui(session, images)){finish_worker(session,I18n::T("图片解码失败"));return;}
     finish_worker(session);
-    vTaskDelete(nullptr);
+    /* Returning through the pthread shim releases C++/capture guards. */
 }
 
 // ---------------------------------------------------------------------------
 // Events / UI build
 // ---------------------------------------------------------------------------
 void on_record_pressed(lv_event_t* /*e*/) {
+    if(cloud_asr_url().empty()){if(s_state.load()==State::Idle)open_text_composer(nullptr);return;}
     if (s_state.load(std::memory_order_acquire) != State::Idle) {
         return;
+    }
+    if(metalio_nt26_get_call_state()!=METALIO_CALL_IDLE){
+        if(s_record_lbl)lv_label_set_text(s_record_lbl,"通话中无法录音");return;
     }
     auto& app = Application::GetInstance();
     const DeviceState ds = app.GetDeviceState();
@@ -1098,12 +1099,15 @@ void on_record_pressed(lv_event_t* /*e*/) {
     }
 
     s_stop_requested.store(false, std::memory_order_release);
+    s_record_start_us.store(0,std::memory_order_release);
     s_state.store(State::Recording, std::memory_order_release);
     update_button_ui_locked(State::Recording);
 
-    BaseType_t ok = xTaskCreate(worker_task, "ai_img_gen", 12288, nullptr, 5,
+    auto* request=new GenerationRequest{s_session.load(std::memory_order_acquire),{}};
+    BaseType_t ok = xTaskCreate(worker_task, "ai_img_gen", 32768, request, 5,
                                 &s_worker_task);
     if (ok != pdPASS) {
+        delete request;
         ESP_LOGE(TAG, "create worker failed");
         s_worker_task = 0;
         s_state.store(State::Idle, std::memory_order_release);
@@ -1114,6 +1118,50 @@ void on_record_pressed(lv_event_t* /*e*/) {
     }
 }
 
+lv_obj_t* s_text_sheet=nullptr;
+void close_text_composer() {
+    if(!s_text_sheet)return;
+    HiInputMethod_Suspend();auto* old=s_text_sheet;s_text_sheet=nullptr;
+    lv_obj_add_flag(old,LV_OBJ_FLAG_HIDDEN);lv_obj_delete_async(old);
+}
+void open_text_composer(lv_event_t*) {
+    if(s_state.load()!=State::Idle || s_worker_task)return;
+    if(s_text_sheet)return;
+    auto* sheet=lv_obj_create(s_screen);s_text_sheet=sheet;
+    screen_strip_obj_chrome(sheet);lv_obj_set_style_pad_all(sheet,0,0);
+    lv_obj_set_size(sheet,688,224);lv_obj_set_pos(sheet,16,kHeaderH+12);
+    lv_obj_remove_flag(sheet,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(sheet,lv_color_hex(kColorCard),0);
+    lv_obj_set_style_bg_opa(sheet,LV_OPA_COVER,0);
+    lv_obj_set_style_text_font(sheet,&font_puhui_20_4,0);
+    lv_obj_set_style_text_color(sheet,lv_color_hex(kColorText),0);screen_swipe_back_ignore(sheet,true);
+    auto* title=lv_label_create(sheet);lv_label_set_text(title,"文字生图");lv_obj_set_pos(title,16,10);
+    auto* field=lv_textarea_create(sheet);lv_obj_set_size(field,522,144);lv_obj_set_pos(field,14,58);
+    lv_textarea_set_max_length(field,512);lv_textarea_set_placeholder_text(field,"描述你想画的内容…");
+    lv_obj_set_style_text_font(field,&font_puhui_20_4,0);
+    lv_obj_set_style_bg_color(field,lv_color_hex(kColorBg),0);
+    lv_obj_set_style_text_color(field,lv_color_hex(kColorText),0);HiInputMethod_Bind(field,true);
+    auto* close=lv_button_create(sheet);lv_obj_set_size(close,96,42);lv_obj_set_pos(close,574,6);
+    auto* label=lv_label_create(close);lv_label_set_text(label,"关闭");lv_obj_center(label);
+    lv_obj_add_event_cb(close,[](lv_event_t*){close_text_composer();},LV_EVENT_CLICKED,nullptr);
+    auto* send=lv_button_create(sheet);lv_obj_set_size(send,116,144);lv_obj_set_pos(send,552,58);
+    label=lv_label_create(send);lv_label_set_text(label,"生成");lv_obj_center(label);
+    lv_obj_add_event_cb(send,[](lv_event_t* event){
+        auto* field=static_cast<lv_obj_t*>(lv_event_get_user_data(event));
+        if(!HiInputMethod_Flush(field))return;
+        std::string prompt=lv_textarea_get_text(field);
+        if(prompt.find_first_not_of(" \r\n\t")==std::string::npos || prompt.size()>2048)return;
+        if(s_state.load()!=State::Idle || s_worker_task)return;
+        auto* request=new GenerationRequest{s_session.load(std::memory_order_acquire),std::move(prompt)};
+        s_stop_requested=false;s_state=State::Busy;update_button_ui_locked(State::Busy);
+        if(xTaskCreate(worker_task,"ai_img_gen",32768,request,5,&s_worker_task)!=pdPASS){
+            delete request;s_worker_task=0;s_state=State::Idle;update_button_ui_locked(State::Idle);return;
+        }
+        close_text_composer();
+    },LV_EVENT_CLICKED,field);
+    HiInputMethod_Show(field,true);
+}
+
 void on_record_released(lv_event_t* /*e*/) {
     if (s_state.load() == State::Recording) {
         s_stop_requested.store(true);
@@ -1122,6 +1170,9 @@ void on_record_released(lv_event_t* /*e*/) {
 
 void on_swipe_back()
 {
+#if defined(HI_SERVICES_PROBE) && HI_SERVICES_PROBE
+    printf("AI_IMAGE_BACK_REQUEST\n");fflush(stdout);
+#endif
     HomeScreen::SwitchToHome();
 }
 
@@ -1129,20 +1180,20 @@ void on_back_clicked(lv_event_t* /*e*/) { on_swipe_back(); }
 
 void on_screen_unloaded(lv_event_t* e) {
     lv_obj_t* scr = lv_event_get_target_obj(e);
-    s_session.fetch_add(1, std::memory_order_acq_rel);
-    s_state.store(State::Closing, std::memory_order_release);
-    s_stop_requested.store(true, std::memory_order_release);
-
     // 若本屏已被更新的 Create() 替换，静态指针属于新实例，不能在这里清掉。
     if (scr != s_screen) {
         ESP_LOGI(TAG, "unload: stale screen instance ignored");
         return;
     }
+    s_session.fetch_add(1, std::memory_order_acq_rel);
+    s_state.store(State::Closing, std::memory_order_release);
+    s_stop_requested.store(true, std::memory_order_release);
 
     if (s_tick_timer != nullptr) {
         lv_timer_delete(s_tick_timer);
         s_tick_timer = nullptr;
     }
+    close_text_composer();
     clear_gallery_locked();
     s_screen = nullptr;
     s_prompt_lbl = nullptr;
@@ -1152,6 +1203,14 @@ void on_screen_unloaded(lv_event_t* e) {
     s_n_dd = nullptr;
 }
 
+void align_count_value(lv_obj_t* dd,lv_obj_t* label){
+    if(!dd||!label)return;char text[2]={char('1'+lv_dropdown_get_selected(dd)),0};lv_label_set_text(label,text);
+    lv_obj_update_layout(label);const auto* font=&font_puhui_20_4;lv_font_glyph_dsc_t glyph{};
+    if(!lv_font_get_glyph_dsc(font,&glyph,text[0],0)){lv_obj_center(label);return;}
+    const int dx=(lv_obj_get_width(label)-glyph.box_w)/2-glyph.ofs_x;
+    const int dy=(lv_obj_get_height(label)+glyph.box_h)/2-font->line_height+font->base_line+glyph.ofs_y;
+    lv_obj_align(label,LV_ALIGN_CENTER,dx,dy);
+}
 void on_dropdown_ready(lv_event_t* e) {
     lv_obj_t* dd = lv_event_get_target_obj(e);
     if (dd == nullptr) {
@@ -1164,6 +1223,7 @@ void on_dropdown_ready(lv_event_t* e) {
     lv_obj_set_style_bg_color(list, lv_color_hex(kColorCard), LV_PART_MAIN);
     lv_obj_set_style_text_color(list, lv_color_hex(kColorText), LV_PART_MAIN);
     lv_obj_set_style_text_font(list, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_set_style_text_opa(list,LV_OPA_COVER,LV_PART_MAIN);
     lv_obj_set_style_radius(list, 10, LV_PART_MAIN);
     lv_obj_set_style_max_height(list, 280, LV_PART_MAIN);
     screen_swipe_back_ignore(list, true);
@@ -1232,9 +1292,26 @@ void build_header(lv_obj_t* parent) {
     lv_obj_set_style_text_color(s_n_dd, lv_color_hex(kColorText),
                                 LV_PART_MAIN);
     lv_obj_set_style_text_font(s_n_dd, &font_puhui_20_4, LV_PART_MAIN);
-    lv_dropdown_set_symbol(s_n_dd, LV_SYMBOL_DOWN);
+    lv_obj_set_style_text_align(s_n_dd,LV_TEXT_ALIGN_CENTER,LV_PART_MAIN);
+    lv_obj_set_style_pad_left(s_n_dd,12,LV_PART_MAIN);
+    lv_obj_set_style_pad_right(s_n_dd,12,LV_PART_MAIN);
+    lv_obj_set_style_pad_column(s_n_dd,0,LV_PART_MAIN);
+    lv_dropdown_set_symbol(s_n_dd, nullptr);
+    static const lv_point_precise_t arrow_points[]={{0,0},{7,7},{14,0}};
+    auto* arrow=lv_line_create(s_n_dd);lv_line_set_points(arrow,arrow_points,3);
+    lv_obj_set_style_line_width(arrow,3,0);lv_obj_set_style_line_color(arrow,lv_color_hex(kColorText),0);
+    lv_obj_align(arrow,LV_ALIGN_RIGHT_MID,-4,0);screen_make_input_passive(arrow);
+    lv_obj_set_style_text_font(s_n_dd, &font_awesome_20_4, LV_PART_INDICATOR);
     lv_dropdown_set_options(s_n_dd, "1\n2\n3\n4");
     lv_dropdown_set_selected(s_n_dd, 0);
+    // Centre the visible digit bounds; the dropdown's font baseline otherwise
+    // leaves numerals lower than the frame's optical centre.
+    lv_obj_set_style_text_opa(s_n_dd,LV_OPA_TRANSP,LV_PART_MAIN);
+    auto* value=lv_label_create(s_n_dd);lv_obj_remove_style_all(value);
+    lv_obj_set_style_text_font(value,&font_puhui_20_4,0);lv_obj_set_style_text_color(value,lv_color_hex(kColorText),0);
+    lv_obj_set_style_text_opa(value,LV_OPA_COVER,0);screen_make_input_passive(value);
+    lv_obj_set_user_data(s_n_dd,value);align_count_value(s_n_dd,value);
+    lv_obj_add_event_cb(s_n_dd,[](lv_event_t* e){align_count_value(lv_event_get_target_obj(e),static_cast<lv_obj_t*>(lv_event_get_user_data(e)));},LV_EVENT_VALUE_CHANGED,value);
     lv_obj_add_event_cb(s_n_dd, on_dropdown_ready, LV_EVENT_READY, nullptr);
     screen_swipe_back_ignore(s_n_dd, true);
 }
@@ -1262,7 +1339,9 @@ void build_body(lv_obj_t* parent) {
     lv_obj_set_style_text_color(s_prompt_lbl, lv_color_hex(kColorPromptText),
                                 LV_PART_MAIN);
     set_prompt_locked("");
-    screen_make_input_passive(s_prompt_lbl);
+    lv_obj_add_flag(s_prompt_lbl,LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_prompt_lbl,open_text_composer,LV_EVENT_CLICKED,nullptr);
+    screen_swipe_back_ignore(s_prompt_lbl,true);
 
     s_gallery = lv_obj_create(body);
     screen_strip_obj_chrome(s_gallery);
@@ -1298,7 +1377,7 @@ void build_footer(lv_obj_t* parent) {
                               LV_PART_MAIN | LV_STATE_PRESSED);
 
     s_record_lbl = lv_label_create(s_record_btn);
-    lv_label_set_text(s_record_lbl, I18n::T("按住说话"));
+    lv_label_set_text(s_record_lbl, I18n::T(idle_button_text()));
     lv_obj_set_style_text_color(s_record_lbl, lv_color_hex(0xFFFFFF),
                                 LV_PART_MAIN);
     lv_obj_set_style_text_font(s_record_lbl, &font_puhui_20_4, LV_PART_MAIN);
@@ -1309,6 +1388,13 @@ void build_footer(lv_obj_t* parent) {
     lv_obj_add_event_cb(s_record_btn, on_record_released, LV_EVENT_RELEASED,
                         nullptr);
     screen_swipe_back_ignore(s_record_btn, true);
+    auto* text_btn=lv_button_create(footer);lv_obj_set_size(text_btn,112,kBtnH);
+    lv_obj_align(text_btn,LV_ALIGN_RIGHT_MID,-24,0);
+    lv_obj_set_style_bg_color(text_btn,lv_color_hex(kColorCard),0);
+    lv_obj_set_style_text_font(text_btn,&font_puhui_20_4,0);
+    auto* text_lbl=lv_label_create(text_btn);lv_label_set_text(text_lbl,"文字");lv_obj_center(text_lbl);
+    lv_obj_add_event_cb(text_btn,open_text_composer,LV_EVENT_CLICKED,nullptr);
+    screen_swipe_back_ignore(text_btn,true);
 }
 
 }  // namespace
@@ -1345,6 +1431,30 @@ lv_obj_t* AiImageGenScreen::Create() {
     root_ = CreateStatic();
     return root_;
 }
+
+#if defined(HI_SERVICES_PROBE) && HI_SERVICES_PROBE
+extern "C" bool hi_image_probe_count_centered(){
+    if(!s_n_dd)return false;auto* value=static_cast<lv_obj_t*>(lv_obj_get_user_data(s_n_dd));if(!value)return false;
+    const auto previous=lv_dropdown_get_selected(s_n_dd);bool ok=true;
+    for(unsigned i=0;i<4;++i){lv_dropdown_set_selected(s_n_dd,i);lv_obj_send_event(s_n_dd,LV_EVENT_VALUE_CHANGED,nullptr);lv_obj_update_layout(s_n_dd);
+        lv_area_t box,label;lv_obj_get_coords(s_n_dd,&box);lv_obj_get_coords(value,&label);lv_font_glyph_dsc_t g{};
+        if(!lv_font_get_glyph_dsc(&font_puhui_20_4,&g,'1'+i,0)){ok=false;continue;}
+        const int x1=label.x1+g.ofs_x,y1=label.y1+font_puhui_20_4.line_height-font_puhui_20_4.base_line-g.box_h-g.ofs_y;
+        const int dx=2*x1+g.box_w-1-box.x1-box.x2,dy=2*y1+g.box_h-1-box.y1-box.y2;
+        printf("IMAGE_COUNT_INK value=%u dx2=%d dy2=%d\n",i+1,dx,dy);fflush(stdout);ok=ok&&std::abs(dx)<=2&&std::abs(dy)<=2;
+    }lv_dropdown_set_selected(s_n_dd,previous);lv_obj_send_event(s_n_dd,LV_EVENT_VALUE_CHANGED,nullptr);return ok;
+}
+extern "C" bool hi_image_probe_record_ready(){return s_record_start_us.load()>0&&s_state.load()==State::Recording;}
+extern "C" const char* hi_image_probe_prompt(){return s_prompt_lbl?lv_label_get_text(s_prompt_lbl):"";}
+extern "C" int hi_image_probe_status() {
+    if(!s_screen||lv_screen_active()!=s_screen)return -1;
+    if(s_state.load()==State::Busy)return 1;
+    return s_image_holders.empty()?0:2;
+}
+extern "C" const char* hi_image_probe_text() {
+    return s_record_lbl?lv_label_get_text(s_record_lbl):"no image page";
+}
+#endif
 
 void AiImageGenScreen::LifecycleCallback(screen_lifecycle_event_t event) {
     if (event == SCREEN_LIFECYCLE_LOAD) {

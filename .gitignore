@@ -1,0 +1,56 @@
+# ============================================================
+# HiOS / Metalio Claw4 contest repo — ignore workspace & junk
+# 注意：logs/ 下的 AI Coding 日志必须提交，绝不能忽略！
+# ============================================================
+
+# --- openvela 编译工作区（不属于交付物，由 manifest linkfile 映射） ---
+/nuttx/
+/apps/
+/build/
+/third_party/
+/external_apps/
+
+# --- vendor/ 顶层为工作区脚手架；交付物只有 vendor/metalio/ ---
+/vendor/.gitignore
+/vendor/CMakeLists.txt
+/vendor/Kconfig
+/vendor/LICENSE
+/vendor/Make.defs
+/vendor/Makefile
+
+# --- openvela 上游文档（交付文档在 docs/porting/ 与根目录新增 md） ---
+/docs/en/
+/docs/zh-cn/
+/docs/images/
+/docs/.gitee/
+/docs/.github/
+/docs/.vscode/
+/docs/.markdownlint.json
+/docs/CONTRIBUTING.md
+/docs/CONTRIBUTING_zh-cn.md
+/docs/DOC_README.md
+/docs/DOC_README_zh-cn.md
+/docs/LICENSE
+/docs/README.md
+/docs/README_zh-cn.md
+/docs/Third_Party_and_Open_Source_Components.md
+/docs/Third_Party_and_Open_Source_Components_zh-cn.md
+
+# --- 本地 IDE / 临时文件 ---
+/.vscode/
+.tmp_*
+/quickapp/
+
+# --- 参考资料与外挂资产（保留在磁盘，不入库） ---
+/*.pdf
+/副屏-secondary_screen/
+/小白助手/
+/cloud_expressions/
+/HiOS-nanoMuse-部署/
+
+# --- 源码树内的构建产物兜底（app/ 预编译 .a 需要保留，勿全局忽略 *.a） ---
+/app/**/*.o
+/app/**/*.depend
+/app/**/Make.dep
+/app/**/.built
+/app/**/_archives/

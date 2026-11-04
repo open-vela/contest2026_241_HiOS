@@ -1,0 +1,5 @@
+// Prefer the maintained app source over a stale copied uClibc++ export.
+#ifndef HIOS_CURRENT_THREAD_OVERLAY_H
+#define HIOS_CURRENT_THREAD_OVERLAY_H
+#include "../../cxx11_support/thread"
+#endif

@@ -15,6 +15,7 @@
  */
 
 #include <lvgl.h>
+#include "src/draw/lv_image_decoder_private.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -124,6 +125,8 @@ static lv_fs_res_t icon_fs_tell(lv_fs_drv_t *drv, void *file_p, uint32_t *pos_p)
 
 void lvgl_assets_fs_init(void)
 {
+    extern void lv_sjpg_init(void);
+    lv_sjpg_init();
     static lv_fs_drv_t drv;
 
     lv_fs_drv_init(&drv);
@@ -137,4 +140,25 @@ void lvgl_assets_fs_init(void)
     drv.tell_cb    = icon_fs_tell;
 
     lv_fs_drv_register(&drv);
+
+    /* Fail visibly during bring-up if either the PNG decoder or embedded
+     * asset path is unavailable. This probes the same file path used by all
+     * launcher and app icons. */
+    lv_image_header_t header = {0};
+    const lv_result_t probe = lv_image_decoder_get_info(
+        "A:ic_app_home_theme1_chat.spng", &header);
+    printf("ASSET_PNG_HEADER=%s %ux%u\n",
+           probe == LV_RESULT_OK && header.w && header.h ? "OK" : "FAIL",
+           (unsigned)header.w, (unsigned)header.h);
+    if (probe == LV_RESULT_OK && header.w && header.h) {
+        lv_image_decoder_dsc_t decoded;
+        lv_image_decoder_args_t args = {0};
+        args.no_cache = true;
+        lv_result_t opened = lv_image_decoder_open(
+            &decoded, "A:ic_app_home_theme1_chat.spng", &args);
+        printf("ASSET_PNG_DECODE=%s\n",
+               opened == LV_RESULT_OK && decoded.decoded ? "OK" : "FAIL");
+        if (opened == LV_RESULT_OK) lv_image_decoder_close(&decoded);
+    }
+    fflush(stdout);
 }

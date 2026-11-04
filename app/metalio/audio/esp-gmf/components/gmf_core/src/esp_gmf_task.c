@@ -312,17 +312,7 @@ static inline int __process_func(esp_gmf_task_handle_t handle, void *para)
             GMF_TASK_SET_STATE_BITS(tsk->event_group, GMF_TASK_RESUME_BIT);
         }
         ESP_LOGV(TAG, "Running, job:%p, ctx:%p, working:%p", worker->func, worker->ctx, tsk->working);
-        {
-            char dbg[96];
-            int n = snprintf(dbg, sizeof(dbg), "JOB_RUN %s\n", worker->label ? worker->label : "(null)");
-            if (n > 0) write(1, dbg, (size_t)n);
-        }
         worker->ret = worker->func(worker->ctx, NULL);
-        {
-            char dbg[96];
-            int n = snprintf(dbg, sizeof(dbg), "JOB_RET %s ret=%d\n", worker->label ? worker->label : "(null)", worker->ret);
-            if (n > 0) write(1, dbg, (size_t)n);
-        }
         ESP_LOGV(TAG, "Job ret:%d, [tsk:%s-%p:%p-%p-%s]", worker->ret, OBJ_GET_TAG((esp_gmf_obj_handle_t)tsk), tsk, worker, worker->ctx, worker->label);
         if (worker->ret == ESP_GMF_JOB_ERR_CONTINUE) {
             if (__gmf_task_handle_user_action(tsk, worker) == GMF_TASK_STRATEGY_ACTION_STOP) {

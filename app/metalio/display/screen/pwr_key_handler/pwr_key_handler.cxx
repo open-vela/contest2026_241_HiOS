@@ -16,12 +16,21 @@
 #include "pwr_key_handler.h"
 
 #include <cstring>
+#include <ctime>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <pthread.h>
+
+#include <nuttx/timers/pwm.h>
 
 #include "esp_log_shim.h"
 #include "lvgl.h"
 #include "home_screen/home_screen.h"
 #include "standby_screen/standby_screen.h"
 #include "application.h"
+#include "system_chrome/control_center.h"   /* PulseVibrateAsync */
+#include "idle_power_policy/idle_power_policy.h"
 
 #include <metalio/metalio.h>   /* metalio_pwr_key_init */
 
@@ -88,30 +97,14 @@ void OnLongPress();
 
 void OnShortPress()
 {
+    IdlePower_NotifyActivity();
     const char *screen = PwrKey_ActiveScreen();
     ESP_LOGI(TAG, "short-press on screen=%s (depth=%d)", screen, s_depth);
 
-    // TODO(openvela): handle USB extend screen running check.
-
-    if (std::strcmp(screen, kHomeScreen) == 0) {
-        ESP_LOGI(TAG, "dispatch: enter standby_screen");
-        lv_async_call(OnEnterStandbyAsync, nullptr);
-        return;
-    }
-
-    if (std::strcmp(screen, "standby") == 0) {
-        ESP_LOGI(TAG, "dispatch: leave standby -> home");
-        lv_async_call(OnLeaveStandbyAsync, nullptr);
-        return;
-    }
-
-    if (IsChatToggleScreen(screen)) {
-        ESP_LOGI(TAG, "dispatch: ToggleChatState()");
-        Application::GetInstance().ToggleChatState();
-        return;
-    }
-
-    ESP_LOGI(TAG, "dispatch: no-op (screen has no short-press action)");
+    if (std::strcmp(screen, "standby") == 0)
+        StandbyScreen::ReturnHome();
+    else
+        StandbyScreen::Show();
 }
 
 void OnLongPressAsync(void * /*arg*/)
@@ -121,6 +114,7 @@ void OnLongPressAsync(void * /*arg*/)
 
 void OnLongPress()
 {
+    IdlePower_NotifyActivity();
     const char *screen = PwrKey_ActiveScreen();
     ESP_LOGI(TAG, "long-press %ums on screen=%s -> power dialog",
              static_cast<unsigned>(kLongPressMs), screen);
@@ -135,12 +129,50 @@ void OnLongPress()
  * (which itself only posts lv_async_call, never blocks). */
 extern "C" void metalio_pwr_key_short_press_cb(void)
 {
-    OnShortPress();
+    lv_lock();
+    lv_async_call([](void *) { OnShortPress(); }, nullptr);
+    lv_unlock();
 }
 
 extern "C" void metalio_pwr_key_long_press_cb(void)
 {
-    OnLongPress();
+    lv_lock();
+    lv_async_call([](void *) { OnLongPress(); }, nullptr);
+    lv_unlock();
+}
+
+extern "C" void metalio_pwr_key_press_cb(void)
+{
+    /* Lock (home → standby) and unlock (standby → home) stay silent.
+     * The press edge is the only haptic on this key, and it fires before
+     * short vs long is known, so both of those screens skip the motor. */
+    const char *screen = PwrKey_ActiveScreen();
+    if (std::strcmp(screen, kHomeScreen) == 0 ||
+        std::strcmp(screen, "standby") == 0) {
+        return;
+    }
+
+    /* Board already pulses once at power-on. Suppress press-edge haptic
+     * for a short boot window so a held/bouncing PWR_KEY cannot fire a
+     * second motor buzz while the boot guide is coming up. */
+    static bool s_boot_gate = true;
+    static int64_t s_gate_start_ms = 0;
+    if (s_boot_gate) {
+        struct timespec ts {};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const int64_t now_ms =
+            static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+        if (s_gate_start_ms == 0) {
+            s_gate_start_ms = now_ms;
+        }
+        if (now_ms - s_gate_start_ms < 800) {
+            return;
+        }
+        s_boot_gate = false;
+    }
+    /* 80 ms short pulse — start the motor synchronously so the buzz is felt
+     * the instant the key edge is detected (no thread-spawn latency). */
+    PulseVibrateInstant(80 * 1000);
 }
 
 void PwrKey_Init()
@@ -150,7 +182,8 @@ void PwrKey_Init()
     }
 
     int ret = metalio_pwr_key_init(metalio_pwr_key_short_press_cb,
-                                   metalio_pwr_key_long_press_cb);
+                                   metalio_pwr_key_long_press_cb,
+                                   metalio_pwr_key_press_cb);
     if (ret != 0) {
         ESP_LOGW(TAG, "PwrKey_Init: metalio_pwr_key_init failed: %d", ret);
         return;

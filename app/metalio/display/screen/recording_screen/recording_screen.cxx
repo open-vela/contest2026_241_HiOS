@@ -1,3 +1,4 @@
+#include "hi_task_policy.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -17,11 +18,7 @@
  *   - esp_lv_adapter_lock(-1) / esp_lv_adapter_unlock() → lv_lock() /
  *     lv_unlock() (LVGL v9 native lock API; the openvela LVGL adapter
  *     routes these to the same mutex the ESP-IDF adapter used).
- *   - ASR HTTP upload / query endpoints are stubbed behind a small
- *     RecordingHttpBackend interface so the UI flow can be exercised
- *     end-to-end without a real cloud. The default
- *     StubRecordingHttpBackend returns failure (matches the original
- *     "上传失败" path).
+ *   - ASR uses the NuttX HTTP client with bounded, streaming uploads.
  *
  * Preserved verbatim:
  *   - Full LVGL widget tree: header (back + title), tabview (录音/列表),
@@ -51,10 +48,14 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cerrno>
+#include <fcntl.h>
+#include <pthread.h>
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -62,13 +63,20 @@
 
 #include "application.h"
 #include "api_endpoints.h"
+#include "ota.h"
 #include "audio_codec.h"
 #include "audio_service.h"
+#include "hi_music_screen/local_music_player.h"
+#include "radio_screen/radio_player.h"
+#include "music_screen/music_screen.h"
+#include "bluetooth_screen/bluetooth_screen.h"
+#include <sched.h>
 #include "board_shim.h"
 #include "home_screen/home_screen.h"
 #include "system_info.h"
 #include "wifi_required_dialog.h"
 #include "SdCardManager.hpp"
+#include <metalio/metalio.h>
 
 #include "cJSON_compat.h"
 
@@ -152,6 +160,8 @@ struct UiState {
 UiState s_ui;
 bool s_screen_alive = false;
 bool s_sd_ready = false;
+uint32_t s_screen_generation = 0;
+uint32_t s_record_generation = 0;
 bool s_detail_open = false;
 int s_detail_idx = -1;
 
@@ -162,8 +172,8 @@ std::atomic<bool> s_stop_asr{false};
 std::atomic<int64_t> s_record_start_us{0};
 std::atomic<uint32_t> s_recorded_frames{0};
 
-TaskHandle_t s_record_task = 0;
-TaskHandle_t s_play_task = 0;
+std::atomic<TaskHandle_t> s_record_task{0};
+std::atomic<TaskHandle_t> s_play_task{0};
 TaskHandle_t s_asr_task = 0;        // 上传转写
 TaskHandle_t s_asr_query_task = 0;  // 查询转写结果
 TaskHandle_t s_meta_task = 0;
@@ -182,23 +192,28 @@ struct FileEntry {
     size_t size_bytes = 0;
     RecFormat format = RecFormat::Opus;
     bool duration_ready = false;  // sidecar / WAV 尺寸已就绪；否则后台补算
+    time_t modified = 0;
 };
 
 std::vector<FileEntry> s_files;
+// Workers own hardware/files; only the LVGL timer owns UI state transitions.
+// Completion is published after every resource is released, including failures.
+struct WorkerUpdates {
+    std::mutex lock;
+    std::string record_status,play_status;
+    bool record_done=false,play_done=false,record_ok=false;
+    uint32_t samples=0,record_generation=0,play_generation=0;
+    bool files_ready=false;uint32_t files_generation=0;std::vector<FileEntry> files;
+};
+WorkerUpdates s_updates;
+lv_timer_t *s_worker_ui_timer=nullptr;
+uint32_t s_play_generation=0;
+bool s_record_after_play=false;
+bool s_scan_busy=false,s_refresh_again=false,s_fill_durations=true;
+
 
 // ---------------------------------------------------------------------------
-// HTTP backend stub
-//
-// The original RecordingScreen used Board::GetInstance().GetNetwork()-
-// >CreateHttp(0) (an esp_http_client wrapper) for two endpoints:
-//   1. POST /api/v1/asr/transcribe — multipart upload of the .opus file.
-//   2. GET  /api/v1/asr/audio-records?originalName=<name> — poll the
-//      transcription result.
-// On openvela the network/http stack is not yet wired through Board, so we
-// stub both calls. The default StubRecordingHttpBackend returns failure
-// (false / empty body), which drives the existing "上传失败" / "转写失败"
-// UI paths. When the network_service OpenClawClient grows ASR support,
-// replace g_recording_http with a real implementation.
+// Reference ASR endpoints over the board's socket/TLS client.
 // ---------------------------------------------------------------------------
 struct AsrUploadResponse {
     bool ok = false;
@@ -220,22 +235,49 @@ public:
     virtual AsrQueryResponse QueryAudioRecords(const char *filename) = 0;
 };
 
-class StubRecordingHttpBackend : public RecordingHttpBackend {
+class SocketRecordingHttpBackend : public RecordingHttpBackend {
+    static bool ReadResponse(Http &http, std::string &body) {
+        char chunk[1024];
+        for (;;) {
+            int n = http.Read(chunk, sizeof(chunk));
+            if (n < 0) return false;
+            if (n == 0) return true;
+            if (body.size() + static_cast<size_t>(n) > 256 * 1024) return false;
+            body.append(chunk, n);
+        }
+    }
+    static void Headers(Http &http) {
+        http.SetHeader("Accept", "*/*");
+        http.SetHeader("X-Device-Id", SystemInfo::GetMacAddress());
+    }
 public:
-    AsrUploadResponse UploadTranscribe(const char * /*path*/,
-                                      const char * /*filename*/) override {
+    AsrUploadResponse UploadTranscribe(const char *path, const char *filename) override {
         AsrUploadResponse r;
-        r.ok = false;
-        r.status = 0;
-        // TODO(openvela): wire through NetworkService / OpenClawClient
-        // once the ASR endpoints are exposed.
-        r.body = "network stack not yet wired";
+        if (!path || !filename) return r;
+        std::string name(filename);
+        // File names form a quoted MIME parameter, never raw header text.
+        for (char &c : name) if (c == '\r' || c == '\n' || c == '"' || c == '\\') c = '_';
+        const std::string boundary = "----XingzhiAsrBoundary";
+        const std::string prefix = "--" + boundary +
+            "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + name +
+            "\"\r\nContent-Type: application/octet-stream\r\n\r\n";
+        Http http;
+        Headers(http);
+        http.SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+        http.SetContentFile(path, prefix, "\r\n--" + boundary + "--\r\n");
+        if (!http.Open("POST", api::Url(api::kAsrTranscribe))) return r;
+        r.status = http.GetStatusCode();
+        r.ok = ReadResponse(http, r.body);
         return r;
     }
-    AsrQueryResponse QueryAudioRecords(const char * /*filename*/) override {
+    AsrQueryResponse QueryAudioRecords(const char *filename) override {
         AsrQueryResponse r;
-        r.ok = false;
-        r.status = 0;
+        if (!filename || !*filename) return r;
+        Http http;
+        Headers(http);
+        if (!http.Open("GET", api::AsrAudioRecordsUrl(filename))) return r;
+        r.status = http.GetStatusCode();
+        r.ok = ReadResponse(http, r.body);
         return r;
     }
 };
@@ -244,8 +286,8 @@ RecordingHttpBackend *g_recording_http = nullptr;
 
 RecordingHttpBackend *GetRecordingHttp() {
     if (g_recording_http == nullptr) {
-        static StubRecordingHttpBackend s_stub;
-        g_recording_http = &s_stub;
+        static SocketRecordingHttpBackend s_http;
+        g_recording_http = &s_http;
     }
     return g_recording_http;
 }
@@ -266,6 +308,7 @@ void UpdateRecordButtonUi();
 void UpdateTimerLabel();
 void RebuildFileList();
 void RebuildFileList(bool schedule_fill);
+void RenderFileList(bool schedule_fill);
 void StopPlayback();
 void ForceStopAll();
 void ShowDetail(int idx);
@@ -310,7 +353,9 @@ bool EnsureRecordingsDir() {
     if (mkdir(kPosixDir, 0755) == 0) {
         return true;
     }
-    ESP_LOGE(TAG, "mkdir(%s) failed", kPosixDir);
+    const int error = errno;
+    if (error == EEXIST && stat(kPosixDir, &st) == 0 && S_ISDIR(st.st_mode)) return true;
+    ESP_LOGE(TAG, "mkdir(%s) failed errno=%d", kPosixDir, error);
     return false;
 }
 
@@ -449,6 +494,22 @@ void KeepLeftChannelOnly(std::vector<int16_t> &samples) {
     samples.resize(mono_count);
 }
 
+// A stateful DC/rumble filter, with no automatic gain on quiet recordings.
+// Kept inside the recording path; never changes shared codec/I2S settings.
+class RecordingPcmFilter {
+public:
+    void Apply(std::vector<int16_t> &pcm) {
+        for (auto &sample : pcm) {
+            const int32_t x=sample;
+            y_=x-x_+static_cast<int32_t>(static_cast<int64_t>(y_)*31900/32768);
+            x_=x;
+            sample=static_cast<int16_t>(std::max(-30000,std::min(30000,static_cast<int>(y_))));
+        }
+    }
+private:
+    int32_t x_=0,y_=0;
+};
+
 void DisableWakeWordIfNeeded() {
     auto &as = Application::GetInstance().GetAudioService();
     if (!as.IsWakeWordRunning()) {
@@ -532,29 +593,9 @@ void SetDetailResultText(const char *text) {
 }
 
 void PostPlayStatusFromWorker(const char *text) {
-    if (text == nullptr) {
-        return;
-    }
-    auto *copy = static_cast<char *>(HeapMalloc(std::strlen(text) + 1));
-    if (copy == nullptr) {
-        return;
-    }
-    std::strcpy(copy, text);
-    if (LvglLock() != ESP_OK) {
-        HeapFree(copy);
-        return;
-    }
-    if (s_screen_alive) {
-        if (s_detail_open) {
-            SetDetailStatusText(copy);
-            UpdateDetailPlayButton();
-        } else {
-            SetListStatusText(copy);
-        }
-        UpdateRecordButtonUi();
-    }
-    LvglUnlock();
-    HeapFree(copy);
+    if(!text)return;
+    std::lock_guard<std::mutex> lock(s_updates.lock);
+    s_updates.play_status=text;s_updates.play_generation=s_play_generation;
 }
 
 void PostDetailStatusFromWorker(const char *text) {
@@ -570,7 +611,7 @@ void PostDetailStatusFromWorker(const char *text) {
         HeapFree(copy);
         return;
     }
-    if (s_screen_alive && s_detail_open) {
+    if (s_screen_alive && s_detail_open && !s_stop_asr.load()) {
         SetDetailStatusText(copy);
     }
     LvglUnlock();
@@ -590,7 +631,7 @@ void PostDetailResultFromWorker(const char *text) {
         HeapFree(copy);
         return;
     }
-    if (s_screen_alive && s_detail_open) {
+    if (s_screen_alive && s_detail_open && !s_stop_asr.load()) {
         SetDetailResultText(copy);
     }
     LvglUnlock();
@@ -598,27 +639,9 @@ void PostDetailResultFromWorker(const char *text) {
 }
 
 void PostStatusFromWorker(bool to_list_tab, const char *text) {
-    if (text == nullptr) {
-        return;
-    }
-    auto *copy = static_cast<char *>(HeapMalloc(std::strlen(text) + 1));
-    if (copy == nullptr) {
-        return;
-    }
-    std::strcpy(copy, text);
-    if (LvglLock() != ESP_OK) {
-        HeapFree(copy);
-        return;
-    }
-    if (s_screen_alive) {
-        if (to_list_tab) {
-            SetListStatusText(copy);
-        } else {
-            SetRecordStatusText(copy);
-        }
-    }
-    LvglUnlock();
-    HeapFree(copy);
+    (void)to_list_tab;if(!text)return;
+    std::lock_guard<std::mutex> lock(s_updates.lock);
+    s_updates.record_status=text;s_updates.record_generation=s_record_generation;
 }
 
 void UpdateTimerLabel() {
@@ -627,17 +650,13 @@ void UpdateTimerLabel() {
     }
     int sec = 0;
     if (s_state.load() == RecState::Recording) {
-        const int64_t start = s_record_start_us.load();
-        if (start > 0) {
-            sec = static_cast<int>((esp_timer_get_time() - start) / 1000000LL);
-        }
-    } else if (s_recorded_frames.load() > 0 && s_state.load() == RecState::Idle) {
-        // 保留结束时写好的最终时长
-        return;
+        // The timer follows captured samples, not delayed UI ticks.
+        sec = static_cast<int>(s_recorded_frames.load() * kFrameDurationMs / 1000);
     }
     char buf[16];
     FormatTimer(buf, sizeof(buf), sec);
-    lv_label_set_text(s_ui.timer_lbl, buf);
+    if (std::strcmp(lv_label_get_text(s_ui.timer_lbl), buf) != 0)
+        lv_label_set_text(s_ui.timer_lbl, buf);
 }
 
 void OnTickTimer(lv_timer_t * /*t*/) {
@@ -684,7 +703,7 @@ void UpdateRecordButtonUi() {
     case RecState::Playing:
         lv_obj_set_style_bg_color(s_ui.record_btn, lv_color_hex(kColorRecord), LV_PART_MAIN);
         lv_label_set_text(s_ui.record_btn_lbl, I18n::T("开始录音"));
-        lv_obj_remove_flag(s_ui.record_btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(s_ui.record_btn, LV_OBJ_FLAG_CLICKABLE);
         break;
     }
 }
@@ -714,161 +733,150 @@ void MakeNextRecordPath(char *path, size_t path_size) {
     std::snprintf(path, path_size, "%s/REC_%s_%lu.opus", kPosixDir, serial, ts_ms);
 }
 
-void RecordTask(void * /*arg*/) {
-    auto &as = Application::GetInstance().GetAudioService();
-    char path[192] = {};
-    FILE *file = nullptr;
-    uint32_t frames = 0;
-    uint32_t page_seq = 0;
-    bool ok = false;
-    bool hit_max = false;
-    std::unique_ptr<OpusEncoderWrapper> encoder;
-
-    DisableWakeWordIfNeeded();
-    as.ResetDecoder();
-
-    if (!EnsureRecordingsDir()) {
-        PostStatusFromWorker(false, I18n::T("无法创建录音目录"));
-        goto done;
+// Fixed allocation ring: the microphone reader never encodes or touches FAT.
+struct WaveWriter {
+ FILE*file;std::mutex lock;std::vector<int16_t> ring;size_t read=0,write=0,count=0;bool done=false,failed=false;uint32_t written=0;
+ explicit WaveWriter(FILE*f):file(f),ring(64000){}
+ bool Push(const std::vector<int16_t>&pcm){std::lock_guard<std::mutex>l(lock);if(failed||pcm.size()>ring.size()-count)return false;for(auto x:pcm){ring[write]=x;write=(write+1)%ring.size();}count+=pcm.size();return true;}
+ static void*Run(void*arg){auto*w=(WaveWriter*)arg;sched_param p{};p.sched_priority=CONFIG_METALIO_APP_PRIORITY+10;pthread_setschedparam(pthread_self(),SCHED_RR,&p);std::vector<int16_t>batch(3840);
+  for(;;){size_t n;bool done;{std::lock_guard<std::mutex>l(w->lock);n=std::min(batch.size(),w->count);for(size_t i=0;i<n;++i){batch[i]=w->ring[w->read];w->read=(w->read+1)%w->ring.size();}w->count-=n;done=w->done;}
+   if(n){size_t at=0;while(at<n){size_t got=fwrite(batch.data()+at,sizeof(int16_t),n-at,w->file);if(!got){std::lock_guard<std::mutex>l(w->lock);w->failed=true;return nullptr;}at+=got;}w->written+=n;}else if(done)break;else usleep(5000);
+  }return nullptr;
+ }
+};
+bool WaveHeader(FILE*f,uint32_t samples){uint8_t h[44]={};auto put=[&](int at,uint32_t v,int n){for(int i=0;i<n;++i)h[at+i]=(v>>(8*i))&255;};memcpy(h,"RIFF",4);put(4,36+samples*2,4);memcpy(h+8,"WAVEfmt ",8);put(16,16,4);put(20,1,2);put(22,1,2);put(24,16000,4);put(28,32000,4);put(32,2,2);put(34,16,2);memcpy(h+36,"data",4);put(40,samples*2,4);return fseek(f,0,SEEK_SET)==0&&fwrite(h,1,44,f)==44;}
+bool VerifyRecordedWave(const char *path,uint32_t samples) {
+    FILE *f=fopen(path,"rb");if(!f)return false;
+    uint8_t h[44];struct stat st{};bool ok=fstat(fileno(f),&st)==0&&
+        st.st_size==(off_t)(44+samples*2)&&fread(h,1,44,f)==44&&
+        !memcmp(h,"RIFF",4)&&!memcmp(h+8,"WAVEfmt ",8)&&!memcmp(h+36,"data",4)&&
+        ReadLe32(h+4)==36+samples*2&&ReadLe32(h+40)==samples*2;
+    fclose(f);return ok;
+}
+// Quiesce previous local sessions before claiming a new one. A late radio or
+// music worker must not replace the recording's session after prebuffering.
+bool PrepareRecorderAudio(bool input) {
+    // The modem may have missed the final idle URC. A read-only CLCC refresh
+    // distinguishes a stale cached call from a real call without resetting RF.
+    if(metalio_nt26_get_call_state()!=METALIO_CALL_IDLE)
+        (void)metalio_nt26_call_poll();
+    if(metalio_nt26_get_call_state()!=METALIO_CALL_IDLE)return false;
+    auto &app=Application::GetInstance();auto &audio=app.GetAudioService();
+    // The recorder worker owns the input lease BEFORE changing routes.
+    // A globally re-armed wake detector must not switch A2DP back to the
+    // microphone route halfway through preparing a file playback session.
+    if(!audio.HasExclusiveCapture())return false;
+    app.RequestVoiceUiDesired(false);
+    audio.EnableWakeWordDetection(false);audio.EnableVoiceProcessing(false);
+    audio.SetTtsUplinkGate(false);
+    LocalMusicPlayer::Instance().Stop();RadioPlayer::Instance().Pause();MusicScreen::PauseForVoice();
+    for(int i=0;i<300&&!audio.LocalPlaybackSettled();++i){
+        if(input?s_stop_record.load():s_stop_play.load())return false;
+        usleep(10000);
     }
-
-    MakeNextRecordPath(path, sizeof(path));
-    file = fopen(path, "wb");
-    if (file == nullptr) {
-        ESP_LOGE(TAG, "fopen failed: %s", path);
-        PostStatusFromWorker(false, I18n::T("写入失败，未保存"));
-        goto done;
+    if(!audio.LocalPlaybackSettled())return false;
+    // Retire old cloud PCM and wait for an already executing DMA write.
+    // ResetDecoder preserves an owned local session; no I2S stop/reconfigure.
+    audio.ResetDecoder();
+    for(int i=0;i<300&&!audio.VoicePlaybackSettled();++i){
+        if(input?s_stop_record.load():s_stop_play.load())return false;
+        usleep(10000);
     }
-
-    encoder = std::make_unique<OpusEncoderWrapper>(kSampleRate, 1, kFrameDurationMs);
-    encoder->SetComplexity(0);
-
-    if (!WriteOpusHeaders(file, kOggSerial, page_seq)) {
-        PostStatusFromWorker(false, I18n::T("写入失败，未保存"));
-        goto done;
-    }
-
-    s_record_start_us.store(esp_timer_get_time());
-    s_recorded_frames.store(0);
-
-    {
-        std::vector<int16_t> frame;
-        frame.reserve(static_cast<size_t>(kSamplesPerFrame) * 2);
-        std::vector<uint8_t> opus_pkt;
-        opus_pkt.reserve(256);
-
-        while (!s_stop_record.load()) {
-            if (!as.ReadAudioData(frame, kSampleRate, kSamplesPerFrame)) {
-                vTaskDelayMs(5);
-                continue;
-            }
-            AudioCodec *codec = Board::GetInstance().GetAudioService() == nullptr
-                                    ? nullptr
-                                    : nullptr;  // codec accessor removed on NuttX
-            (void)codec;  // KeepLeftChannelOnly is a no-op for mono input
-            if (static_cast<int>(frame.size()) != kSamplesPerFrame) {
-                continue;
-            }
-            if (!encoder->Encode(std::move(frame), opus_pkt)) {
-                ESP_LOGW(TAG, "opus encode failed");
-                continue;
-            }
-
-            ++frames;
-            const int64_t granule = static_cast<int64_t>(frames) * kGranulePerFrame;
-            const bool force_eos =
-                ((esp_timer_get_time() - s_record_start_us.load()) / 1000) >=
-                kMaxRecordSeconds * 1000;
-            if (!WriteOggPage(file, 0x00, granule, kOggSerial, page_seq++,
-                              opus_pkt.data(), opus_pkt.size())) {
-                PostStatusFromWorker(false, I18n::T("写入失败，未保存"));
-                goto done;
-            }
-            s_recorded_frames.store(frames);
-
-            if (force_eos) {
-                ESP_LOGI(TAG, "max record duration reached");
-                hit_max = true;
-                break;
-            }
+    if(!audio.VoicePlaybackSettled())return false;
+    int route=input?BluetoothScreen::PrepareVoiceRoute():BluetoothScreen::PreparePlaybackRoute();
+    if(route<0||metalio_nt26_get_call_state()!=METALIO_CALL_IDLE)return false;
+    // Same idle/local source selection used by working Hi Music playback.
+    // Never change this mux while the modem owns a real telephone call.
+    if(metalio_audio_select_local()<0||
+       metalio_nt26_call_control(3,BluetoothScreen::IsHeadsetConnected()?0:1)<0)return false;
+    printf("REC_AUDIO_ROUTE direction=%s headset=%d sco=%d\n",input?"capture":"playback",
+           BluetoothScreen::IsHeadsetConnected(),BluetoothScreen::IsHeadsetCaptureReady());
+    return true;
+}
+void RecordTask(void*) {
+    auto&as=Application::GetInstance().GetAudioService();char path[192]={};
+    std::string pending;FILE*file=nullptr;bool ok=false,owned=false;
+    uint32_t samples=0;const char*error="录音未开始";bool headset=false;
+    printf("REC_CAPTURE_BEGIN generation=%lu\n",(unsigned long)s_record_generation);
+    do {
+        if(!as.BeginExclusiveCapture()){error="麦克风忙，请重试";break;}
+        owned=true;DisableWakeWordIfNeeded();
+        if(!PrepareRecorderAudio(true)){error="录音音频通路未就绪，请重试";break;}
+        headset=BluetoothScreen::IsHeadsetCaptureReady();
+        if(s_stop_record)break;
+        if(as.GetCodec()){as.GetCodec()->EnableInput(true);as.GetCodec()->SetRecordingInput(true);}
+        // Settle only before the recording starts. Never discard words after
+        // the sample clock/UI has started, and never reset shared I2S/DMA.
+        bool warmed=true;{std::vector<int16_t>settle;for(int i=0;i<2&&!s_stop_record;++i)
+            if(!as.ReadAudioData(settle,16000,320)){warmed=false;break;}}
+        if(!warmed){error="麦克风未就绪，请重试";break;}
+        if(!EnsureRecordingsDir()){error="无法创建录音目录";break;}
+        MakeNextRecordPath(path,sizeof(path));std::string base(path);base.resize(base.rfind('.'));
+        for(unsigned suffix=0;suffix<1000;++suffix){
+            std::string candidate=base+(suffix?"_"+std::to_string(suffix):"")+".wav";
+            if(access(candidate.c_str(),F_OK)==0)continue;
+            snprintf(path,sizeof(path),"%s",candidate.c_str());pending=candidate+".partial";
+            int fd=open(pending.c_str(),O_WRONLY|O_CREAT|O_EXCL,0644);
+            if(fd>=0){file=fdopen(fd,"wb");if(!file){close(fd);unlink(pending.c_str());}break;}
+            if(errno!=EEXIST)break;
         }
-
-        // 若最后一页未标 EOS，补一帧空 EOS 页（或把最后一页重写太麻烦，写空 EOS）
-        if (frames > 0) {
-            const int64_t granule = static_cast<int64_t>(frames) * kGranulePerFrame;
-            if (!WriteOggPage(file, 0x04 /* EOS */, granule, kOggSerial, page_seq++,
-                              nullptr, 0)) {
-                PostStatusFromWorker(false, I18n::T("写入失败，未保存"));
-                goto done;
+        if(!file){error="写入失败，未保存";break;}
+        setvbuf(file,nullptr,_IOFBF,16384);
+        if(!WaveHeader(file,0)){error="无法写入录音头";break;}
+        WaveWriter writer(file);pthread_attr_t a;pthread_attr_init(&a);
+        pthread_attr_setstacksize(&a,16384);pthread_t task;
+        int rc=hi_task_create_legacy(&task,&a,WaveWriter::Run,&writer);pthread_attr_destroy(&a);
+        if(rc){error="录音存储任务启动失败";break;}
+        sched_param priority{};priority.sched_priority=CONFIG_METALIO_APP_PRIORITY+12;
+        pthread_setschedparam(pthread_self(),SCHED_RR,&priority);
+        s_record_start_us=esp_timer_get_time();s_recorded_frames=0;
+        RecordingPcmFilter filter;std::vector<int16_t>pcm;pcm.reserve(640);
+        int64_t last=esp_timer_get_time();bool capture_ok=true;
+        PostStatusFromWorker(false,"正在录音…");
+        while(!s_stop_record&&samples<(uint32_t)kMaxRecordSeconds*16000){
+            if(metalio_nt26_get_call_state()!=METALIO_CALL_IDLE){error="来电已停止录音并保存";capture_ok=false;break;}
+            if(headset&&!BluetoothScreen::IsHeadsetCaptureReady()){error="耳机已断开，已保存录音";capture_ok=false;break;}
+            if(!as.ReadAudioData(pcm,16000,320)){
+                if(esp_timer_get_time()-last>3000000){error="麦克风读取中断";capture_ok=false;break;}
+                usleep(2000);continue;
             }
+            // Stop belongs to this capture session. Do not enqueue a final
+            // in-flight microphone block after the user has ended it.
+            if(s_stop_record.load())break;
+            last=esp_timer_get_time();
+            if(pcm.size()==640)KeepLeftChannelOnly(pcm);
+            if(pcm.size()!=320){error="麦克风采样不完整";capture_ok=false;break;}
+            filter.Apply(pcm);
+            if(!writer.Push(pcm)){error="SD 卡写入速度不足，录音已停止";capture_ok=false;break;}
+            samples+=pcm.size();s_recorded_frames=samples/960;
         }
-    }
-
-    {
-        const int duration_ms = static_cast<int>(
-            (esp_timer_get_time() - s_record_start_us.load()) / 1000);
-        if (duration_ms < kMinRecordMs || frames < 5) {
-            ESP_LOGI(TAG, "discard short recording: %d ms / %u frames", duration_ms,
-                     static_cast<unsigned>(frames));
-            fclose(file);
-            file = nullptr;
-            unlink(path);
-            UnlinkDurationSidecar(path);
-            PostStatusFromWorker(false, I18n::T("录音太短，再试一次"));
-            goto done;
+        // Release the microphone before waiting for storage drain/sync.
+        if(as.GetCodec())as.GetCodec()->SetRecordingInput(false);
+        as.EndExclusiveCapture();owned=false;
+        {std::lock_guard<std::mutex>l(writer.lock);writer.done=true;}
+        pthread_join(task,nullptr);samples=writer.written;
+        printf("REC_CAPTURE_DRAIN samples=%lu write_error=%d\n",(unsigned long)samples,writer.failed);
+        if(writer.failed){error="SD 卡写入失败，已保留可恢复文件";capture_ok=false;}
+        if(samples<4800){error="录音太短，再试一次";break;}
+        bool complete=WaveHeader(file,samples)&&fflush(file)==0&&fsync(fileno(file))==0;
+        bool closed=fclose(file)==0;file=nullptr;
+        if(!complete||!closed||!VerifyRecordedWave(pending.c_str(),samples)){
+            error="录音保存未完成，已保留可恢复文件";break;
         }
-
-        fflush(file);
-        fclose(file);
-        file = nullptr;
-        ok = true;
-        {
-            const int duration_sec =
-                static_cast<int>(frames * kFrameDurationMs / 1000);
-            WriteDurationSidecar(path, duration_sec);
-        }
-        ESP_LOGI(TAG, "saved %s (%u frames, %d ms)", path,
-                 static_cast<unsigned>(frames), duration_ms);
-        if (hit_max) {
-            char msg[96];
-            std::snprintf(msg, sizeof(msg), I18n::T("已达最长 %d 分钟，已自动保存"),
-                          kMaxRecordSeconds / 60);
-            PostStatusFromWorker(false, msg);
-        } else {
-            PostStatusFromWorker(false, I18n::T("已保存到 SD 卡"));
-        }
-    }
-
-done:
-    if (file != nullptr) {
-        fclose(file);
-        if (!ok && path[0] != '\0') {
-            unlink(path);
-            UnlinkDurationSidecar(path);
-        }
-    }
-    encoder.reset();
+        if(rename(pending.c_str(),path)<0){error="录音重命名失败，已保留文件";break;}
+        WriteDurationSidecar(path,samples/16000);ok=true;
+        if(!capture_ok)printf("REC_CAPTURE_PARTIAL samples=%lu\n",(unsigned long)samples);
+    }while(false);
+    if(file){WaveHeader(file,samples);fflush(file);fsync(fileno(file));fclose(file);}
+    if(!pending.empty()&&samples<4800)unlink(pending.c_str());
+    if(owned){if(as.GetCodec())as.GetCodec()->SetRecordingInput(false);as.EndExclusiveCapture();}
     RestoreWakeWordIfNeeded();
-
-    s_state.store(RecState::Idle);
-    if (LvglLock() == ESP_OK) {
-        if (s_screen_alive) {
-            UpdateRecordButtonUi();
-            if (ok) {
-                char buf[16];
-                FormatTimer(buf, sizeof(buf),
-                            static_cast<int>(frames * kFrameDurationMs / 1000));
-                if (s_ui.timer_lbl != nullptr) {
-                    lv_label_set_text(s_ui.timer_lbl, buf);
-                }
-                RebuildFileList();
-            }
-        }
-        LvglUnlock();
+    {std::lock_guard<std::mutex>lock(s_updates.lock);
+        s_updates.record_status=ok?"已保存到 SD 卡（WAV 无损录音）":error;
+        s_updates.record_generation=s_record_generation;s_updates.samples=samples;
+        s_updates.record_ok=ok;s_updates.record_done=true;
     }
-
-    s_record_task = 0;
-    vTaskDelete(nullptr);
+    printf("REC_CAPTURE_RELEASED saved=%d samples=%lu\n",ok,(unsigned long)samples);
 }
 
 void StartRecording() {
@@ -876,8 +884,12 @@ void StartRecording() {
         SetRecordStatusText(I18n::T("请插入 SD 卡"));
         return;
     }
-    if (s_state.load() != RecState::Idle || s_record_task != 0) {
-        return;
+    if(s_play_task!=0||s_state.load()==RecState::Playing){
+        s_record_after_play=true;StopPlayback();
+        SetRecordStatusText("正在停止回放，随后开始录音…");return;
+    }
+    if(s_record_task!=0||s_state.load()!=RecState::Idle){
+        SetRecordStatusText("录音正在收尾，请稍候…");return;
     }
 
     StopPlayback();
@@ -887,31 +899,75 @@ void StartRecording() {
         SetRecordStatusText(I18n::T("音频未就绪"));
         return;
     }
-    if (as.IsAudioProcessorRunning()) {
-        SetRecordStatusText(I18n::T("音频忙，稍后再试"));
-        return;
-    }
 
-    s_stop_record.store(false);
+    s_stop_record.store(false);s_stop_play.store(false);s_record_after_play=false;
+    s_record_start_us=0;s_recorded_frames=0;s_playing_path[0]=0;
+    {std::lock_guard<std::mutex>lock(s_updates.lock);
+        s_updates.record_done=false;s_updates.record_status.clear();s_updates.record_ok=false;s_updates.samples=0;
+        s_updates.play_done=false;s_updates.play_status.clear();
+    }
+    s_record_generation = s_screen_generation;
     s_state.store(RecState::Recording);
     if (s_ui.timer_lbl != nullptr) {
         lv_label_set_text(s_ui.timer_lbl, "00:00");
     }
-    SetRecordingStatusHint();
+    SetRecordStatusText("正在准备麦克风…");
     UpdateRecordButtonUi();
     StartTickTimer();
 
     // Opus/SILK 编码栈很深：AudioService opus_codec 用 2048*13，
     // wake_word encode 用 4096*7；16KB 会 Stack protection fault。
     constexpr uint32_t kRecordTaskStack = 2048 * 14;
+    s_record_task=1;
     if (xTaskCreatePinnedToCore(RecordTask, "rec_save", kRecordTaskStack, nullptr,
-                                tskIDLE_PRIORITY + 3, &s_record_task, 0) != pdPASS) {
+                                tskIDLE_PRIORITY + 3, nullptr, 0) != pdPASS) {
         s_record_task = 0;
         s_state.store(RecState::Idle);
         StopTickTimer();
         UpdateRecordButtonUi();
         SetRecordStatusText(I18n::T("录音任务启动失败"));
     }
+}
+
+void ApplyWorkerUpdates(lv_timer_t*) {
+    bool record_done,play_done,ok,files_ready;uint32_t rg,pg,fg;std::string record,play;std::vector<FileEntry>files;
+    {std::lock_guard<std::mutex>lock(s_updates.lock);
+        record_done=s_updates.record_done;play_done=s_updates.play_done;
+        s_updates.record_done=s_updates.play_done=false;ok=s_updates.record_ok;
+        rg=s_updates.record_generation;pg=s_updates.play_generation;
+        if(record_done){s_updates.samples=0;s_updates.record_ok=false;}
+        record.swap(s_updates.record_status);play.swap(s_updates.play_status);
+        files_ready=s_updates.files_ready;s_updates.files_ready=false;fg=s_updates.files_generation;
+        if(files_ready)files.swap(s_updates.files);
+    }
+    if(files_ready){
+        s_scan_busy=false;
+        if(s_screen_alive&&fg==s_screen_generation){s_files=std::move(files);RenderFileList(s_fill_durations);s_fill_durations=false;}
+        if(s_refresh_again){s_refresh_again=false;RebuildFileList();}
+    }
+    if(record_done){
+        // The worker publishes done only after PCM/filter/writer destruction,
+        // file finalization and microphone release. Clear session state here,
+        // never the shared audio hardware while that worker is still active.
+        s_record_task=0;s_state=RecState::Idle;StopTickTimer();
+        s_record_start_us=0;s_recorded_frames=0;s_stop_record=false;
+        if(s_play_task==0){s_stop_play=false;s_playing_path[0]=0;}
+        UpdateTimerLabel();
+    }
+    if(play_done){s_play_task=0;s_state=RecState::Idle;s_playing_path[0]=0;}
+    if(s_screen_alive){
+        if(rg==s_screen_generation&&!record.empty())SetRecordStatusText(record.c_str());
+        if(pg==s_screen_generation&&!play.empty()){
+            if(s_detail_open)SetDetailStatusText(play.c_str());else SetListStatusText(play.c_str());
+        }
+        if(record_done||play_done){UpdateRecordButtonUi();UpdateDetailPlayButton();}
+        if(record_done&&rg==s_screen_generation&&ok){
+            // Saved duration remains in the file/sidecar and list. The
+            // recording panel is a fresh 00:00 session after Stop.
+            RebuildFileList();
+        }
+        if(play_done&&s_record_after_play){s_record_after_play=false;StartRecording();}
+    }else s_record_after_play=false;
 }
 
 void StopRecording() {
@@ -921,13 +977,14 @@ void StopRecording() {
     s_stop_record.store(true);
     s_state.store(RecState::Saving);
     StopTickTimer();
+    if(s_ui.timer_lbl)lv_label_set_text(s_ui.timer_lbl,"00:00");
     UpdateRecordButtonUi();
     SetRecordStatusText(I18n::T("保存中…"));
 }
 
 void OnRecordBtnClicked(lv_event_t * /*e*/) {
     const RecState st = s_state.load();
-    if (st == RecState::Idle) {
+    if (st == RecState::Idle || st == RecState::Playing) {
         StartRecording();
     } else if (st == RecState::Recording) {
         StopRecording();
@@ -1092,11 +1149,15 @@ int EnsureOpusDuration(FileEntry &entry) {
 void DurationFillTask(void * /*arg*/) {
     std::vector<std::string> pending;
     pending.reserve(16);
+    lv_lock();
+    if (!s_stop_meta.load() && s_screen_alive) {
     for (const auto &e : s_files) {
         if (e.format == RecFormat::Opus && !e.duration_ready) {
             pending.emplace_back(e.path);
         }
     }
+    }
+    lv_unlock();
 
     for (const auto &path : pending) {
         if (s_stop_meta.load() || !s_screen_alive) {
@@ -1114,7 +1175,7 @@ void DurationFillTask(void * /*arg*/) {
             }
         }
         if (LvglLock() == ESP_OK) {
-            if (s_screen_alive) {
+            if (s_screen_alive && !s_stop_meta.load()) {
                 for (auto &e : s_files) {
                     if (e.path == path) {
                         e.duration_sec = (sec >= 0) ? sec : 0;
@@ -1130,10 +1191,21 @@ void DurationFillTask(void * /*arg*/) {
 
     if (!s_stop_meta.load() && s_screen_alive) {
         if (LvglLock() == ESP_OK) {
-            if (s_screen_alive && s_ui.list_scroll != nullptr && !s_detail_open) {
-                // 列表可见时刷新时长文案（sidecar 已齐，Collect 很快）
-                RebuildFileList(false);
-            } else if (s_screen_alive && s_detail_open && s_detail_idx >= 0 &&
+            if (s_screen_alive && !s_stop_meta.load() && s_ui.list_scroll != nullptr && !s_detail_open) {
+                // Preserve rows while a pointer is down. Re-collecting also
+                // discarded duration_ready for damaged files and retried forever.
+                for (size_t i = 0; i < s_files.size() &&
+                     i < lv_obj_get_child_count(s_ui.list_scroll); ++i) {
+                    auto *row = lv_obj_get_child(s_ui.list_scroll, i);
+                    auto *hint = lv_obj_get_child(row, 1);
+                    if (!hint || !lv_obj_check_type(hint, &lv_label_class)) continue;
+                    char dur[16], size_buf[24], text[72];
+                    FormatTimer(dur, sizeof(dur), s_files[i].duration_sec);
+                    FormatFileSize(size_buf, sizeof(size_buf), s_files[i].size_bytes);
+                    std::snprintf(text, sizeof(text), I18n::T("时长 %s · %s · 点击查看"), dur, size_buf);
+                    lv_label_set_text(hint, text);
+                }
+            } else if (s_screen_alive && !s_stop_meta.load() && s_detail_open && s_detail_idx >= 0 &&
                        s_detail_idx < static_cast<int>(s_files.size())) {
                 FileEntry &e = s_files[static_cast<size_t>(s_detail_idx)];
                 EnsureOpusDuration(e);
@@ -1156,7 +1228,7 @@ void DurationFillTask(void * /*arg*/) {
     if (!s_stop_meta.load() && s_screen_alive) {
         ScheduleDurationFill();  // sidecar 写入失败时再补一轮
     }
-    vTaskDelete(nullptr);
+    return;
 }
 
 void ScheduleDurationFill() {
@@ -1181,14 +1253,14 @@ void ScheduleDurationFill() {
     }
 }
 
-void CollectRecordings() {
-    s_files.clear();
+std::vector<FileEntry> CollectRecordings() {
+    std::vector<FileEntry> files;
     if (!SdCardManager::GetInstance().IsMounted()) {
-        return;
+        return files;
     }
     DIR *dir = opendir(kPosixDir);
     if (dir == nullptr) {
-        return;
+        return files;
     }
     struct dirent *ent;
     while ((ent = readdir(dir)) != nullptr) {
@@ -1215,6 +1287,7 @@ void CollectRecordings() {
         entry.format = HasExt(entry.name, ".opus") ? RecFormat::Opus : RecFormat::Wav;
         struct stat st;
         if (stat(entry.path, &st) == 0 && st.st_size > 0) {
+            entry.modified = st.st_mtime;
             entry.size_bytes = static_cast<size_t>(st.st_size);
             if (entry.format == RecFormat::Opus) {
                 // 进页只读 sidecar；缺失则留给后台 / 详情懒加载
@@ -1235,192 +1308,306 @@ void CollectRecordings() {
                 entry.duration_ready = true;
             }
         }
-        s_files.push_back(entry);
-        if (s_files.size() >= static_cast<size_t>(kMaxListItems)) {
-            break;
-        }
+        // FAT directory order and device prefixes are not chronological.
+        // Keep the newest 80 across the entire directory, including calls.
+        auto newer=[](const FileEntry &a,const FileEntry &b) {
+            if(a.modified!=b.modified)return a.modified>b.modified;
+            return std::strcmp(a.name,b.name)>0;
+        };
+        files.insert(std::lower_bound(files.begin(),files.end(),entry,newer),entry);
+        if(files.size()>static_cast<size_t>(kMaxListItems))files.pop_back();
     }
     closedir(dir);
 
-    std::sort(s_files.begin(), s_files.end(),
-              [](const FileEntry &a, const FileEntry &b) {
-                  return std::strcmp(a.name, b.name) > 0;
-              });
+    return files;
 }
 
+// Historical saved captures contain predominantly 65-110 Hz rumble. A
+// recording-only 140 Hz Butterworth high-pass removes that low-frequency
+// energy without boosting hiss or gating away quiet syllables. Q30 state
+// spans every Opus packet/WAV chunk; the hardware PCM format is unchanged.
+class RecordingPlaybackLevel {
+public:
+    void Apply(std::vector<int16_t> &pcm) {
+        for(auto &sample:pcm) {
+            const int64_t x=sample;
+            int64_t y=(1032800534LL*x-2065601067LL*x1_+1032800534LL*x2_+
+                2064039427LL*y1_-993420884LL*y2_)/(1LL<<30);
+            y=std::max<int64_t>(-65536,std::min<int64_t>(65536,y));
+            x2_=x1_;x1_=x;y2_=y1_;y1_=y;
+            sample=static_cast<int16_t>(std::max<int64_t>(-30000,std::min<int64_t>(30000,y)));
+        }
+    }
+private:
+    int64_t x1_=0,x2_=0,y1_=0,y2_=0;
+};
+
+// File playback holds the capture/route lease and writes its own PCM directly.
+// It does not wait in the shared cloud/music prebuffer queue. The previous
+// output has drained before this object is constructed; other producers are
+// rejected for this entire session, including amplifier lead-in and DMA tail.
+class RecordingOutput {
+public:
+    explicit RecordingOutput(AudioService &audio) : audio_(audio), session_(audio.BeginLocalPlayback(5760,true,true)) {}
+    ~RecordingOutput() {
+        // Stop/error also leaves accepted PCM in the hardware DMA queue.
+        // Retain the lease until that tail is silent before the next record,
+        // route change or wake detector can start reading microphone frames.
+        if(wrote_&&!drained_)vTaskDelayMs(500);
+        audio_.EndLocalPlayback(session_);
+    }
+    bool Prepare() {
+        if (!session_) { PostPlayStatusFromWorker("录音回放通路被占用，请稍后重试"); return false; }
+        if (auto *codec=audio_.GetCodec()) codec->EnableOutput(true);
+        // Let the I2S/BT amplifier settle on silence before submitting the
+        // FIRST file sample. These samples are not read from or counted in
+        // the recording, so neither its beginning nor its duration is lost.
+        const int16_t silence[kSamplesPerFrame]{};
+        for (int i=0;i<6;++i) if (!Push(silence,kSamplesPerFrame)) return false;
+        return true;
+    }
+    bool Push(const int16_t *pcm, size_t count) {
+        if(s_stop_play.load() || !audio_.HasExclusiveCapture() ||
+           audio_.LocalPlaybackWriteFailed(session_) ||
+           metalio_nt26_get_call_state()!=METALIO_CALL_IDLE)return false;
+        auto *codec=audio_.GetCodec();
+        if(!codec || !codec->OutputDataChecked(pcm,count)) {
+            PostPlayStatusFromWorker(I18n::T("音频输出未就绪"));
+            return false;
+        }
+        wrote_=true;
+        return !s_stop_play.load();
+    }
+    bool Finish() {
+        // Push the complete file through the lower-half DMA queue before
+        // releasing the session. Padding is not part of the recording.
+        const int16_t silence[kSamplesPerFrame]{};
+        for(int i=0;i<8;++i)if(!Push(silence,kSamplesPerFrame))return false;
+        audio_.FinishLocalPlayback(session_);
+        for (int waited=0; !s_stop_play.load() && waited<400; ++waited) {
+            if(audio_.LocalPlaybackWriteFailed(session_)||metalio_nt26_get_call_state()!=METALIO_CALL_IDLE)return false;
+            if (audio_.LocalPlaybackDrained(session_)) {
+                // Include the I2S lower-half's final queued DMA blocks.
+                for (int i=0;i<24&&!s_stop_play.load();++i) vTaskDelayMs(20);
+                drained_=!s_stop_play.load();
+                return !s_stop_play.load();
+            }
+            vTaskDelayMs(20);
+        }
+        return false;
+    }
+private:
+    AudioService &audio_;
+    uint32_t session_;
+    bool wrote_=false,drained_=false;
+};
+
 bool PlayOpusFile(FILE *file, AudioService &as) {
-    as.ResetDecoder();
+    RecordingOutput output(as);
+    if (!output.Prepare()) return false;
     PostPlayStatusFromWorker(I18n::T("播放中…"));
 
     bool seen_head = false;
     bool seen_tags = false;
-    int sample_rate = kSampleRate;
+    unsigned queued_frames = 0;
+    OpusDecoderWrapper recording_decoder(kSampleRate, 1, kFrameDurationMs);
+    RecordingPlaybackLevel playback_level;
+    std::vector<int16_t> decoded_pcm;
+    const int64_t play_start_us = esp_timer_get_time();
     uint8_t hdr[27];
-
+    std::vector<uint8_t> packet;
+    bool truncated=false;
+    bool decode_failed=false;
     while (!s_stop_play.load()) {
-        if (fread(hdr, 1, 27, file) != 27) {
-            break;
-        }
-        if (std::memcmp(hdr, "OggS", 4) != 0) {
-            PostPlayStatusFromWorker(I18n::T("录音文件损坏"));
-            return false;
-        }
-        const uint8_t nseg = hdr[26];
+        const size_t header_size=fread(hdr,1,sizeof(hdr),file);
+        if (!header_size) break;
+        if (header_size!=sizeof(hdr)||std::memcmp(hdr,"OggS",4)||hdr[4]!=0) {truncated=true;break;}
+        const size_t nseg=hdr[26];
         uint8_t segs[255];
-        if (nseg == 0 || fread(segs, 1, nseg, file) != nseg) {
-            break;
-        }
-
-        size_t body_off = 0;
-        size_t body_size = 0;
-        for (uint8_t i = 0; i < nseg; ++i) {
-            body_size += segs[i];
-        }
+        if (nseg&&fread(segs,1,nseg,file)!=nseg) {truncated=true;break;}
+        size_t body_size=0;
+        for (size_t i=0;i<nseg;++i) body_size+=segs[i];
         std::vector<uint8_t> body(body_size);
-        if (body_size > 0 && fread(body.data(), 1, body_size, file) != body_size) {
-            break;
-        }
-
-        size_t seg_idx = 0;
-        while (seg_idx < nseg && !s_stop_play.load()) {
-            size_t pkt_len = 0;
-            const size_t pkt_start = body_off;
-            bool continued = false;
-            do {
-                const uint8_t l = segs[seg_idx++];
-                pkt_len += l;
-                body_off += l;
-                continued = (l == 255);
-            } while (continued && seg_idx < nseg);
-
-            if (pkt_len == 0) {
-                continue;
-            }
-            const uint8_t *pkt = body.data() + pkt_start;
-
+        if (body_size&&fread(body.data(),1,body_size,file)!=body_size) {truncated=true;break;}
+        size_t offset=0;
+        for (size_t i=0;i<nseg&&!s_stop_play.load();++i) {
+            const size_t len=segs[i];
+            if (packet.size()+len>65536) {truncated=true;break;}
+            if (len) packet.insert(packet.end(),body.data()+offset,body.data()+offset+len);
+            offset+=len;
+            // A 255 lacing value continues the SAME packet, even over an
+            // Ogg page boundary. Decoding each page fragment truncated files.
+            if (len==255) continue;
+            if (packet.empty()) continue;
             if (!seen_head) {
-                if (pkt_len >= 19 && std::memcmp(pkt, "OpusHead", 8) == 0) {
-                    seen_head = true;
-                    sample_rate = static_cast<int>(ReadLe32(pkt + 12));
-                    if (sample_rate <= 0) {
-                        sample_rate = kSampleRate;
-                    }
+                if (packet.size()<19||std::memcmp(packet.data(),"OpusHead",8)) {truncated=true;break;}
+                if (packet[9]!=1 || packet[18]!=0) {
+                    PostPlayStatusFromWorker(I18n::T("不支持此录音格式"));
+                    return false;
                 }
-                continue;
+                seen_head=true;packet.clear();continue;
             }
             if (!seen_tags) {
-                if (pkt_len >= 8 && std::memcmp(pkt, "OpusTags", 8) == 0) {
-                    seen_tags = true;
-                }
-                continue;
+                seen_tags=true;
+                if (packet.size()>=8&&!std::memcmp(packet.data(),"OpusTags",8)) {packet.clear();continue;}
+                // Do not drop the first audio packet if tags are absent.
             }
-
-            auto packet = std::make_unique<AudioStreamPacket>();
-            packet->sample_rate = sample_rate;
-            packet->frame_duration = kFrameDurationMs;
-            packet->payload.assign(pkt, pkt + pkt_len);
-            if (!as.PushPacketToDecodeQueue(std::move(packet), true)) {
-                break;
-            }
+            if (!recording_decoder.Decode(std::move(packet),decoded_pcm)) {decode_failed=true;break;}
+            packet.clear();
+            playback_level.Apply(decoded_pcm);
+            if (!output.Push(decoded_pcm.data(),decoded_pcm.size())) return false;
+            ++queued_frames;
         }
-
-        if (hdr[5] & 0x04) {
-            break;
-        }
+        if (truncated||decode_failed||(hdr[5]&0x04)) break;
     }
 
-    // 等解码播放队列排空
-    while (!s_stop_play.load() && !as.IsIdle()) {
-        vTaskDelayMs(20);
+    const bool read_failed = ferror(file) != 0 || truncated || (!decode_failed&&!packet.empty());
+    const bool drained = output.Finish();
+    printf("REC_PLAY frames=%u elapsed_ms=%lld cancelled=%d read_error=%d\n",
+           queued_frames, static_cast<long long>((esp_timer_get_time()-play_start_us)/1000),
+           s_stop_play.load(), read_failed);
+    if (s_stop_play.load()) return false;
+    if (ferror(file)) {
+        PostPlayStatusFromWorker(I18n::T("读取录音失败"));
+        return false;
+    }
+    if (decode_failed) {
+        PostPlayStatusFromWorker(I18n::T("录音解码失败"));
+        return false;
+    }
+    if (read_failed || !seen_head || !seen_tags) {
+        PostPlayStatusFromWorker(I18n::T("录音数据不完整"));
+        return false;
+    }
+    if (queued_frames == 0) {
+        PostPlayStatusFromWorker(I18n::T("录音中没有音频"));
+        return false;
+    }
+    if (!drained) {
+        PostPlayStatusFromWorker(I18n::T("音频输出未就绪"));
+        return false;
     }
     return true;
 }
 
-// WAV 直接喂给 AudioService 解码队列（codec 直驱扬声器在 NuttX 上未暴露，
-// 因此即便 WAV 也走 PushPacketToDecodeQueue 路径，由解码器把 PCM 直接
-// 透传到扬声器）。sample_rate 取 WAV 头里的值。
+// WAV recordings use the bounded 16 kHz PCM playback queue.
 bool PlayWavFile(FILE *file, AudioService &as) {
-    uint8_t hdr[44] = {};
-    if (fread(hdr, 1, sizeof(hdr), file) != sizeof(hdr) ||
-        std::memcmp(hdr, "RIFF", 4) != 0 || std::memcmp(hdr + 8, "WAVE", 4) != 0) {
-        PostPlayStatusFromWorker(I18n::T("录音文件损坏"));
+    uint8_t hdr[12] = {};
+    struct stat st{};
+    if (fstat(fileno(file), &st)!=0 || fread(hdr,1,sizeof(hdr),file)!=sizeof(hdr) ||
+        std::memcmp(hdr,"RIFF",4) || std::memcmp(hdr+8,"WAVE",4)) {
+        PostPlayStatusFromWorker(I18n::T("读取录音失败"));
+        return false;
+    }
+    // RIFF permits extended fmt, LIST/JUNK/fact chunks and odd-size padding.
+    // A valid WAV does not necessarily put its data header at byte 36.
+    const uint64_t riff_end=8ULL+ReadLe32(hdr+4);
+    uint32_t remaining=0;
+    long data_position=-1;
+    bool have_format=false;
+    bool supported=false;
+    if (st.st_size<12 || riff_end<12 || riff_end>static_cast<uint64_t>(st.st_size)) {
+        PostPlayStatusFromWorker(I18n::T("录音数据不完整"));
+        return false;
+    }
+    for (unsigned chunk=0;chunk<128;++chunk) {
+        const long position=ftell(file);
+        if (position<0 || static_cast<uint64_t>(position)+8>riff_end) break;
+        uint8_t chunk_header[8];
+        if (fread(chunk_header,1,8,file)!=8) break;
+        const uint32_t size=ReadLe32(chunk_header+4);
+        const uint64_t payload=static_cast<uint64_t>(position)+8;
+        const uint64_t next=payload+size+(size&1u);
+        if (payload>0x7fffffffULL || payload+size>riff_end ||
+            next>static_cast<uint64_t>(st.st_size)) break;
+        if (!std::memcmp(chunk_header,"fmt ",4)) {
+            uint8_t fmt[16];
+            if (size<16 || fread(fmt,1,sizeof(fmt),file)!=sizeof(fmt)) break;
+            have_format=true;
+            supported=fmt[0]==1 && fmt[1]==0 && fmt[2]==1 && fmt[3]==0 &&
+                ReadLe32(fmt+4)==kSampleRate && fmt[12]==2 && fmt[13]==0 &&
+                fmt[14]==16 && fmt[15]==0;
+        } else if (!std::memcmp(chunk_header,"data",4)) {
+            data_position=static_cast<long>(payload);
+            remaining=size;
+        }
+        if (have_format && data_position>=0) break;
+        if (next>0x7fffffffULL || fseek(file,static_cast<long>(next),SEEK_SET)!=0) break;
+    }
+    if (!have_format || data_position<0 || (remaining&1u) ||
+        fseek(file,data_position,SEEK_SET)!=0) {
+        PostPlayStatusFromWorker(I18n::T("录音数据不完整"));
+        return false;
+    }
+    if (!supported) {
+        PostPlayStatusFromWorker(I18n::T("不支持此录音格式"));
+        return false;
+    }
+    if (!remaining) {
+        PostPlayStatusFromWorker(I18n::T("录音中没有音频"));
         return false;
     }
     PostPlayStatusFromWorker(I18n::T("播放中…"));
 
-    const int sample_rate = kSampleRate;
     std::vector<int16_t> pcm(static_cast<size_t>(kPlayChunkSamples));
-    while (!s_stop_play.load()) {
-        const size_t want = pcm.size() * sizeof(int16_t);
+    RecordingPlaybackLevel playback_level;
+    bool ok=true;
+    RecordingOutput output(as);
+    if (!output.Prepare()) return false;
+    while (ok&&remaining&&!s_stop_play.load()) {
+        const size_t want = std::min<size_t>(remaining,pcm.size() * sizeof(int16_t));
         const size_t got = fread(pcm.data(), 1, want, file);
-        if (got < sizeof(int16_t)) {
+        if (got != want || (got&1u)) {
+            ok=false;
             break;
         }
         const size_t samples = got / sizeof(int16_t);
+        remaining-=samples*sizeof(int16_t);
         pcm.resize(samples);
+        playback_level.Apply(pcm);
 
-        auto packet = std::make_unique<AudioStreamPacket>();
-        packet->sample_rate = sample_rate;
-        packet->frame_duration = kFrameDurationMs;
-        packet->payload.assign(reinterpret_cast<const uint8_t *>(pcm.data()),
-                               reinterpret_cast<const uint8_t *>(pcm.data()) + samples * sizeof(int16_t));
-        if (!as.PushPacketToDecodeQueue(std::move(packet), true)) {
-            break;
-        }
+        if (!output.Push(pcm.data(),samples)) {ok=false;break;}
         pcm.resize(static_cast<size_t>(kPlayChunkSamples));
     }
-    while (!s_stop_play.load() && !as.IsIdle()) {
-        vTaskDelayMs(20);
-    }
-    return true;
+    // WAV must wait for the SAME lower-half DMA tail as Opus. An empty
+    // software queue does not mean the last ~480ms have reached the speaker.
+    if (!output.Finish()) ok=false;
+    if(!ok&&!s_stop_play.load())PostPlayStatusFromWorker(I18n::T("录音数据不完整或音频输出未就绪"));
+    return ok&&!ferror(file);
 }
 
 void PlayTask(void *arg) {
-    auto *path_copy = static_cast<char *>(arg);
-    const bool is_opus = HasExt(path_copy, ".opus");
-    FILE *file = fopen(path_copy, "rb");
-    HeapFree(path_copy);
-    path_copy = nullptr;
-
-    if (file == nullptr) {
-        PostPlayStatusFromWorker(I18n::T("无法打开录音文件"));
-        s_state.store(RecState::Idle);
-        if (LvglLock() == ESP_OK) {
-            if (s_screen_alive) {
-                UpdateRecordButtonUi();
-            }
-            LvglUnlock();
-        }
-        s_play_task = 0;
-        vTaskDelete(nullptr);
-        return;
+    auto*path_copy=static_cast<char*>(arg);FILE*file=fopen(path_copy,"rb");
+    HeapFree(path_copy);bool played_ok=false,owned=false;
+    auto &as=Application::GetInstance().GetAudioService();
+    sched_param priority{};priority.sched_priority=CONFIG_METALIO_APP_PRIORITY+12;
+    pthread_setschedparam(pthread_self(),SCHED_RR,&priority);
+    do{
+        if(!file){PostPlayStatusFromWorker("无法打开录音文件");break;}
+        // Hold the input lease through playback and its DMA tail. This
+        // prevents wake/AI/notifications from consuming samples or changing
+        // the shared Bluetooth/I2S route, without stopping either DMA engine.
+        if(!as.BeginExclusiveCapture()){PostPlayStatusFromWorker("音频正在使用，请稍后播放");break;}
+        owned=true;
+        if(!PrepareRecorderAudio(false)){PostPlayStatusFromWorker("音频设备尚未就绪，请重试");break;}
+        if(s_stop_play)break;
+        std::vector<char>buffer(16384);setvbuf(file,buffer.data(),_IOFBF,buffer.size());
+        uint8_t signature[12]{};size_t n=fread(signature,1,sizeof(signature),file);
+        if(fseek(file,0,SEEK_SET)!=0||ferror(file))PostPlayStatusFromWorker("读取录音失败");
+        else if(n>=4&&!memcmp(signature,"OggS",4))played_ok=PlayOpusFile(file,as);
+        else if(n==12&&!memcmp(signature,"RIFF",4)&&!memcmp(signature+8,"WAVE",4))played_ok=PlayWavFile(file,as);
+        else PostPlayStatusFromWorker("不支持此录音格式");
+        // fclose must run before the caller-provided stdio buffer is freed.
+        fclose(file);file=nullptr;
+    }while(false);
+    if(file)fclose(file);
+    if(owned)as.EndExclusiveCapture();
+    {std::lock_guard<std::mutex>lock(s_updates.lock);
+        if(played_ok&&!s_stop_play)s_updates.play_status="播放结束";
+        else if(s_stop_play)s_updates.play_status="已停止播放";
+        s_updates.play_generation=s_play_generation;s_updates.play_done=true;
     }
-
-    auto &as = Application::GetInstance().GetAudioService();
-    bool played_ok = false;
-    if (is_opus) {
-        played_ok = PlayOpusFile(file, as);
-    } else {
-        as.ResetDecoder();
-        played_ok = PlayWavFile(file, as);
-    }
-    fclose(file);
-
-    s_playing_path[0] = '\0';
-    s_state.store(RecState::Idle);
-    if (played_ok && !s_stop_play.load()) {
-        PostPlayStatusFromWorker(I18n::T("播放结束"));
-    } else if (s_stop_play.load()) {
-        PostPlayStatusFromWorker(I18n::T("已停止播放"));
-    }
-    if (LvglLock() == ESP_OK) {
-        if (s_screen_alive) {
-            UpdateRecordButtonUi();
-        }
-        LvglUnlock();
-    }
-    s_play_task = 0;
-    vTaskDelete(nullptr);
+    printf("REC_PLAY_RELEASED complete=%d cancelled=%d\n",played_ok,s_stop_play.load());
 }
 
 void StopPlayback() {
@@ -1428,16 +1615,11 @@ void StopPlayback() {
         return;
     }
     s_stop_play.store(true);
-    // 最多等约 300ms，避免长时间卡住 LVGL 线程。
-    for (int i = 0; i < 15 && s_play_task != 0; ++i) {
-        vTaskDelayMs(20);
-    }
-    s_stop_play.store(false);
+    // The worker observes cancellation after this UI callback releases LVGL.
     s_playing_path[0] = '\0';
     if (s_state.load() == RecState::Playing && s_play_task == 0) {
         s_state.store(RecState::Idle);
     }
-    Application::GetInstance().GetAudioService().ResetDecoder();
     UpdateDetailPlayButton();
 }
 
@@ -1452,7 +1634,7 @@ void StartPlayback(const char *path) {
             SetListStatusText(text);
         }
     };
-    if (s_state.load() == RecState::Recording || s_state.load() == RecState::Saving) {
+    if (s_record_task != 0 || s_state.load() == RecState::Recording || s_state.load() == RecState::Saving) {
         set_status(I18n::T("请先结束录音"));
         return;
     }
@@ -1471,13 +1653,17 @@ void StartPlayback(const char *path) {
     std::strcpy(path_copy, path);
     std::snprintf(s_playing_path, sizeof(s_playing_path), "%s", path);
 
+    s_play_generation=s_screen_generation;
+    s_record_after_play=false;
     s_stop_play.store(false);
+    {std::lock_guard<std::mutex>lock(s_updates.lock);s_updates.play_done=false;s_updates.play_status.clear();}
     s_state.store(RecState::Playing);
     UpdateRecordButtonUi();
     UpdateDetailPlayButton();
 
-    if (xTaskCreatePinnedToCore(PlayTask, "rec_play", 8 * 1024, path_copy,
-                                tskIDLE_PRIORITY + 2, &s_play_task, 0) != pdPASS) {
+    s_play_task=1;
+    if (xTaskCreatePinnedToCore(PlayTask, "rec_play", 24 * 1024, path_copy,
+                                tskIDLE_PRIORITY + 2, nullptr, 0) != pdPASS) {
         HeapFree(path_copy);
         s_play_task = 0;
         s_playing_path[0] = '\0';
@@ -1603,7 +1789,7 @@ void AsrQueryTask(void * /*arg*/) {
     strlcpy(name_snapshot, s_detail_name, sizeof(name_snapshot));
     if (name_snapshot[0] == '\0') {
         s_asr_query_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
 
@@ -1613,21 +1799,21 @@ void AsrQueryTask(void * /*arg*/) {
     if (s_stop_asr.load() || !s_detail_open ||
         std::strcmp(name_snapshot, s_detail_name) != 0) {
         s_asr_query_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
 
     // 无记录 / 请求失败：不改动 UI（「没有就不管」）
     if (!res.ok || res.status != 200 || res.body.empty()) {
         s_asr_query_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
 
     cJSON *root = cJSON_Parse(res.body.c_str());
     if (root == nullptr) {
         s_asr_query_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
     cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "code");
@@ -1644,17 +1830,17 @@ void AsrQueryTask(void * /*arg*/) {
     if (need_again) {
         ScheduleAsrQuery();
     }
-    vTaskDelete(nullptr);
+    return;
 }
 
 void ScheduleAsrQuery() {
     if (!s_screen_alive || !s_detail_open || s_detail_name[0] == '\0') {
         return;
     }
-    if (s_asr_query_task != 0) {
+    if (s_asr_query_task != 0 || s_asr_task != 0) {
         return;
     }
-    // 查询结果需联网；未连 WiFi 时静默跳过（不弹窗，本地详情仍可用）。
+    // 查询结果需联网；WiFi 和 4G 均不可用时静默跳过（不弹窗，本地详情仍可用）。
     if (WifiRequired_ShouldBlock()) {
         return;
     }
@@ -1672,14 +1858,14 @@ void AsrUploadTask(void * /*arg*/) {
     if (file == nullptr) {
         PostDetailStatusFromWorker(I18n::T("无法打开录音文件"));
         s_asr_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
     if (fseek(file, 0, SEEK_END) != 0) {
         fclose(file);
         PostDetailStatusFromWorker(I18n::T("读取录音失败"));
         s_asr_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
     const long file_size = ftell(file);
@@ -1687,45 +1873,25 @@ void AsrUploadTask(void * /*arg*/) {
         fclose(file);
         PostDetailStatusFromWorker(I18n::T("录音文件过大或无效"));
         s_asr_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
-    rewind(file);
-
-    auto *file_buf = static_cast<uint8_t *>(HeapMalloc(static_cast<size_t>(file_size)));
-    if (file_buf == nullptr) {
-        fclose(file);
-        PostDetailStatusFromWorker(I18n::T("内存不足"));
-        s_asr_task = 0;
-        vTaskDelete(nullptr);
-        return;
-    }
-    const size_t got = fread(file_buf, 1, static_cast<size_t>(file_size), file);
     fclose(file);
-    if (got != static_cast<size_t>(file_size)) {
-        HeapFree(file_buf);
-        PostDetailStatusFromWorker(I18n::T("读取录音失败"));
-        s_asr_task = 0;
-        vTaskDelete(nullptr);
-        return;
-    }
-
     if (s_stop_asr.load()) {
-        HeapFree(file_buf);
         s_asr_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
 
-    const char *fname = s_detail_name[0] != '\0' ? s_detail_name : "recording.opus";
+    const std::string path_snapshot(s_detail_path);
+    const std::string name_snapshot(s_detail_name[0] ? s_detail_name : "recording.opus");
     PostDetailStatusFromWorker(I18n::T("正在上传…"));
-    AsrUploadResponse res = GetRecordingHttp()->UploadTranscribe(s_detail_path, fname);
-    (void)file_buf;  // Stub backend does not need the bytes; real impl will.
-    HeapFree(file_buf);
+    AsrUploadResponse res = GetRecordingHttp()->UploadTranscribe(
+        path_snapshot.c_str(), name_snapshot.c_str());
 
-    if (s_stop_asr.load() || !s_detail_open) {
+    if (s_stop_asr.load() || !s_detail_open || path_snapshot != s_detail_path) {
         s_asr_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
 
@@ -1734,7 +1900,7 @@ void AsrUploadTask(void * /*arg*/) {
         std::snprintf(err, sizeof(err), I18n::T("转写失败（HTTP %d）"), res.status);
         PostDetailStatusFromWorker(err);
         s_asr_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
 
@@ -1742,7 +1908,7 @@ void AsrUploadTask(void * /*arg*/) {
     if (root == nullptr) {
         PostDetailStatusFromWorker(I18n::T("转写结果解析失败"));
         s_asr_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
 
@@ -1757,7 +1923,7 @@ void AsrUploadTask(void * /*arg*/) {
         }
         cJSON_Delete(root);
         s_asr_task = 0;
-        vTaskDelete(nullptr);
+        return;
         return;
     }
 
@@ -1766,24 +1932,24 @@ void AsrUploadTask(void * /*arg*/) {
     PostDetailStatusFromWorker(
         I18n::T("上传成功，请稍后来查看转写结果，勿反复上传"));
     s_asr_task = 0;
-    vTaskDelete(nullptr);
+    return;
 }
 
 void OnDetailAsrClicked(lv_event_t * /*e*/) {
     if (s_detail_path[0] == '\0') {
         return;
     }
-    if (s_asr_task != 0) {
+    if (s_asr_task != 0 || s_asr_query_task != 0) {
         SetDetailStatusText(I18n::T("正在上传…"));
         return;
     }
-    if (s_state.load() == RecState::Recording || s_state.load() == RecState::Saving) {
+    if (s_record_task != 0 || s_state.load() == RecState::Recording || s_state.load() == RecState::Saving) {
         SetDetailStatusText(I18n::T("请先结束录音"));
         return;
     }
-    // 转写需联网：WiFi 模式未连接时弹窗拦截（本地录音/播放不受影响）。
+    // 转写需联网：WiFi 和 4G 均不可用时弹窗拦截（本地录音/播放不受影响）。
     if (WifiRequired_ShouldBlock()) {
-        WifiRequired_ShowDialog("请先连接 WiFi 后再使用转写");
+        WifiRequired_ShowDialog("请先连接 WiFi 或 4G 后再使用转写");
         return;
     }
 
@@ -1802,10 +1968,8 @@ void HideDetail() {
     if (!s_detail_open) {
         return;
     }
-    if (s_state.load() == RecState::Playing &&
-        std::strcmp(s_playing_path, s_detail_path) == 0) {
-        StopPlayback();
-    }
+    // Returning to the list is navigation, not a stop command. The playback
+    // worker owns its file and stays alive until EOF or an explicit stop.
     s_stop_asr.store(true);
     s_detail_open = false;
     s_detail_idx = -1;
@@ -1891,11 +2055,27 @@ void ClearListChildren() {
 
 void RebuildFileList() { RebuildFileList(true); }
 
-void RebuildFileList(bool schedule_fill) {
+void *ScanRecordingFiles(void *arg){
+    uint32_t generation=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(arg));
+    auto files=CollectRecordings();
+    std::lock_guard<std::mutex>lock(s_updates.lock);
+    s_updates.files=std::move(files);s_updates.files_generation=generation;s_updates.files_ready=true;
+    return nullptr;
+}
+void RebuildFileList(bool schedule_fill){
+    if(!s_screen_alive)return;
+    s_fill_durations=s_fill_durations||schedule_fill;
+    if(s_scan_busy){s_refresh_again=true;return;}
+    s_scan_busy=true;pthread_attr_t a;pthread_attr_init(&a);pthread_attr_setstacksize(&a,16384);
+    pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);pthread_t t;
+    int rc=hi_task_create_legacy(&t,&a,ScanRecordingFiles,reinterpret_cast<void*>(static_cast<uintptr_t>(s_screen_generation)));
+    pthread_attr_destroy(&a);
+    if(rc){s_scan_busy=false;SetListStatusText("录音列表读取失败，请重试");}
+}
+void RenderFileList(bool schedule_fill) {
     if (!s_screen_alive || s_ui.list_scroll == nullptr) {
         return;
     }
-    CollectRecordings();
     ClearListChildren();
 
     if (s_files.empty()) {
@@ -1990,29 +2170,25 @@ void OnTabChanged(lv_event_t *e) {
 }
 
 void ForceStopAll() {
+    s_record_after_play=false;
     s_stop_record.store(true);
     s_stop_play.store(true);
     s_stop_asr.store(true);
     s_stop_meta.store(true);
     StopTickTimer();
-    for (int i = 0; i < 80 &&
-         (s_record_task != 0 || s_play_task != 0 || s_asr_task != 0 ||
-          s_asr_query_task != 0 || s_meta_task != 0);
-         ++i) {
-        vTaskDelayMs(20);
-    }
-    s_stop_record.store(false);
-    s_stop_play.store(false);
-    s_stop_asr.store(false);
-    s_stop_meta.store(false);
+    // Leave cancellation set until the corresponding worker has exited.
     s_playing_path[0] = '\0';
     s_detail_open = false;
     s_detail_idx = -1;
     s_detail_path[0] = '\0';
     s_detail_name[0] = '\0';
-    s_state.store(RecState::Idle);
-    RestoreWakeWordIfNeeded();
-    Application::GetInstance().GetAudioService().ResetDecoder();
+    // The capture worker still owns the microphone until it closes the
+    // file and restores wake-word detection. Do not start a competing
+    // reader while its final I2S request is being cancelled.
+    if (s_record_task == 0 && s_play_task == 0) {
+        s_state.store(RecState::Idle);
+        RestoreWakeWordIfNeeded();
+    }
 }
 
 void BuildDetailPanel(lv_obj_t *parent) {
@@ -2328,7 +2504,8 @@ void OnSwipeBack() {
 
 void OnBackClicked(lv_event_t * /*e*/) { OnSwipeBack(); }
 
-void OnScreenUnloaded(lv_event_t * /*e*/) {
+void OnScreenUnloaded(lv_event_t *e) {
+    if(lv_event_get_target_obj(e)!=s_ui.screen)return;
     ForceStopAll();
     s_screen_alive = false;
     s_detail_open = false;
@@ -2336,13 +2513,32 @@ void OnScreenUnloaded(lv_event_t * /*e*/) {
     s_files.clear();
 }
 
+void *PrepareRecordingStorage(void *arg) {
+    const uint32_t generation = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(arg));
+    const bool ready = SdCardManager::GetInstance().EnsureWritable() && EnsureRecordingsDir();
+    lv_lock();
+    if (s_screen_alive && generation == s_screen_generation) {
+        s_sd_ready = ready;
+        if (ready) {
+            RebuildFileList();
+            SetRecordStatusText(I18n::T("点击开始录音"));
+        } else {
+            SetRecordStatusText(I18n::T("请插入 SD 卡"));
+        }
+    }
+    lv_unlock();
+    return nullptr;
+}
+
 }  // namespace
 
 lv_obj_t *RecordingScreen::CreateStatic() {
+    if(!s_worker_ui_timer)s_worker_ui_timer=lv_timer_create(ApplyWorkerUpdates,60,nullptr);
     s_ui = {};
     s_screen_alive = true;
-    s_state.store(RecState::Idle);
-    s_sd_ready = SdCardManager::GetInstance().IsMounted();
+    ++s_screen_generation;
+    if (s_record_task == 0 && s_play_task == 0) s_state.store(RecState::Idle);
+    s_sd_ready = false;
 
     lv_obj_t *scr = lv_obj_create(nullptr);
     s_ui.screen = scr;
@@ -2354,14 +2550,18 @@ lv_obj_t *RecordingScreen::CreateStatic() {
 
     BuildHeader(scr);
 
-    if (!s_sd_ready) {
-        BuildNoSdHint(scr);
-    } else {
-        EnsureRecordingsDir();
-        BuildTabView(scr);
-        BuildDetailPanel(scr);
-        RebuildFileList();
-    }
+    BuildTabView(scr);
+    BuildDetailPanel(scr);
+    SetRecordStatusText(I18n::T("正在读取 SD 卡…"));
+    pthread_t storage_thread;
+    pthread_attr_t storage_attr;
+    pthread_attr_init(&storage_attr);
+    pthread_attr_setstacksize(&storage_attr, 8192);
+    pthread_attr_setdetachstate(&storage_attr, PTHREAD_CREATE_DETACHED);
+    if (hi_task_create_legacy(&storage_thread, &storage_attr, PrepareRecordingStorage,
+                       reinterpret_cast<void *>(static_cast<uintptr_t>(s_screen_generation))) != 0)
+        SetRecordStatusText(I18n::T("SD 卡读取失败"));
+    pthread_attr_destroy(&storage_attr);
 
     screen_attach_swipe_back(scr, OnSwipeBack);
     lv_obj_add_event_cb(scr, OnScreenUnloaded, LV_EVENT_SCREEN_UNLOADED, nullptr);
@@ -2381,3 +2581,5 @@ void RecordingScreen::LifecycleCallback(screen_lifecycle_event_t event) {
         ForceStopAll();
     }
 }
+
+bool RecordingScreen::IsCapturing() { return s_state.load()==RecState::Recording || s_state.load()==RecState::Saving; }

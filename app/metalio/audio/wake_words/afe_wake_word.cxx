@@ -1,3 +1,4 @@
+#include "hi_task_cpp.h"
 /*
  * AfeWakeWord — ESP-SR AFE + WakeNet port for NuttX Metalio.
  * Based on MetalioClaw4 main/audio/wake_words/afe_wake_word.cc.
@@ -209,7 +210,7 @@ bool AfeWakeWord::Initialize(AudioCodec *codec, srmodel_list_t *models_list)
         pthread_attr_t cattr;
         pthread_attr_init(&cattr);
         pthread_attr_setstacksize(&cattr, 256 * 1024);
-        pret = pthread_create(
+        pret = hi_task_create_legacy(
             &th, &cattr,
             [](void *arg) -> void * {
                 auto *j = static_cast<CreateJob *>(arg);
@@ -259,14 +260,14 @@ bool AfeWakeWord::Initialize(AudioCodec *codec, srmodel_list_t *models_list)
     write(1, "WW_I5\n", 6);
     if (detect_task_ == 0)
     {
-        xTaskCreate(
+        xTaskCreatePinnedToCore(
             [](void *arg) {
                 auto *self = static_cast<AfeWakeWord *>(arg);
                 self->AudioDetectionTask();
                 self->detect_task_ = 0;
                 vTaskDelete(nullptr);
             },
-            "audio_detection", 8192, this, 3, &detect_task_);
+            "audio_detection", 8192, this, 3, &detect_task_, 0);
     }
     write(1, "WW_I6\n", 6);
 
@@ -406,7 +407,7 @@ void AfeWakeWord::EncodeWakeWordData()
         return;
 
     wake_word_opus_.clear();
-    std::thread([this]() {
+    HiTask::LegacyThread([this]() {
         auto encoder = std::make_unique<OpusEncoderWrapper>(16000, 1, 60);
         encoder->SetComplexity(0);
         int packets = 0;

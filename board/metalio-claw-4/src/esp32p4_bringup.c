@@ -76,13 +76,11 @@ int metalio_qmc6309_initialize(FAR struct i2c_master_s *i2c);
 int metalio_gps_initialize(void);
 int metalio_sdcard_initialize(void);
 int metalio_camera_initialize(FAR struct i2c_master_s *i2c);
-#ifdef CONFIG_METALIO_CAMERA_OV2710
-int metalio_camera_capture_test(void);
-#endif
-
 int metalio_bq27220_read_soc(FAR int *percent);
 int metalio_tca9555_read_pin(int pin, FAR bool *level);
 int metalio_pwr_shutdown_pulse(void);
+int metalio_boot_claim_backlight_pwm(void);
+void metalio_boot_pwr_vibrate_once(void);
 
 /****************************************************************************
  * Name: metalio_check_battery_at_boot
@@ -112,12 +110,10 @@ static void metalio_check_battery_at_boot(void)
 
           if (level == 0 && !usb && !wchg)
             {
-              syslog(LOG_WARNING, "Battery 0%%, forcing power off\n");
-              (void)metalio_pwr_shutdown_pulse();
-              for (; ; )
-                {
-                  up_mdelay(1000);
-                }
+              /* USB-JTAG often does not raise USB_INSERT; a false 0%
+               * reading previously killed the board (black, no reboot). */
+              write(1, "BATT0\n", 6);
+              syslog(LOG_WARNING, "Battery 0%%, skip force power off\n");
             }
 
           return;
@@ -137,6 +133,8 @@ int esp_bringup(void)
 {
   int ret = OK;
   FAR struct i2c_master_s *i2c = NULL;
+
+  write(1, "BU0\n", 4);
 
 #ifdef CONFIG_FS_PROCFS
   ret = nx_mount(NULL, "/proc", "procfs", 0, NULL);
@@ -216,11 +214,28 @@ int esp_bringup(void)
 #endif /* CONFIG_ESPRESSIF_I2C0 */
 
 #if defined(CONFIG_METALIO_DISPLAY_NV3051F) || defined(CONFIG_METALIO_DISPLAY_FL7707N)
+  write(1, "DISP_HW0\n", 9);
   ret = metalio_display_initialize();
   if (ret < 0)
     {
       syslog(LOG_WARNING, "Display init failed: %d\n", ret);
     }
+  write(1, "DISP_HW1\n", 9);
+#endif
+
+#ifdef CONFIG_ESPRESSIF_LEDC
+  /* Register LEDC only. Backlight duty and the boot buzz happen after
+   * the guide frame is flushed (see NuttxLvglDisplay::SetupUI). */
+  write(1, "LEDC0\n", 6);
+  ret = board_ledc_setup();
+  if (ret < 0)
+    {
+      syslog(LOG_WARNING, "LEDC backlight init failed: %d\n", ret);
+    }
+  /* Do not light the backlight or buzz here. The framebuffer is still
+   * empty, so a 75% PWM shows a black panel for the whole haptic.
+   * NuttxLvglDisplay flushes the boot guide, then turns the backlight
+   * on and calls metalio_boot_pwr_vibrate_once(). */
 #endif
 
   /* GT911 touch — initialized after display power is stable.
@@ -294,6 +309,11 @@ int esp_bringup(void)
        * ready for the application-layer MetalioAudioCodec. */
       metalio_tca9555_write_pin(BOARD_IOEXP_PA_ENABLE, true);
       syslog(LOG_INFO, "I2S+PA ready\n");
+
+      /* Ground truth: is the BT codec actually driving BCLK/WS? A static
+       * bus here means the AT mode-1 sequence failed and the mic read path
+       * will block forever (no WAKE rms heartbeat, dead voice wake). */
+      metalio_bt_probe_clocks();
     }
 #endif /* CONFIG_ESPRESSIF_I2S */
 
@@ -324,29 +344,12 @@ int esp_bringup(void)
     }
 #endif
 
-#ifdef CONFIG_ESPRESSIF_LEDC
-  /* LCD backlight PWM — registers /dev/pwm0 (LEDC timer0, GPIO 52). */
-
-  ret = board_ledc_setup();
-  if (ret < 0)
-    {
-      syslog(LOG_WARNING, "LEDC backlight init failed: %d\n", ret);
-    }
-#endif
-
-#ifdef CONFIG_METALIO_CAMERA_OV2710
-  /* Temporary V4L2 capture bring-up test: stream a few RAW10 frames from
-   * /dev/video0 and report the result. */
-#if 0
-  ret = metalio_camera_capture_test();
-  if (ret < 0)
-    {
-      syslog(LOG_WARNING, "Camera capture test failed: %d\n", ret);
-    }
-#endif
-#endif
-
   UNUSED(i2c);
+#ifdef CONFIG_METALIO_FLASH32
+  extern int esp_flash32_initialize(void);
+  if (esp_flash32_initialize() < 0)
+    syslog(LOG_ERR, "FLASH32_UNAVAILABLE\n");
+#endif
   write(1, "BRINGUP_END\n", 12);
   return OK;
 }

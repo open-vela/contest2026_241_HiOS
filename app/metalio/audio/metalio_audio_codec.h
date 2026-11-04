@@ -27,6 +27,8 @@
 #define _METALIO_AUDIO_CODEC_H
 
 #include "audio_codec.h"
+#include <mutex>
+#include <atomic>
 
 /*
  * NuttX I2S audio device paths.
@@ -54,9 +56,11 @@ public:
 
     /* Software volume only — I2S has no FU_VOLUME and the ioctl can glitch. */
     virtual void SetOutputVolume(int volume) override;
+    virtual void SetOutputVolume(int volume, bool persist) override;
     virtual void EnableInput(bool enable) override;
     virtual void EnableOutput(bool enable) override;
     virtual void Start() override;
+    void SetRecordingInput(bool enabled) override;
 
 protected:
     /*
@@ -76,11 +80,26 @@ protected:
 private:
     /* Reuse conversion scratch to avoid per-frame heap churn on the
      * audio threads (fragmentation here has caused crackle + LVGL blue). */
+    std::mutex device_mutex_;
+    std::mutex read_mutex_;
+    std::mutex write_mutex_;
     std::vector<int32_t> write_scratch_;
     std::vector<int32_t> read_scratch_;
     /* Cached from SetOutputVolume — avoids pow() every Write() frame. */
-    int32_t volume_factor_ = 0;
+    std::atomic<int32_t> volume_factor_{0};
+    // Write mutex owns ramp state; UI only publishes the requested gain.
+    int32_t applied_volume_factor_ = 0;
+    int32_t ramp_start_factor_ = 0;
+    int32_t ramp_target_factor_ = 0;
+    unsigned gain_ramp_position_ = 160;
+    /* 0=>>12 (Claw4), 1=>>16, 2=low 16-bit. Locked after a few frames. */
+    bool recording_input_=false;
+    int rx_pack_ = 0;
+    int rx_calib_ = 0;
+    bool rx_started_ = false;
+    bool tx_started_ = false;
     void RecalcVolumeFactor();
+    void EnsureDirStarted(bool input);
 };
 
 #endif /* _METALIO_AUDIO_CODEC_H */

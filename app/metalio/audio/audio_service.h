@@ -170,6 +170,7 @@ struct AudioTask
     AudioTaskType type;
     std::vector<int16_t> pcm;
     uint32_t timestamp;
+    uint32_t local_session = 0;
 };
 
 struct DebugStatistics
@@ -230,14 +231,29 @@ public:
     void SetWakeWordUpgradeAllowed(bool allowed);
     bool IsWakeWordUpgradeAllowed() const;
 
+    // Prepare local recognition during boot without starting cloud audio.
+    bool PrepareWakeWordDetection();
     void EnableWakeWordDetection(bool enable);
     void ReleaseWakeWordEngine();
-    bool IsWakeWordEngineReady() const { return wake_word_initialized_; }
+    // Initialize starts an asynchronous worker. HiOpenvela publishes its
+    // nonzero feed size only AFTER create, real vocabulary/FST and threshold
+    // setup have completed; a prepared thread alone is not a ready model.
+    bool IsWakeWordEngineReady() const {
+        return wake_word_initialized_ && wake_word_ && wake_word_->GetFeedSize()>0;
+    }
     /* Spawn WakeNet init off the boot path (after Home is ready). */
     void EnsureWakeWordReady();
     void EnableVoiceProcessing(bool enable);
+    // Only camera+voice mode needs capture/Opus priority over image work.
+    void SetVisualConversation(bool active) { visual_conversation_.store(active); }
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
+    // Local speech interruption is separate from full-duplex device AEC.
+    void EnableBargeIn(bool enable) { barge_in_enabled_.store(enable, std::memory_order_release); }
+    bool IsBargeInEnabled() const { return barge_in_enabled_.load(std::memory_order_acquire); }
+
+    /* NoAudioProcessor has no AEC. Realtime barge-in stays off until one exists. */
+    bool SupportsDeviceAec() const { return false; }
 
     /* Callbacks */
     void SetCallbacks(AudioServiceCallbacks& callbacks);
@@ -247,6 +263,43 @@ public:
                                  bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
+
+    /*
+     * Queue mono PCM onto the audio output task (safe from UI thread).
+     * Prefer this over OutputPcm for short UI sounds — OutputPcm from a
+     * random pthread solid-blues LVGL on this port.
+     */
+    void PlayLocalPcm(const int16_t* data, size_t samples);
+    /* Non-blocking 16 kHz mono frames for radio — never opens pcm0 itself. */
+    void EnqueuePlaybackPcm(const int16_t* data, size_t samples);
+    /* Reports queue backpressure so streaming sources can retry instead of
+     * silently dropping decoded frames. */
+    bool TryEnqueuePlaybackPcm(const int16_t* data, size_t samples);
+    // Local-file PCM is isolated from asynchronous voice teardown.
+    uint32_t BeginLocalPlayback(size_t prebuffer_samples = 6400, bool complete_write = false);
+    uint32_t BeginLocalPlayback(size_t prebuffer_samples, bool complete_write, bool capture_owner);
+    uint32_t BeginLocalPlayback(size_t prebuffer_samples, bool complete_write, bool capture_owner, bool require_idle);
+    uint32_t LocalPlaybackTimeMs(uint32_t session) const;
+    void PauseLocalPlayback(uint32_t session, bool pause);
+    bool LocalPlaybackWriteFailed(uint32_t session) const;
+    bool BeginExclusiveCapture();
+    void EndExclusiveCapture();
+    bool HasExclusiveCapture() const { return exclusive_capture_.load(); }
+    // No previous file writer or its queued DMA tail may overlap a new capture.
+    bool LocalPlaybackSettled() const;
+    bool VoicePlaybackSettled() const;
+    bool TryEnqueueLocalPcm(uint32_t session,const int16_t *data,size_t samples);
+    void FlushLocalPlayback(uint32_t session);
+    void FinishLocalPlayback(uint32_t session);
+    bool LocalPlaybackDrained(uint32_t session) const;
+    void EndLocalPlayback(uint32_t session);
+    bool HasLocalPlaybackSession() const;
+    // Independent 16 kHz notification lane; never clears a media session.
+    uint32_t BeginNotification();
+    bool EnqueueNotification(uint32_t,const int16_t*,size_t);
+    void EndNotification(uint32_t);
+    bool NotificationDrained(uint32_t) const;
+    void ClearWakeWordMute();
 
     /*
      * Write raw mono PCM directly to the codec output (speaker).  Used by
@@ -277,15 +330,22 @@ public:
     {
         return protect_downlink_playback_.load(std::memory_order_relaxed);
     }
+    /* Speaker chime / BT AT clicks must not be heard as a wake phrase. */
+    bool ShouldSuppressWakeWord() const;
+    void MuteWakeWordForMs(uint32_t ms);
     /* While armed, EnableVoiceProcessing(true) must not wipe decode/playback
      * queues — first-wake cloud greeting often arrives around detect/start. */
     void ArmDownlinkPlaybackProtect();
     void ClearDownlinkPlaybackProtect();
+    // A small jitter buffer applies only to the greeting of a new wake session.
+    void BeginWakeGreetingPlayback();
+    void NotifyTtsStreamEnded();
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void SetModelsList(srmodel_list_t* models_list);
 
-    /* Volume / mute control */
+    /* Volume / mute. One-arg persists; two-arg persist=false for live drag. */
     void SetVolume(int volume);
+    void SetVolume(int volume, bool persist);
     int GetVolume() const;
     AudioCodec *GetCodec() const { return codec_; }
     void SetMute(bool mute);
@@ -327,6 +387,20 @@ private:
 
     /* Audio encode / decode queues */
     mutable std::mutex audio_queue_mutex_;
+    std::deque<int16_t> notification_pcm_;
+    uint32_t notification_epoch_=0;
+    bool decode_in_progress_ = false; // guarded by audio_queue_mutex_
+    uint32_t local_session_counter_=0,local_session_=0,output_local_session_=0;
+    uint64_t local_clock_samples_=0;int64_t local_clock_start_ms_=0,local_pause_ms_=0;
+    size_t local_prebuffer_=6400;
+    bool local_buffering_=false,local_finished_=false;
+    bool local_complete_write_=false,local_write_failed_=false;
+    bool output_in_progress_ = false; // guarded by audio_queue_mutex_
+    bool wake_greeting_active_ = false; // guarded by audio_queue_mutex_
+    bool wake_greeting_started_ = false;
+    bool wake_greeting_ended_ = false;
+    std::chrono::steady_clock::time_point wake_greeting_first_packet_{};
+    std::chrono::steady_clock::time_point wake_greeting_drain_until_{};
     std::condition_variable audio_queue_cv_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_send_queue_;
@@ -337,6 +411,7 @@ private:
     bool wake_word_initialized_ = false;
     bool audio_processor_initialized_ = false;
     bool device_aec_enabled_ = false;
+    std::atomic<bool> barge_in_enabled_{false};
     bool using_esp_wake_word_ = false;
     std::atomic<bool> wake_word_probe_started_{false};
     /* Cleared during wake/Connecting/Listening so Esp create cannot swap
@@ -344,8 +419,14 @@ private:
     std::atomic<bool> wake_word_upgrade_allowed_{true};
     std::atomic<bool> voice_detected_{false};
     std::atomic<bool> service_stopped_{true};
+    std::atomic<bool> exclusive_capture_{false},capture_yielded_{false};
+    std::atomic<uint32_t> capture_request_{0},capture_ack_{0};
+    uint64_t local_output_tail_until_ms_=0; // audio_queue_mutex_
+    std::atomic<bool> visual_conversation_{false};
     bool audio_input_need_warmup_ = false;
     std::atomic<bool> protect_downlink_playback_{false};
+    std::atomic<uint64_t> wake_mute_until_ms_{0};
+    std::atomic<uint64_t> hold_tx_until_ms_{0};
     /* When true (Speaking), ShouldSuppressUplink may mute mic for TTS.
      * Must be false in Listening or leftover decode keeps STT dead. */
     std::atomic<bool> tts_uplink_gate_{false};
