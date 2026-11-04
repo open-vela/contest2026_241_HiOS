@@ -1,0 +1,560 @@
+{
+  "range_start": "2026-10-07T00:00:00+08:00",
+  "range_end": "2026-11-04T21:23:29.735931+08:00",
+  "first_message": "2026-10-08T18:04:49+08:00",
+  "last_message": "2026-11-04T21:22:52+08:00",
+  "messages": 8575,
+  "key_messages": 2437,
+  "threads": 62,
+  "duplicates_removed": 286,
+  "errors": [],
+  "files": [
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-09T15-50-49-01a11fa4-b379-7cd3-b5ec-6c55090d368b.jsonl",
+      "thread_id": "01a11fa4-b379-7cd3-b5ec-6c55090d368b",
+      "relevant": true,
+      "messages": 54,
+      "bytes": 5945119
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-14T17-39-24-01a139c7-e80b-7c33-b1d8-3acdbd3286bb.jsonl",
+      "thread_id": "01a139c7-e80b-7c33-b1d8-3acdbd3286bb",
+      "relevant": true,
+      "messages": 179,
+      "bytes": 9287663
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-15T21-33-57-01a13fc4-fdbd-7840-94d7-8bd39d726259.jsonl.zst",
+      "thread_id": "01a13fc4-fdbd-7840-94d7-8bd39d726259",
+      "relevant": true,
+      "messages": 23,
+      "bytes": 175586
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-15T21-34-51-01a13fc5-d3df-7a13-9c9a-95da94afaa4f.jsonl.zst",
+      "thread_id": "01a13fc5-d3df-7a13-9c9a-95da94afaa4f",
+      "relevant": true,
+      "messages": 9,
+      "bytes": 82935
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-15T22-24-25-01a13ff3-329b-7d10-a61a-fe7971bbc51c.jsonl.zst",
+      "thread_id": "01a13ff3-329b-7d10-a61a-fe7971bbc51c",
+      "relevant": true,
+      "messages": 147,
+      "bytes": 2620265
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-16T16-51-12-01a143e8-7d9a-7fa1-97a1-e97bcd19e5cd.jsonl.zst",
+      "thread_id": "01a143e8-7d9a-7fa1-97a1-e97bcd19e5cd",
+      "relevant": true,
+      "messages": 56,
+      "bytes": 1016757
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-21T21-37-50-01a15eae-b74e-7533-89f9-1053e7fb39b4.jsonl.zst",
+      "thread_id": "01a15eae-b74e-7533-89f9-1053e7fb39b4",
+      "relevant": true,
+      "messages": 16,
+      "bytes": 110803
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-21T22-20-59-01a15ed6-3780-7e92-91e3-519bc24f3382.jsonl.zst",
+      "thread_id": "01a15ed6-3780-7e92-91e3-519bc24f3382",
+      "relevant": true,
+      "messages": 2,
+      "bytes": 49901
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-22T01-53-28-01a15f98-bdd4-7e31-be4b-7882851c8479.jsonl.zst",
+      "thread_id": "01a15f98-bdd4-7e31-be4b-7882851c8479",
+      "relevant": true,
+      "messages": 7,
+      "bytes": 54424
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-22T10-33-53-01a16175-33ad-7500-86aa-23542b8216c7.jsonl.zst",
+      "thread_id": "01a16175-33ad-7500-86aa-23542b8216c7",
+      "relevant": false,
+      "messages": 0,
+      "bytes": 50946
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-23T02-37-55-01a164e7-ce54-7861-b54d-21abc1fb78b7.jsonl.zst",
+      "thread_id": "01a164e7-ce54-7861-b54d-21abc1fb78b7",
+      "relevant": true,
+      "messages": 3,
+      "bytes": 52246
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-23T11-47-58-01a166df-6581-7d03-8953-5b0272b1d665.jsonl.zst",
+      "thread_id": "01a166df-6581-7d03-8953-5b0272b1d665",
+      "relevant": true,
+      "messages": 48,
+      "bytes": 281857
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-23T12-11-42-01a166f5-1c9f-7fd0-8da6-a22be415bb0c.jsonl.zst",
+      "thread_id": "01a166f5-1c9f-7fd0-8da6-a22be415bb0c",
+      "relevant": true,
+      "messages": 28,
+      "bytes": 719481
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-23T12-39-39-01a1670e-b36b-7d03-af5b-6b85850d0ed6.jsonl.zst",
+      "thread_id": "01a1670e-b36b-7d03-af5b-6b85850d0ed6",
+      "relevant": true,
+      "messages": 5,
+      "bytes": 53331
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-23T13-53-42-01a16752-8212-7b52-a2ab-b397f51464a5.jsonl.zst",
+      "thread_id": "01a16752-8212-7b52-a2ab-b397f51464a5",
+      "relevant": true,
+      "messages": 15,
+      "bytes": 161465
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-23T15-04-03-01a16792-e708-7341-8411-abf165b8742a.jsonl.zst",
+      "thread_id": "01a16792-e708-7341-8411-abf165b8742a",
+      "relevant": true,
+      "messages": 16,
+      "bytes": 128897
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-23T16-19-23-01a167d7-e258-7713-9dcf-1c38694d9839.jsonl.zst",
+      "thread_id": "01a167d7-e258-7713-9dcf-1c38694d9839",
+      "relevant": true,
+      "messages": 33,
+      "bytes": 740379
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-23T18-13-08-01a16840-045f-7762-83a3-61c6fe24aea4.jsonl.zst",
+      "thread_id": "01a16840-045f-7762-83a3-61c6fe24aea4",
+      "relevant": true,
+      "messages": 3,
+      "bytes": 52191
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-24T23-12-45-01a16e78-aed7-78a2-b704-686bd0f269bc.jsonl",
+      "thread_id": "01a16e78-aed7-78a2-b704-686bd0f269bc",
+      "relevant": true,
+      "messages": 168,
+      "bytes": 6972066
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-25T04-20-57-01a16f92-d9ed-79a0-8639-e340a864f31c.jsonl.zst",
+      "thread_id": "01a16f92-d9ed-79a0-8639-e340a864f31c",
+      "relevant": true,
+      "messages": 59,
+      "bytes": 1476139
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-25T04-45-08-01a16fa8-fcfb-7b20-aa5a-63fe50bd7475.jsonl.zst",
+      "thread_id": "01a16fa8-fcfb-7b20-aa5a-63fe50bd7475",
+      "relevant": true,
+      "messages": 14,
+      "bytes": 111598
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-25T13-05-33-01a17173-227b-7ca1-b75e-5cf2bf45886c.jsonl.zst",
+      "thread_id": "01a17173-227b-7ca1-b75e-5cf2bf45886c",
+      "relevant": true,
+      "messages": 4,
+      "bytes": 68791
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-25T21-48-08-01a17351-9490-7043-b954-8e7b2930fac5.jsonl.zst",
+      "thread_id": "01a17351-9490-7043-b954-8e7b2930fac5",
+      "relevant": true,
+      "messages": 16,
+      "bytes": 229690
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-25T22-28-23-01a17376-6eea-7e53-93a4-bdc7e861839d.jsonl.zst",
+      "thread_id": "01a17376-6eea-7e53-93a4-bdc7e861839d",
+      "relevant": true,
+      "messages": 4,
+      "bytes": 53448
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-26T14-07-33-01a176d2-43f9-7150-bdcf-03bd1334ecf9.jsonl.zst",
+      "thread_id": "01a176d2-43f9-7150-bdcf-03bd1334ecf9",
+      "relevant": true,
+      "messages": 6,
+      "bytes": 527083
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-26T16-01-25-01a1773a-8273-71a2-a60e-27e66ba13ddb.jsonl.zst",
+      "thread_id": "01a1773a-8273-71a2-a60e-27e66ba13ddb",
+      "relevant": true,
+      "messages": 6,
+      "bytes": 115696
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-26T18-37-08-01a177c9-1339-7a60-900d-c2e82b90c7ed.jsonl.zst",
+      "thread_id": "01a177c9-1339-7a60-900d-c2e82b90c7ed",
+      "relevant": true,
+      "messages": 15,
+      "bytes": 11273301
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-27T14-54-00-01a17c23-25be-7bc0-95f1-023e4325809d.jsonl",
+      "thread_id": "01a17c23-25be-7bc0-95f1-023e4325809d",
+      "relevant": true,
+      "messages": 18,
+      "bytes": 935710
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-27T18-47-36-01a17cf9-039e-73d3-bdf3-79f1c040ac88.jsonl.zst",
+      "thread_id": "01a17cf9-039e-73d3-bdf3-79f1c040ac88",
+      "relevant": true,
+      "messages": 5,
+      "bytes": 63233
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-27T20-56-56-01a17d6f-6bc0-7a00-bdf7-b7cdf4b6749c.jsonl.zst",
+      "thread_id": "01a17d6f-6bc0-7a00-bdf7-b7cdf4b6749c",
+      "relevant": true,
+      "messages": 35,
+      "bytes": 382620
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-27T23-18-09-01a17df0-b731-7753-a973-ae2224d0f17d.jsonl.zst",
+      "thread_id": "01a17df0-b731-7753-a973-ae2224d0f17d",
+      "relevant": true,
+      "messages": 3,
+      "bytes": 52436
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-28T01-31-10-01a17e6a-7cad-7260-8543-d2851b174d0d.jsonl.zst",
+      "thread_id": "01a17e6a-7cad-7260-8543-d2851b174d0d",
+      "relevant": true,
+      "messages": 4,
+      "bytes": 93418
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-28T13-32-31-01a180fe-e812-7540-a585-bf430243548f.jsonl",
+      "thread_id": "01a180fe-e812-7540-a585-bf430243548f",
+      "relevant": true,
+      "messages": 3,
+      "bytes": 227471
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-28T15-56-35-01a18182-cbd0-78d2-be5b-2994a7626e71.jsonl",
+      "thread_id": "01a18182-cbd0-78d2-be5b-2994a7626e71",
+      "relevant": true,
+      "messages": 168,
+      "bytes": 14964079
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-28T16-26-15-01a1819d-f528-7d10-b240-9acdcd3f7bd0.jsonl",
+      "thread_id": "01a1819d-f528-7d10-b240-9acdcd3f7bd0",
+      "relevant": true,
+      "messages": 35,
+      "bytes": 2299420
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-29T02-00-15-01a183ab-79cb-7b80-a20d-5650ec034980.jsonl",
+      "thread_id": "01a183ab-79cb-7b80-a20d-5650ec034980",
+      "relevant": true,
+      "messages": 8,
+      "bytes": 432758
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-29T02-25-01-01a183ab-79cb-7b80-a20d-5650ec034980_01a183c2-254c-7443-96e0-71bc28a781d7.jsonl",
+      "thread_id": "01a183ab-79cb-7b80-a20d-5650ec034980",
+      "relevant": true,
+      "messages": 51,
+      "bytes": 1297836
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-30T00-06-12-01a18869-6a6b-7490-8193-970a53b84f77.jsonl",
+      "thread_id": "01a18869-6a6b-7490-8193-970a53b84f77",
+      "relevant": true,
+      "messages": 6,
+      "bytes": 291726
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-30T00-10-37-01a1886d-775c-7f83-8549-bbeb90143ed8.jsonl",
+      "thread_id": "01a1886d-775c-7f83-8549-bbeb90143ed8",
+      "relevant": true,
+      "messages": 8,
+      "bytes": 246131
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-30T00-56-21-01a18897-532b-7201-9ff5-8918ac6072c9.jsonl",
+      "thread_id": "01a18897-532b-7201-9ff5-8918ac6072c9",
+      "relevant": true,
+      "messages": 3,
+      "bytes": 424420
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-30T01-27-34-01a188b3-ea4e-7660-b051-b4d1c096184d.jsonl",
+      "thread_id": "01a188b3-ea4e-7660-b051-b4d1c096184d",
+      "relevant": true,
+      "messages": 20,
+      "bytes": 828969
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-30T18-50-11-01a18c6e-765c-7ae1-8d21-a2f6e1086df2.jsonl",
+      "thread_id": "01a18c6e-765c-7ae1-8d21-a2f6e1086df2",
+      "relevant": true,
+      "messages": 326,
+      "bytes": 59852248
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-30T20-53-04-01a18cde-f582-72c3-8b68-eefc7fb296dc.jsonl",
+      "thread_id": "01a18cde-f582-72c3-8b68-eefc7fb296dc",
+      "relevant": true,
+      "messages": 33,
+      "bytes": 15828746
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-30T22-45-44-01a18d46-1be0-78b3-9c37-e00bb1568bd3.jsonl",
+      "thread_id": "01a18d46-1be0-78b3-9c37-e00bb1568bd3",
+      "relevant": true,
+      "messages": 12,
+      "bytes": 1373679
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-30T23-49-12-01a18d80-3765-7463-a886-0f79db071047.jsonl",
+      "thread_id": "01a18d80-3765-7463-a886-0f79db071047",
+      "relevant": true,
+      "messages": 10,
+      "bytes": 543762
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-31T02-22-42-01a18e0c-bdf5-78e3-a6ac-f52774987a7e.jsonl",
+      "thread_id": "01a18e0c-bdf5-78e3-a6ac-f52774987a7e",
+      "relevant": true,
+      "messages": 8,
+      "bytes": 881746
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-10-31T10-50-56-01a18fde-0b5d-7ae0-b109-5a58f63887a9.jsonl",
+      "thread_id": "01a18fde-0b5d-7ae0-b109-5a58f63887a9",
+      "relevant": true,
+      "messages": 10,
+      "bytes": 1163507
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-02T14-56-43-01a19b0b-c7fe-7432-a4ec-6c62d6c58250.jsonl",
+      "thread_id": "01a19b0b-c7fe-7432-a4ec-6c62d6c58250",
+      "relevant": true,
+      "messages": 3,
+      "bytes": 43054
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-02T14-56-43-01a19b0b-c808-7bd2-a077-8b03b31eaef0.jsonl",
+      "thread_id": "01a19b0b-c808-7bd2-a077-8b03b31eaef0",
+      "relevant": true,
+      "messages": 2,
+      "bytes": 110221
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-02T14-56-43-01a19b0b-c813-7ad1-a930-eebb9015f544.jsonl",
+      "thread_id": "01a19b0b-c813-7ad1-a930-eebb9015f544",
+      "relevant": true,
+      "messages": 172,
+      "bytes": 18470494
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-02T14-56-43-01a19b0b-c821-7901-b983-eaf44dd55e97.jsonl",
+      "thread_id": "01a19b0b-c821-7901-b983-eaf44dd55e97",
+      "relevant": true,
+      "messages": 108,
+      "bytes": 2866137
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-02T16-20-20-01a19b58-5646-7030-a2f3-231a11a6d1db.jsonl",
+      "thread_id": "01a19b58-5646-7030-a2f3-231a11a6d1db",
+      "relevant": true,
+      "messages": 5,
+      "bytes": 287576
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-02T17-49-07-01a19ba9-a00b-7470-bbfb-4d145f889dc5.jsonl",
+      "thread_id": "01a19ba9-a00b-7470-bbfb-4d145f889dc5",
+      "relevant": true,
+      "messages": 3,
+      "bytes": 180143
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-02T18-03-46-01a19bb7-0ae0-74e2-b898-7ec6ad30411e.jsonl",
+      "thread_id": "01a19bb7-0ae0-74e2-b898-7ec6ad30411e",
+      "relevant": true,
+      "messages": 18,
+      "bytes": 902983
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-03T12-33-41-01a19faf-33de-7411-807f-67ff1d3ea756.jsonl",
+      "thread_id": "01a19faf-33de-7411-807f-67ff1d3ea756",
+      "relevant": true,
+      "messages": 5,
+      "bytes": 541279
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-03T18-32-39-01a1a0f7-d76b-7683-8f2f-4bd959cf5a12.jsonl",
+      "thread_id": "01a1a0f7-d76b-7683-8f2f-4bd959cf5a12",
+      "relevant": true,
+      "messages": 1,
+      "bytes": 158464
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-03T18-34-53-01a1a0f9-e44b-7da2-865b-6c52ad984d82.jsonl",
+      "thread_id": "01a1a0f9-e44b-7da2-865b-6c52ad984d82",
+      "relevant": true,
+      "messages": 10,
+      "bytes": 745011
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-04T00-21-31-01a1a237-3cce-7a83-9579-4a43e5de7783.jsonl",
+      "thread_id": "01a1a237-3cce-7a83-9579-4a43e5de7783",
+      "relevant": true,
+      "messages": 9,
+      "bytes": 1513939
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\archived_sessions\\rollout-2026-11-04T10-37-00-01a1a46a-bbd4-75e1-b03d-90ed5318aaf7.jsonl",
+      "thread_id": "01a1a46a-bbd4-75e1-b03d-90ed5318aaf7",
+      "relevant": true,
+      "messages": 11,
+      "bytes": 283455
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\10\\08\\rollout-2026-10-08T18-04-03-01a11af8-5163-7ad0-9ecf-dac6ff529598.jsonl.zst",
+      "thread_id": "01a11af8-5163-7ad0-9ecf-dac6ff529598",
+      "relevant": true,
+      "messages": 796,
+      "bytes": 17590998
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\10\\13\\rollout-2026-10-13T19-06-24-01a11af8-5163-7ad0-9ecf-dac6ff529598_01a134f1-32ad-7dc2-9e7d-8125b526f509.jsonl.zst",
+      "thread_id": "01a11af8-5163-7ad0-9ecf-dac6ff529598",
+      "relevant": true,
+      "messages": 230,
+      "bytes": 3861503
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\10\\14\\rollout-2026-10-14T20-26-24-01a11af8-5163-7ad0-9ecf-dac6ff529598_01a13a60-ca81-74f0-8692-29e30e328f42.jsonl.zst",
+      "thread_id": "01a11af8-5163-7ad0-9ecf-dac6ff529598",
+      "relevant": true,
+      "messages": 398,
+      "bytes": 14438468
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\10\\16\\rollout-2026-10-16T01-12-25-01a11af8-5163-7ad0-9ecf-dac6ff529598_01a1408d-01d4-7941-bf76-21f7ad0f6c85.jsonl.zst",
+      "thread_id": "01a11af8-5163-7ad0-9ecf-dac6ff529598",
+      "relevant": true,
+      "messages": 881,
+      "bytes": 51341883
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\10\\18\\rollout-2026-10-18T02-32-12-01a11af8-5163-7ad0-9ecf-dac6ff529598_01a14b22-c516-74a1-8350-71c0593cd6ba.jsonl.zst",
+      "thread_id": "01a11af8-5163-7ad0-9ecf-dac6ff529598",
+      "relevant": true,
+      "messages": 369,
+      "bytes": 56991878
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\10\\18\\rollout-2026-10-18T19-18-30-01a11af8-5163-7ad0-9ecf-dac6ff529598_01a14ebc-1304-70a1-9508-a38e2fb5d00e.jsonl.zst",
+      "thread_id": "01a11af8-5163-7ad0-9ecf-dac6ff529598",
+      "relevant": true,
+      "messages": 546,
+      "bytes": 91916717
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\10\\19\\rollout-2026-10-19T20-00-59-01a15409-538d-71b3-9555-e36500c1e2bf.jsonl.zst",
+      "thread_id": "01a11af8-5163-7ad0-9ecf-dac6ff529598",
+      "relevant": true,
+      "messages": 3,
+      "bytes": 2248225
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\10\\19\\rollout-2026-10-19T20-01-09-01a15409-77b0-7741-93f5-e2f91c08fd1f.jsonl.zst",
+      "thread_id": "01a11af8-5163-7ad0-9ecf-dac6ff529598",
+      "relevant": true,
+      "messages": 4,
+      "bytes": 2268917
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\10\\21\\rollout-2026-10-21T14-30-00-01a15d27-04ea-7bb2-891c-93ff6c12fc12.jsonl.zst",
+      "thread_id": "01a15d27-04ea-7bb2-891c-93ff6c12fc12",
+      "relevant": true,
+      "messages": 1644,
+      "bytes": 104543106
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\10\\21\\rollout-2026-10-21T15-56-22-01a11af8-5163-7ad0-9ecf-dac6ff529598_01a15d76-168b-7de3-8c94-068ad9a70b44.jsonl.zst",
+      "thread_id": "01a11af8-5163-7ad0-9ecf-dac6ff529598",
+      "relevant": true,
+      "messages": 56,
+      "bytes": 2772904
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\10\\26\\rollout-2026-10-26T11-06-09-01a15d27-04ea-7bb2-891c-93ff6c12fc12_01a1762c-2d26-72c1-b469-88cfaa355330.jsonl",
+      "thread_id": "01a15d27-04ea-7bb2-891c-93ff6c12fc12",
+      "relevant": true,
+      "messages": 1585,
+      "bytes": 675771843
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\11\\03\\rollout-2026-11-03T23-08-26-01a1a1f4-525c-7400-827a-30e159a2bafe.jsonl",
+      "thread_id": "01a1a1f4-525c-7400-827a-30e159a2bafe",
+      "relevant": true,
+      "messages": 7,
+      "bytes": 5550625
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\11\\04\\rollout-2026-11-04T00-28-15-01a1a23d-675f-7872-b9bb-05be97dd57d5.jsonl",
+      "thread_id": "01a1a23d-675f-7872-b9bb-05be97dd57d5",
+      "relevant": true,
+      "messages": 6,
+      "bytes": 696657
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\11\\04\\rollout-2026-11-04T10-37-00-01a1a46a-bbd7-70f1-a02f-628761c26a22.jsonl",
+      "thread_id": "01a1a46a-bbd7-70f1-a02f-628761c26a22",
+      "relevant": true,
+      "messages": 1,
+      "bytes": 108999
+    },
+    {
+      "source": "C:\\Users\\Kay kay\\.codex\\sessions\\2026\\11\\04\\rollout-2026-11-04T21-16-47-01a1a6b4-79db-7241-a997-c2130a3c0671.jsonl",
+      "thread_id": "01a1a6b4-79db-7241-a997-c2130a3c0671",
+      "relevant": false,
+      "messages": 0,
+      "bytes": 974322
+    }
+  ],
+  "daily": {
+    "2026-10-08": 86,
+    "2026-10-09": 241,
+    "2026-10-10": 48,
+    "2026-10-11": 189,
+    "2026-10-12": 145,
+    "2026-10-13": 170,
+    "2026-10-14": 427,
+    "2026-10-15": 329,
+    "2026-10-16": 519,
+    "2026-10-17": 399,
+    "2026-10-18": 700,
+    "2026-10-19": 270,
+    "2026-10-20": 100,
+    "2026-10-21": 375,
+    "2026-10-22": 236,
+    "2026-10-23": 570,
+    "2026-10-24": 420,
+    "2026-10-25": 571,
+    "2026-10-26": 354,
+    "2026-10-27": 398,
+    "2026-10-28": 289,
+    "2026-10-29": 451,
+    "2026-10-30": 350,
+    "2026-10-31": 208,
+    "2026-11-02": 398,
+    "2026-11-03": 134,
+    "2026-11-04": 198
+  }
+}
