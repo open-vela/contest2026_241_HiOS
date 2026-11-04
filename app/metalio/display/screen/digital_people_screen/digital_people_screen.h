@@ -62,6 +62,7 @@ public:
     static void LifecycleCallback(screen_lifecycle_event_t event);
 
     static bool IsActive();
+    static bool IsForeground();
     static void ShowUserMessage(const char *text);
     static void ShowSystemMessage(const char *text);
     static void ClearMessages();

@@ -1,3 +1,4 @@
+#include "hi_task_cpp.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -37,6 +38,19 @@ class EnergyWakeWord : public WakeWord
 public:
     static constexpr const char *kWakeWordText = "Hi openvela";
 
+    /* Desktop: reject short/single-burst speech so TV / 嗯 / 你好 cannot
+     * open the floating AI. Chat uses a milder gate so「Hi openvela」fires. */
+    static void SetDesktopStrict(bool on)
+    {
+        DesktopStrictFlag().store(on, std::memory_order_relaxed);
+    }
+
+    static std::atomic<bool> &DesktopStrictFlag()
+    {
+        static std::atomic<bool> flag{false};
+        return flag;
+    }
+
     bool Initialize(AudioCodec* codec, srmodel_list_t* models_list) override
     {
         (void)models_list;
@@ -55,6 +69,8 @@ public:
         initialized_ = false;
         codec_ = nullptr;
     }
+
+    void Reset() override { ResetDetector(); }
 
     void Feed(const std::vector<int16_t>& data) override
     {
@@ -91,33 +107,44 @@ public:
         if (noise_floor_ > kNoiseFloorCap)
             noise_floor_ = kNoiseFloorCap;
 
+        const bool desk = DesktopStrictFlag().load(std::memory_order_relaxed);
+        const int need_pre = desk ? kPreSilenceFrames : 2;
         float thresh = std::max(noise_floor_ * 1.8f, (float)kAbsRmsMin);
         if (thresh > kThreshCap)
             thresh = (float)kThreshCap;
 
-        const bool loud = (rms >= thresh) && (peak_abs >= kAbsPeakMin);
+        const bool loud = (rms >= thresh) && (peak_abs >= kOnsetPeakMin);
 
         if (loud)
         {
             if (speech_frames_ == 0)
             {
-                if (pre_silence_frames_ < kPreSilenceFrames)
+                if (pre_silence_frames_ < need_pre)
                     return;
+                envelope_n_ = 0;
             }
             ++speech_frames_;
             silence_frames_ = 0;
+            if (envelope_n_ < (int)(sizeof(envelope_) / sizeof(envelope_[0])))
+                envelope_[envelope_n_++] = rms;
             if (rms > peak_rms_)
                 peak_rms_ = rms;
             if (peak_abs > peak_abs_)
                 peak_abs_ = peak_abs;
 
-            if (speech_frames_ > kMaxSpeechFrames)
+            /* Chat: fire once the phrase is long enough — do not wait for a
+             * trailing pause (that dropped "Hi openvela" spoken in one breath). */
+            if (!desk && speech_frames_ >= 12 &&
+                peak_rms_ >= 140.0f && peak_abs_ >= 1100)
             {
-                speech_frames_ = 0;
-                silence_frames_ = 0;
-                peak_rms_ = 0.0f;
-                peak_abs_ = 0;
-                pre_silence_frames_ = kPreSilenceFrames;
+                MaybeFireWake(speech_frames_, peak_rms_, peak_abs_);
+                ResetUtterance();
+                pre_silence_frames_ = need_pre;
+            }
+            else if (speech_frames_ > kMaxSpeechFrames)
+            {
+                ResetUtterance();
+                pre_silence_frames_ = need_pre;
             }
         }
         else if (speech_frames_ > 0)
@@ -126,11 +153,8 @@ public:
             if (silence_frames_ >= kSilenceFramesEnd)
             {
                 MaybeFireWake(speech_frames_, peak_rms_, peak_abs_);
-                speech_frames_ = 0;
-                silence_frames_ = 0;
-                peak_rms_ = 0.0f;
-                peak_abs_ = 0;
-                pre_silence_frames_ = kPreSilenceFrames;
+                ResetUtterance();
+                pre_silence_frames_ = need_pre;
             }
         }
         else
@@ -198,7 +222,7 @@ public:
             wake_word_opus_.clear();
         }
 
-        std::thread([this]() {
+        HiTask::LegacyThread([this]() {
             std::deque<std::vector<int16_t>> pcm;
             {
                 std::lock_guard<std::mutex> lock(wake_word_mutex_);
@@ -279,28 +303,63 @@ public:
 
 private:
     /* ~30 ms frames. Energy is interim until EspWakeWord swaps in. */
-    static constexpr int kAbsRmsMin = 80;
-    static constexpr int kAbsPeakMin = 1200;
-    static constexpr int kThreshCap = 600;
-    static constexpr float kNoiseFloorCap = 120.0f;
-    static constexpr int kMinSpeechFrames = 5;    /* ~150 ms */
-    static constexpr int kMaxSpeechFrames = 45;   /* ~1.35 s */
+    static constexpr int kAbsRmsMin = 90;
+    static constexpr int kOnsetPeakMin = 1400;
+    static constexpr int kThreshCap = 700;
+    static constexpr float kNoiseFloorCap = 140.0f;
+    static constexpr int kMaxSpeechFrames = 70;   /* ~2.1 s */
     static constexpr int kSilenceFramesEnd = 3;   /* ~90 ms end silence */
-    static constexpr int kPreSilenceFrames = 2;   /* ~60 ms leading quiet */
-    static constexpr int kArmDelayMs = 500;
+    static constexpr int kPreSilenceFrames = 5;   /* ~150 ms leading quiet */
+    static constexpr int kArmDelayMs = 250;
     static constexpr int kCooldownMs = 2000;
-    static constexpr float kMinPeakRms = 200.0f;
     static constexpr size_t kMaxPcmChunks = 2000 / 30; /* ~2 s */
 
-    void ResetDetector()
+    void ResetUtterance()
     {
         speech_frames_ = 0;
         silence_frames_ = 0;
-        pre_silence_frames_ = 0;
-        log_counter_ = 0;
         peak_rms_ = 0.0f;
         peak_abs_ = 0;
+        envelope_n_ = 0;
+    }
+
+    void ResetDetector()
+    {
+        ResetUtterance();
+        pre_silence_frames_ = 0;
+        log_counter_ = 0;
         noise_floor_ = 0.0f;
+    }
+
+    bool LooksLikeWakePhrase(int speech_frames) const
+    {
+        /* "Hi openvela" is two pulses ~0.6–1.1 s. A single 嗯/咳/你好 fails. */
+        if (envelope_n_ < 8)
+            return false;
+        const int n = envelope_n_ < speech_frames ? envelope_n_ : speech_frames;
+        if (n < 8)
+            return false;
+        const int a = n / 3;
+        const int b = (n * 2) / 3;
+        float p0 = 0, p1 = 0, p2 = 0, mid_min = 1.0e9f;
+        for (int i = 0; i < n; ++i)
+        {
+            const float v = envelope_[i];
+            if (i < a) {
+                if (v > p0) p0 = v;
+            } else if (i < b) {
+                if (v > p1) p1 = v;
+                if (v < mid_min) mid_min = v;
+            } else {
+                if (v > p2) p2 = v;
+            }
+        }
+        const float side = std::max(p0, p2);
+        if (side < 220.0f)
+            return false;
+        if (p2 < side * 0.45f)
+            return false;
+        return mid_min < side * 0.78f || p1 < side * 0.90f;
     }
 
     void StoreWakeWordPcm(const std::vector<int16_t>& data, size_t frames)
@@ -317,35 +376,12 @@ private:
 
     void MaybeFireWake(int speech_frames, float peak_rms, int32_t peak_abs)
     {
-        /* Interim near-field energy wake until EspWakeWord swaps in.
-         * Without this, the first「Hi openvela」before WW_ESP_OK is silently
-         * dropped (Energy was muted + Esp deferred → no voice wake). */
-        if (speech_frames < kMinSpeechFrames)
-            return;
-        if (speech_frames > kMaxSpeechFrames)
-            return;
-        if (peak_rms < kMinPeakRms)
-            return;
-        if (peak_abs < kAbsPeakMin)
-            return;
+        // Energy is not speech recognition. Never report an arbitrary sound
+        // as a recognized keyword, including when a phrase model is unavailable.
+        (void)speech_frames;
+        (void)peak_rms;
+        (void)peak_abs;
 
-        const auto now = std::chrono::steady_clock::now();
-        if (now - last_fire_ < std::chrono::milliseconds(kCooldownMs))
-            return;
-
-        last_fire_ = now;
-        last_wake_word_ = kWakeWordText;
-
-        char buf[96];
-        int n = snprintf(buf, sizeof(buf),
-                         "WAKE hit \"%s\" frames=%d peak=%.0f abs=%ld\n",
-                         kWakeWordText, speech_frames, (double)peak_rms,
-                         (long)peak_abs);
-        if (n > 0)
-            write(1, buf, (size_t)n);
-
-        if (on_detected_)
-            on_detected_(last_wake_word_);
     }
 
     AudioCodec* codec_ = nullptr;
@@ -359,6 +395,8 @@ private:
     int silence_frames_ = 0;
     int pre_silence_frames_ = 0;
     int log_counter_ = 0;
+    int envelope_n_ = 0;
+    float envelope_[48] = {};
     std::string last_wake_word_;
     std::chrono::steady_clock::time_point last_fire_{};
     std::chrono::steady_clock::time_point armed_at_{};

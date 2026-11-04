@@ -1,3 +1,4 @@
+#include "hi_task_cpp.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -12,6 +13,7 @@
  */
 
 #include "mqtt_protocol.h"
+#include "app_dns.h"
 #include "application.h"
 #include "board_shim.h"
 #include "settings.h"
@@ -27,6 +29,10 @@
 #include <cerrno>
 #include <netdb.h>
 #include <poll.h>
+#include <fcntl.h>
+#include <algorithm>
+#include <pthread.h>
+#include <sched.h>
 
 #include <mbedtls/ssl.h>
 #include <mbedtls/entropy.h>
@@ -72,6 +78,7 @@ static int mqtt_tls_send(void *ctx, const unsigned char *buf, size_t len)
     {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
             return MBEDTLS_ERR_SSL_WANT_WRITE;
+        ESP_LOGE(TAG, "mqtt socket send failed fd=%d errno=%d", fd, errno);
         return MBEDTLS_ERR_NET_SEND_FAILED;
     }
     return (int)n;
@@ -211,8 +218,14 @@ bool Mqtt::TlsSetup(const std::string &host)
     mbedtls_ssl_set_hostname(&t->ssl, host.c_str());
     mbedtls_ssl_set_bio(&t->ssl, &t->bio_fd, mqtt_tls_send, mqtt_tls_recv, nullptr);
 
+    const auto handshake_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(metalio_app_cellular_active() ? 20 : 6);
     while ((ret = mbedtls_ssl_handshake(&t->ssl)) != 0)
     {
+        if (std::chrono::steady_clock::now() >= handshake_deadline)
+        {
+            TlsTeardown();
+            return false;
+        }
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
         {
             ESP_LOGE(TAG, "mqtt tls handshake failed: -0x%x", (unsigned)-ret);
@@ -240,6 +253,8 @@ int Mqtt::NetSend(const uint8_t *buf, size_t len)
             errno = EAGAIN;
             return -1;
         }
+        ESP_LOGE(TAG, "mqtt TLS write failed code=-0x%x", (unsigned)-ret);
+        errno = EPROTO;
         return -1;
     }
 
@@ -263,6 +278,8 @@ int Mqtt::NetRecv(uint8_t *buf, size_t len)
             errno = EAGAIN;
             return -1;
         }
+        ESP_LOGE(TAG, "mqtt TLS read failed code=-0x%x", (unsigned)-ret);
+        errno = EPROTO;
         return -1;
     }
 
@@ -346,28 +363,24 @@ bool Mqtt::Connect(const std::string &host, int port,
     last_error_ = 0;
     use_tls_ = (port == 8883);
 
-    struct addrinfo hints;
-    struct addrinfo *res = nullptr;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
-
-    int gai = getaddrinfo(host.c_str(), port_str, &hints, &res);
-    if (gai != 0 || res == nullptr)
+    struct sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    if (metalio_voice_resolve_ipv4(host.c_str(), &address.sin_addr.s_addr) < 0)
     {
-        ESP_LOGE(TAG, "getaddrinfo(%s:%d) failed: %s", host.c_str(), port, gai_strerror(gai));
         last_error_ = EHOSTUNREACH;
         return false;
     }
-
-    sock_ = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock_ < 0)
-    {
+    sock_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock_ < 0) {
         last_error_ = errno;
-        freeaddrinfo(res);
+        ESP_LOGE(TAG, "voice TCP socket allocation failed errno=%d", last_error_);
+        return false;
+    }
+    if (metalio_app_bind_active_interface(sock_) < 0)
+    {
+        last_error_ = errno ? errno : ENODEV;
+        close(sock_); sock_ = -1;
         return false;
     }
 
@@ -380,16 +393,14 @@ bool Mqtt::Connect(const std::string &host, int port,
         setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
-    if (connect(sock_, res->ai_addr, res->ai_addrlen) < 0)
+    if (connect(sock_, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) < 0)
     {
         ESP_LOGE(TAG, "connect(%s:%d) failed: %s", host.c_str(), port, strerror(errno));
         last_error_ = errno;
         close(sock_);
         sock_ = -1;
-        freeaddrinfo(res);
         return false;
     }
-    freeaddrinfo(res);
 
     if (use_tls_ && !TlsSetup(host))
     {
@@ -417,9 +428,21 @@ bool Mqtt::Connect(const std::string &host, int port,
         return false;
     }
 
+    // Bootstrap TLS/CONNACK is complete. Receive must no longer wait while
+    // holding io_mutex_: the application sends listen/detect on this mutex.
+    int flags = fcntl(sock_, F_GETFL, 0);
+    if (flags < 0 || fcntl(sock_, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+        last_error_ = errno;
+        TlsTeardown();
+        close(sock_);
+        sock_ = -1;
+        return false;
+    }
+    rx_buffer_.clear();
     connected_ = true;
     running_ = true;
-    rx_thread_ = std::thread([this]() { this->RxLoop(); });
+    rx_thread_ = HiTask::LegacyThread([this]() { this->RxLoop(); });
 
     if (on_connected_)
         on_connected_();
@@ -495,7 +518,9 @@ bool Mqtt::SendPacket(const uint8_t *buf, size_t len)
                 if (poll(&pfd, 1, 0) > 0)
                 {
                     uint8_t sink[256];
-                    (void)NetRecv(sink, sizeof(sink));
+                    int received = NetRecv(sink, sizeof(sink));
+                    if (received > 0)
+                        rx_buffer_.append(reinterpret_cast<const char *>(sink), received);
                 }
             }
             if (++spins > 200)
@@ -563,92 +588,104 @@ bool Mqtt::IsConnected() const
 void Mqtt::Stop()
 {
     running_ = false;
+    connected_ = false;
+    // Keep socket closure and TLS destruction serialized with every publish.
+    // A lease-change worker can otherwise free TLS while the app sends MCP.
     if (sock_ >= 0)
     {
-        /* Send DISCONNECT (0xE0) so the broker closes cleanly. */
-        uint8_t disc[2] = {0xE0, 0x00};
-        SendPacket(disc, 2);
-        shutdown(sock_, SHUT_RDWR);
-        close(sock_);
-        sock_ = -1;
+        const uint8_t disc[2] = {0xe0, 0};
+        SendPacket(disc, sizeof(disc));
     }
-    connected_ = false;
-    if (rx_thread_.joinable())
-        rx_thread_.join();
+    {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        if (sock_ >= 0)
+        {
+            shutdown(sock_, SHUT_RDWR);
+            close(sock_);
+            sock_ = -1;
+        }
+    }
+    if (rx_thread_.joinable()) rx_thread_.join();
+    std::lock_guard<std::mutex> lock(io_mutex_);
     TlsTeardown();
 }
 
-bool Mqtt::ReadMqttPacketLocked(uint8_t &fh_out, std::string &payload)
+int Mqtt::ReadMqttPacketLocked(uint8_t &fh_out, std::string &payload)
 {
-    /* Caller must hold io_mutex_. */
-    uint8_t fh = 0;
-    int n = NetRecv(&fh, 1);
-    if (n <= 0)
-        return false;
-
-    size_t rl_value = 0;
-    size_t rl_bytes = 0;
-    uint8_t rlbuf[4];
-    for (size_t i = 0; i < 4; i++)
+    // Caller holds io_mutex_. Preserve split TLS records / MQTT frames and
+    // consume already decrypted bytes before waiting for new socket data.
+    for (int pass = 0; pass < 2; ++pass)
     {
-        int r = NetRecv(&rlbuf[i], 1);
-        if (r <= 0)
-            return false;
-        rl_bytes++;
-        if (!(rlbuf[i] & 0x80))
-            break;
-    }
-    if (decode_remaining_length(rlbuf, rl_bytes, rl_value) == 0)
-        return false;
-
-    payload.clear();
-    if (rl_value > 0)
-    {
-        if (rl_value > 256 * 1024)
-            return false;
-        payload.resize(rl_value);
-        size_t got = 0;
-        while (got < rl_value)
+        size_t remaining = 0, multiplier = 1, header = 1;
+        bool complete_length = false;
+        while (header < rx_buffer_.size() && header <= 4)
         {
-            int r = NetRecv((uint8_t *)&payload[got], rl_value - got);
-            if (r <= 0)
-                return false;
-            got += (size_t)r;
+            const uint8_t byte = static_cast<uint8_t>(rx_buffer_[header++]);
+            remaining += (byte & 0x7f) * multiplier;
+            if (!(byte & 0x80)) { complete_length = true; break; }
+            multiplier *= 128;
         }
+        if ((!complete_length && header == 5) || remaining > 256 * 1024)
+            return -1;
+        if (complete_length && rx_buffer_.size() >= header + remaining)
+        {
+            fh_out = static_cast<uint8_t>(rx_buffer_[0]);
+            payload.assign(rx_buffer_.data() + header, remaining);
+            rx_buffer_.erase(0, header + remaining);
+            return 1;
+        }
+        if (pass != 0) return 0;
+        uint8_t bytes[4096];
+        int n = NetRecv(bytes, sizeof(bytes));
+        if (n > 0)
+            rx_buffer_.append(reinterpret_cast<const char *>(bytes), n);
+        else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+            return 0;
+        else
+            return -1;
     }
-    fh_out = fh;
-    return true;
+    return 0;
 }
 
 void Mqtt::RxLoop()
 {
+    const int ping_seconds = keepalive_ > 0 ? std::max(1, std::min(20, keepalive_ / 2)) : 0;
+    auto next_ping = std::chrono::steady_clock::now() + std::chrono::seconds(ping_seconds);
+    auto ping_sent = std::chrono::steady_clock::time_point{};
+    bool ping_pending = false;
     while (running_ && sock_ >= 0)
     {
-        /* Poll without holding io_mutex_ so Publish can proceed. */
-        struct pollfd pfd;
-        pfd.fd = sock_;
-        pfd.events = POLLIN;
-        int pr = poll(&pfd, 1, 200);
-        if (pr < 0)
+        const auto now = std::chrono::steady_clock::now();
+        if (ping_pending && now - ping_sent >= std::chrono::seconds(10))
         {
-            if (errno == EINTR)
-                continue;
+            last_error_ = ETIMEDOUT;
+            write(1, "VOICE_PING_TIMEOUT\n", 19);
             break;
         }
-        if (pr == 0)
-            continue;
-
+        if (ping_seconds && !ping_pending && now >= next_ping)
+        {
+            const uint8_t ping[] = {0xc0, 0};
+            if (!SendPacket(ping, sizeof(ping))) break;
+            ping_pending = true;
+            ping_sent = now;
+            next_ping = now + std::chrono::seconds(ping_seconds);
+        }
         uint8_t fh = 0;
         std::string payload;
-        bool ok = false;
+        int result;
         {
             std::lock_guard<std::mutex> lock(io_mutex_);
-            if (!running_ || sock_ < 0)
-                break;
-            ok = ReadMqttPacketLocked(fh, payload);
+            if (!running_ || sock_ < 0) break;
+            result = ReadMqttPacketLocked(fh, payload);
         }
-        if (!ok)
-            break;
+        if (result < 0) break;
+        if (result == 0)
+        {
+            struct pollfd pfd{sock_, POLLIN, 0};
+            int ready = poll(&pfd, 1, 20);
+            if (ready < 0 && errno != EINTR) break;
+            continue;
+        }
 
         const uint8_t pkt_type = (fh >> 4) & 0x0F;
         switch (pkt_type)
@@ -674,7 +711,10 @@ void Mqtt::RxLoop()
                 on_message_(topic, msg);
             break;
         }
-        case 12: /* PINGRESP */
+        case 13: /* PINGRESP */
+            ping_pending = false;
+            write(1, "VOICE_PING_OK\n", 14);
+            break;
         case 2:  /* CONNACK */
         case 9:  /* SUBACK */
             break;
@@ -701,25 +741,38 @@ Udp::~Udp()
 
 bool Udp::Connect(const std::string &host, int port)
 {
-    struct addrinfo hints;
-    struct addrinfo *res = nullptr;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
-
-    if (getaddrinfo(host.c_str(), port_str, &hints, &res) != 0 || res == nullptr)
+    if (port <= 0 || port > 65535) return false;
+    const auto begin = std::chrono::steady_clock::now();
+    static std::string s_dns_host;
+    static uint32_t s_dns_addr = 0;
+    static int s_dns_network = -1;
+    static std::chrono::steady_clock::time_point s_dns_expires{};
+    const int network = metalio_app_cellular_active();
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(static_cast<uint16_t>(port));
+    if (inet_pton(AF_INET, host.c_str(), &sa.sin_addr) != 1)
     {
-        ESP_LOGE(TAG, "udp: getaddrinfo(%s:%d) failed", host.c_str(), port);
+        if (s_dns_addr && s_dns_host == host && s_dns_network == network &&
+            begin < s_dns_expires)
+            sa.sin_addr.s_addr = s_dns_addr;
+        else if (metalio_voice_resolve_ipv4(host.c_str(), &sa.sin_addr.s_addr) < 0)
+            return false;
+    }
+    const auto resolved = std::chrono::steady_clock::now();
+    ESP_LOGE(TAG, "voice UDP resolve %lld ms",
+             (long long)std::chrono::duration_cast<std::chrono::milliseconds>(resolved-begin).count());
+
+    sock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock_ < 0)
+    {
         return false;
     }
 
-    sock_ = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock_ < 0)
+    if (metalio_app_bind_active_interface(sock_) < 0)
     {
-        freeaddrinfo(res);
+        close(sock_);
+        sock_ = -1;
         return false;
     }
 
@@ -731,14 +784,25 @@ bool Udp::Connect(const std::string &host, int port)
         setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
-    if (connect(sock_, res->ai_addr, res->ai_addrlen) < 0)
+    if (connect(sock_, reinterpret_cast<struct sockaddr *>(&sa),
+                sizeof(sa)) < 0)
     {
         close(sock_);
         sock_ = -1;
-        freeaddrinfo(res);
+        /* Cached address may be stale — clear so the next open re-resolves. */
+        if (s_dns_host == host)
+            s_dns_addr = 0;
         return false;
     }
-    freeaddrinfo(res);
+    char peer[INET_ADDRSTRLEN]{};
+    inet_ntop(AF_INET, &sa.sin_addr, peer, sizeof(peer));
+    ESP_LOGE(TAG, "voice UDP peer %s:%d", peer, port);
+    s_dns_host = host;
+    s_dns_addr = sa.sin_addr.s_addr;
+    s_dns_network = network;
+    s_dns_expires = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+    ESP_LOGE(TAG, "voice UDP connect %lld ms",
+             (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-resolved).count());
     return true;
 }
 
@@ -752,8 +816,14 @@ ssize_t Udp::Send(const std::string &data)
 void Udp::StartReceive()
 {
     running_ = true;
-    rx_thread_ = std::thread([this]()
+    rx_thread_ = HiTask::LegacyThread([this]()
     {
+        // Voice packets must reach the decoder while LVGL paints the first
+        // reply. Keep this voice-only receiver above UI work, below decode
+        // and speaker output; recv() blocks when no audio is arriving.
+        struct sched_param voice_priority{};
+        voice_priority.sched_priority = CONFIG_METALIO_APP_PRIORITY + 12;
+        pthread_setschedparam(pthread_self(), SCHED_RR, &voice_priority);
         char buf[2048];
         while (running_ && sock_ >= 0)
         {
@@ -766,9 +836,26 @@ void Udp::StartReceive()
             }
             /* SO_RCVTIMEO: keep living through silence so TTS can arrive
              * after the user finishes speaking (STT → LLM → TTS). */
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
-                          errno == EINTR))
+            const int receive_error = n < 0 ? errno : 0;
+            if (!running_)
+                break;
+            if (n < 0 && (receive_error == EAGAIN ||
+                          receive_error == EWOULDBLOCK ||
+                          receive_error == EINTR))
                 continue;
+            /* Connected UDP can report a delayed ICMP error while the
+             * cellular NAT mapping is being established. That error does
+             * not close the socket. Keep receiving on this live session;
+             * otherwise uplink continues but every later reply is lost. */
+            if (n == 0 || (n < 0 &&
+                (receive_error == ECONNREFUSED || receive_error == EHOSTUNREACH ||
+                 receive_error == ENETUNREACH || receive_error == ENETDOWN)))
+            {
+                ESP_LOGW(TAG, "voice UDP transient receive error=%d", receive_error);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            ESP_LOGE(TAG, "voice UDP receiver stopped error=%d", receive_error);
             break;
         }
     });
@@ -779,6 +866,7 @@ void Udp::Stop()
     running_ = false;
     if (sock_ >= 0)
     {
+        shutdown(sock_, SHUT_RDWR);
         close(sock_);
         sock_ = -1;
     }
@@ -797,9 +885,13 @@ MqttProtocol::MqttProtocol()
     esp_timer_create_args_t reconnect_timer_args = {
         .callback = [](void *arg) {
             MqttProtocol *protocol = (MqttProtocol *)arg;
-            /* Defer the reconnect into a worker thread so we don't run MQTT
-             * connect from the LPWORK timer context. */
-            std::thread([protocol]() { protocol->StartMqttClient(false); }).detach();
+            // LPWORK has a different NuttX task group / descriptor table.
+            // Create the network pthread from the application owner, otherwise
+            // CONNECT succeeds there but app-side publish sees an invalid fd.
+            auto alive = protocol->reconnect_alive_;
+            Application::GetInstance().Schedule([protocol, alive]() {
+                if (alive->load()) protocol->StartReconnectWorker();
+            });
         },
         .arg = this,
     };
@@ -808,13 +900,29 @@ MqttProtocol::MqttProtocol()
 
 MqttProtocol::~MqttProtocol()
 {
+    stopping_.store(true);
+    reconnect_alive_->store(false);
+    client_ready_.store(false);
     ESP_LOGI(TAG, "MqttProtocol deinit");
     if (reconnect_timer_ != nullptr)
     {
         esp_timer_stop(reconnect_timer_);
-        esp_timer_delete(reconnect_timer_);
     }
 
+    {
+        std::lock_guard<std::mutex> lock(reconnect_worker_mutex_);
+        if (reconnect_joinable_)
+        {
+            pthread_join(reconnect_worker_, nullptr);
+            reconnect_joinable_ = false;
+        }
+    }
+    if (reconnect_timer_)
+    {
+        // All network callbacks have finished before their timer is freed.
+        esp_timer_delete(reconnect_timer_);
+        reconnect_timer_ = nullptr;
+    }
     udp_.reset();
     mqtt_.reset();
 
@@ -822,24 +930,81 @@ MqttProtocol::~MqttProtocol()
         vEventGroupDelete(event_group_handle_);
 }
 
+std::shared_ptr<Mqtt> MqttProtocol::GetMqttClient()
+{
+    std::lock_guard<std::mutex> lock(mqtt_pointer_mutex_);
+    return mqtt_;
+}
+
+void MqttProtocol::StartReconnectWorker()
+{
+    std::lock_guard<std::mutex> lock(reconnect_worker_mutex_);
+    if (stopping_.load() || reconnect_running_.load()) return;
+    if (reconnect_joinable_)
+    {
+        pthread_join(reconnect_worker_, nullptr);
+        reconnect_joinable_ = false;
+    }
+    reconnect_running_.store(true);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    // TLS handshake retains the large stack previously supplied by OTA.
+    pthread_attr_setstacksize(&attr, 131072);
+    int rc = hi_task_create_legacy(&reconnect_worker_, &attr, [](void *arg)->void * {
+        auto *self = static_cast<MqttProtocol *>(arg);
+        self->StartMqttClient(false);
+        self->reconnect_running_.store(false);
+        return nullptr;
+    }, this);
+    pthread_attr_destroy(&attr);
+    if (rc == 0) reconnect_joinable_ = true;
+    else
+    {
+        reconnect_running_.store(false);
+        if (!stopping_.load() && reconnect_timer_)
+            esp_timer_start_once(reconnect_timer_, MQTT_RECONNECT_INTERVAL_MS * 1000);
+    }
+}
+
+bool MqttProtocol::OnNetworkReady()
+{
+    if (stopping_.load()) return false;
+    network_generation_.fetch_add(1);
+    client_ready_.store(false);
+    if (reconnect_timer_)
+    {
+        esp_timer_stop(reconnect_timer_);
+        esp_timer_start_once(reconnect_timer_, 1000);
+    }
+    return true;
+}
+
 bool MqttProtocol::Start()
 {
-    return StartMqttClient(false);
+    if (network_generation_.load() == 0) OnNetworkReady();
+    else if (!client_ready_.load() && !stopping_.load() && reconnect_timer_)
+        esp_timer_start_once(reconnect_timer_, 1000);
+    return !stopping_.load();
 }
 
 bool MqttProtocol::StartMqttClient(bool report_error)
 {
-    if (mqtt_ != nullptr && mqtt_->IsConnected())
+    std::lock_guard<std::mutex> start_lock(mqtt_start_mutex_);
+    if (stopping_.load()) return false;
+    const auto network = network_generation_.load();
+    auto client = GetMqttClient();
+    if (client != nullptr && client->IsConnected() && client_ready_.load() &&
+        connected_generation_.load() == network)
     {
         ESP_LOGE(TAG, "MQTT already connected");
         return true;
     }
 
-    if (mqtt_ != nullptr)
+    if (client != nullptr)
     {
         ESP_LOGW(TAG, "Mqtt client already started");
-        mqtt_->Stop();
-        mqtt_.reset();
+        client->Stop();
+        client.reset();
     }
 
     Settings settings("mqtt", false);
@@ -848,8 +1013,11 @@ bool MqttProtocol::StartMqttClient(bool report_error)
     auto username = settings.GetString("username");
     auto password = settings.GetString("password");
     int keepalive_interval = settings.GetInt("keepalive", 240);
-    publish_topic_ = settings.GetString("publish_topic");
-    subscribe_topic_ = settings.GetString("subscribe_topic");
+    {
+        std::lock_guard<std::mutex> lock(mqtt_pointer_mutex_);
+        publish_topic_ = settings.GetString("publish_topic");
+        subscribe_topic_ = settings.GetString("subscribe_topic");
+    }
 
     if (endpoint.empty())
         endpoint = METALIO_MQTT_DEFAULT_ENDPOINT;
@@ -872,10 +1040,17 @@ bool MqttProtocol::StartMqttClient(bool report_error)
         client_id = SystemInfo::GetMacAddress();
     }
 
-    mqtt_ = std::make_unique<Mqtt>();
-    mqtt_->SetKeepAlive(keepalive_interval);
+    client_ready_.store(false);
+    client = std::make_shared<Mqtt>();
+    {
+        std::lock_guard<std::mutex> lock(mqtt_pointer_mutex_);
+        mqtt_ = client;
+    }
+    client->SetKeepAlive(keepalive_interval);
 
-    mqtt_->OnDisconnected([this]() {
+    client->OnDisconnected([this]() {
+        client_ready_.store(false);
+        if (stopping_.load()) return;
         if (on_disconnected_)
             on_disconnected_();
         ESP_LOGI(TAG, "MQTT disconnected, schedule reconnect in %d seconds",
@@ -884,14 +1059,14 @@ bool MqttProtocol::StartMqttClient(bool report_error)
             esp_timer_start_once(reconnect_timer_, MQTT_RECONNECT_INTERVAL_MS * 1000);
     });
 
-    mqtt_->OnConnected([this]() {
-        if (on_connected_)
-            on_connected_();
+    client->OnConnected([this]() {
+        if (stopping_.load()) return;
         if (reconnect_timer_)
             esp_timer_stop(reconnect_timer_);
     });
 
-    mqtt_->OnMessage([this](const std::string &topic, const std::string &payload) {
+    client->OnMessage([this](const std::string &topic, const std::string &payload) {
+        if (stopping_.load()) return;
         (void)topic;
         cJSON *root = cJSON_Parse(payload.c_str());
         if (root == nullptr)
@@ -985,13 +1160,16 @@ bool MqttProtocol::StartMqttClient(bool report_error)
     ESP_LOGE(TAG, "MQTT connect %s:%d tls=%d", broker_address.c_str(),
              broker_port, broker_port == 8883 ? 1 : 0);
 
-    if (!mqtt_->Connect(broker_address, broker_port, client_id, username, password))
+    if (!client->Connect(broker_address, broker_port, client_id, username, password))
     {
-        ESP_LOGE(TAG, "Failed to connect to endpoint, code=%d", mqtt_->GetLastError());
-        SetError("server not connected");
+        ESP_LOGE(TAG, "Failed to connect to endpoint, code=%d", client->GetLastError());
+        if (report_error) SetError("server not connected");
+        if (!stopping_.load() && reconnect_timer_)
+            esp_timer_start_once(reconnect_timer_, MQTT_RECONNECT_INTERVAL_MS * 1000);
         return false;
     }
 
+    if (stopping_.load()) return false;
     ESP_LOGI(TAG, "Connected to endpoint");
     last_incoming_time_ = std::chrono::steady_clock::now();
 
@@ -1002,26 +1180,54 @@ bool MqttProtocol::StartMqttClient(bool report_error)
         subscribe_topic_ = publish_topic_ + "/down";
     if (!subscribe_topic_.empty())
     {
-        mqtt_->Subscribe(subscribe_topic_);
+        if (!client->Subscribe(subscribe_topic_))
+        {
+            if (!stopping_.load() && reconnect_timer_)
+                esp_timer_start_once(reconnect_timer_, MQTT_RECONNECT_INTERVAL_MS * 1000);
+            return false;
+        }
         ESP_LOGI(TAG, "Subscribed to %s", subscribe_topic_.c_str());
     }
+    if (network_generation_.load() != network)
+    {
+        client->Stop();
+        if (!stopping_.load() && reconnect_timer_)
+            esp_timer_start_once(reconnect_timer_, 1000);
+        return false;
+    }
+    connected_generation_.store(network);
+    client_ready_.store(true);
+    if (!client->IsConnected() || stopping_.load())
+    {
+        client_ready_.store(false);
+        return false;
+    }
+    write(1, "VOICE_NET_READY\n", 16);
+    if (on_connected_) on_connected_();
     return true;
 }
 
 bool MqttProtocol::SendText(const std::string &text)
 {
-    if (publish_topic_.empty())
+    std::shared_ptr<Mqtt> client;
+    std::string topic;
+    {
+        std::lock_guard<std::mutex> lock(mqtt_pointer_mutex_);
+        client = mqtt_;
+        topic = publish_topic_;
+    }
+    if (topic.empty())
     {
         ESP_LOGE(TAG, "publish_topic empty — cannot send hello/text");
         write(1, "TX_NO_TOPIC\n", 12);
         return false;
     }
-    if (!mqtt_ || !mqtt_->IsConnected())
+    if (!client || !client->IsConnected())
     {
         write(1, "TX_NO_MQTT\n", 11);
         return false;
     }
-    if (!mqtt_->Publish(publish_topic_, text))
+    if (!client->Publish(topic, text))
     {
         /* Do not SetError here — a single listen/detect publish glitch was
          * MAIN_EVENT_ERROR → Idle and killed the whole dialogue session. */
@@ -1139,7 +1345,14 @@ bool MqttProtocol::OpenAudioChannel()
     write(1, "AUD_OPEN\n", 9);
     opening_audio_.store(true, std::memory_order_release);
 
-    if (mqtt_ == nullptr || !mqtt_->IsConnected())
+    if (!client_ready_.load() && !stopping_.load() && reconnect_timer_)
+        esp_timer_start_once(reconnect_timer_, 1000);
+    const auto prepare_until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!client_ready_.load() && !stopping_.load() &&
+           std::chrono::steady_clock::now() < prepare_until)
+        usleep(10000);
+    auto client = GetMqttClient();
+    if (!client_ready_.load() || !client || !client->IsConnected())
     {
         /* Never StartMqttClient/TLS from the wake worker — concurrent
          * mbedtls use with the RX thread hangs at WAKE_START and blue-screens.
@@ -1178,7 +1391,7 @@ bool MqttProtocol::OpenAudioChannel()
     EventBits_t bits = xEventGroupWaitBits(event_group_handle_,
                                            MQTT_PROTOCOL_SERVER_HELLO_EVENT,
                                            pdTRUE, pdFALSE,
-                                           10000 / portTICK_PERIOD_MS);
+                                           8000 / portTICK_PERIOD_MS);
     if (!(bits & MQTT_PROTOCOL_SERVER_HELLO_EVENT))
     {
         ESP_LOGE(TAG, "Failed to receive server hello");
@@ -1189,7 +1402,7 @@ bool MqttProtocol::OpenAudioChannel()
     }
     write(1, "AUD_HELLO_OK\n", 13);
 
-    std::lock_guard<std::mutex> lock(channel_mutex_);
+    std::unique_lock<std::mutex> lock(channel_mutex_);
     udp_ = std::make_unique<Udp>();
     udp_->OnMessage([this](const std::string &data) {
         /*
@@ -1261,6 +1474,7 @@ bool MqttProtocol::OpenAudioChannel()
     }
     write(1, "AUD_UDP_OK\n", 11);
     udp_->StartReceive();
+    lock.unlock();
 
     if (on_audio_channel_opened_)
         on_audio_channel_opened_();

@@ -8,6 +8,7 @@
  */
 
 #include "screen_manager.h"
+#include "screen_util.h"
 
 #include "esp_log_shim.h"
 
@@ -75,7 +76,7 @@ bool ScreenManager::SwitchTo(const std::string &name)
         return false;
     }
 
-    lv_screen_load(new_scr);
+    screen_load_safe(new_scr);
 
     current_ = next;
     current_name_ = name;

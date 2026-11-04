@@ -22,6 +22,9 @@
 #include "auto_test_screen.h"
 #include "stress_test_screen.h"
 
+LV_FONT_DECLARE(font_puhui_20_4);
+LV_FONT_DECLARE(font_puhui_30_4);
+
 namespace {
 
 constexpr const char *TAG = "TestScreen";
@@ -61,7 +64,11 @@ void NavigateToSubScreen(lv_obj_t *(*create_screen)())
     }
     lv_obj_t *old_scr = lv_screen_active();
     lv_obj_t *new_scr = create_screen();
-    lv_screen_load(new_scr);
+    if (new_scr == nullptr) {
+        return;
+    }
+    lv_obj_set_style_text_font(new_scr, &font_puhui_20_4, LV_PART_MAIN);
+    screen_load_safe(new_scr);
     if (old_scr != nullptr && old_scr != new_scr) {
         lv_obj_delete_async(old_scr);
     }
@@ -124,6 +131,7 @@ void CreateHeader(lv_obj_t *parent, const char *title,
     lv_label_set_text(title_lbl, title);
     lv_obj_set_style_text_color(title_lbl, lv_color_hex(kTestColorText),
                                 LV_PART_MAIN);
+    lv_obj_set_style_text_font(title_lbl, &font_puhui_30_4, LV_PART_MAIN);
     lv_obj_align(title_lbl, LV_ALIGN_LEFT_MID, 16 + 72 + 16, 0);
 }
 
@@ -158,6 +166,7 @@ void CreateMenuRow(lv_obj_t *parent, const char *text, lv_event_cb_t cb)
     lv_label_set_text(lbl, text);
     lv_obj_set_style_text_color(lbl, lv_color_hex(kTestColorText),
                                 LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl, &font_puhui_30_4, LV_PART_MAIN);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
 }
 
@@ -173,6 +182,7 @@ lv_obj_t *TestScreen::CreateStatic()
     lv_obj_set_size(scr, kTestPanelW, kTestPanelH);
     lv_obj_set_style_bg_color(scr, lv_color_hex(kTestColorBg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_text_font(scr, &font_puhui_20_4, LV_PART_MAIN);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     CreateHeader(scr, I18n::T("硬件测试"), OnBackBtnClicked);
@@ -214,7 +224,7 @@ void TestScreen::LaunchFromHome(screen_lifecycle_cb_t lifecycle_cb)
     s_lifecycle_cb = lifecycle_cb;
     lv_obj_t *old_scr = lv_screen_active();
     lv_obj_t *app = TestScreen::CreateStatic();
-    lv_screen_load(app);
+    screen_load_safe(app);
     if (old_scr != nullptr && old_scr != app) {
         lv_obj_delete_async(old_scr);
     }

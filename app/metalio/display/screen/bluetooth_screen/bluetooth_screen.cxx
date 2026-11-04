@@ -1,3 +1,4 @@
+#include "hi_task_cpp.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -18,6 +19,8 @@
  */
 
 #include "bluetooth_screen.h"
+#include "application.h"
+#include "settings.h"
 
 #include "i18n.h"
 #include "esp_log_shim.h"
@@ -33,6 +36,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <atomic>
+#include <pthread.h>
+#include <errno.h>
 #include <unistd.h>            /* usleep() */
 
 LV_FONT_DECLARE(font_puhui_20_4);
@@ -90,9 +96,32 @@ struct UiState {
 };
 
 UiState  s_ui;
-BtMode   s_active_mode = BtMode::kMode1;  /* board bringup applies mode 1 */
-ConnState s_conn_state = ConnState::kIdle;
-bool     s_screen_active = false;
+std::atomic<BtMode> s_active_mode{BtMode::kMode1};
+std::atomic<ConnState> s_conn_state{ConnState::kIdle};
+std::atomic<bool> s_screen_active{false};
+std::atomic<bool> s_mode_busy{false};
+std::atomic<int> s_ack_mode{0};
+std::atomic<unsigned> s_scan_epoch{0},s_ui_epoch{0};
+std::atomic<bool> s_request_busy{false};
+std::mutex s_rx_mutex;
+std::mutex s_phone_audio_mutex;
+std::atomic<bool> s_phone_audio{false};
+// Private route state stays on the heap; no Application layout changes.
+struct PhoneRoutingState {
+ std::mutex operation;
+ std::atomic<unsigned> generation{1},request{1};
+ std::atomic<int> preferred{-1},route{0}; // auto=-1; speaker=1, headset=2
+ std::atomic<bool> worker{false},ending{false},boot_restore{false};
+ BtMode before=BtMode::kMode1;bool before_sco=false;
+};
+PhoneRoutingState&PhoneRouting(){static auto*s=new PhoneRoutingState;return *s;}
+bool CellularAudioActive(){int c=metalio_nt26_get_call_state();return c==METALIO_CALL_DIALING||c==METALIO_CALL_ACTIVE||c==METALIO_CALL_HELD;}
+
+std::atomic<bool> s_sco_up{false},s_profile_busy{false},s_a2dp_selected{false},s_headset_linked{false};
+// A profile selection is distinct from a running P4 PCM stream. An idle
+// A2DP link need not drive I2S clocks until the first playback starts.
+std::atomic<unsigned> s_link_epoch{0};
+std::string s_observer_rx;
 
 std::string           s_rx_buffer;
 std::vector<BtDevice> s_devices;
@@ -137,12 +166,13 @@ void UpdateStatus(const char *text, uint32_t color = kColorText)
 struct AsyncStatusMsg {
     char text[128];
     uint32_t color;
+    unsigned epoch;
 };
 
 void async_update_status(void *user_data)
 {
     auto *msg = static_cast<AsyncStatusMsg *>(user_data);
-    UpdateStatus(msg->text, msg->color);
+    if(s_screen_active&&msg->epoch==s_ui_epoch)UpdateStatus(msg->text, msg->color);
     delete msg;
 }
 
@@ -153,8 +183,10 @@ void post_status(const char *text, uint32_t color = kColorText)
     }
     auto *msg = new AsyncStatusMsg{};
     snprintf(msg->text, sizeof(msg->text), "%s", text);
-    msg->color = color;
-    lv_async_call(async_update_status, msg);
+    msg->color = color;msg->epoch=s_ui_epoch;
+    lv_lock();
+    if(lv_async_call(async_update_status, msg)!=LV_RESULT_OK)delete msg;
+    lv_unlock();
 }
 
 void RefreshModeButtons()
@@ -163,7 +195,7 @@ void RefreshModeButtons()
         if (s_ui.mode_btns[i] == nullptr) {
             continue;
         }
-        const bool active = (static_cast<int>(s_active_mode) == i + 1);
+        const bool active = (static_cast<int>(s_active_mode.load()) == i + 1);
         lv_obj_set_style_bg_color(
             s_ui.mode_btns[i],
             lv_color_hex(active ? kColorBtnActive : kColorBtn),
@@ -197,6 +229,7 @@ void ShowMode2Panel(bool show)
 
 void RestoreModeUi()
 {
+    if(s_headset_linked)s_conn_state=ConnState::kConnected;
     RefreshModeButtons();
     switch (s_active_mode) {
         case BtMode::kMode1:
@@ -227,59 +260,63 @@ void RestoreModeUi()
 
 void RunModeCommand(BtMode mode)
 {
-    switch (mode) {
-        case BtMode::kMode1:
-            post_status(I18n::T("切换模式1..."), kColorScanning);
-            SendAt("AT+RX=2");
-            usleep(700 * 1000);
-            SendAt("AT+MODE=1");
-            break;
-        case BtMode::kMode2:
-            post_status(I18n::T("切换模式2..."), kColorScanning);
-            SendAt("AT+TX=1");
-            usleep(700 * 1000);
-            SendAt("AT+MODE=2");
-            break;
-        case BtMode::kMode3:
-            post_status(I18n::T("切换模式3..."), kColorScanning);
-            SendAt("AT+RX=1");
-            usleep(700 * 1000);
-            SendAt("AT+MODE=3");
-            break;
-        default:
-            break;
+    // Keep the prefix, gap, final command and ACK under one UART owner.
+    // The background reader must not consume half of this transaction.
+    auto valid=[](){return !s_phone_audio.load()&&metalio_nt26_get_call_state()==METALIO_CALL_IDLE;};
+    BtMode previous=s_active_mode.load();s_ack_mode=0;
+    {std::lock_guard<std::mutex> lock(s_phone_audio_mutex);if(s_phone_audio){s_mode_busy=false;return;}metalio_bt_set_scan_mode(true);}
+    bool ok=metalio_bt_is_powered()||metalio_bt_power(true)==0;
+    char text[48];snprintf(text,sizeof(text),"正在切换模式%d…",(int)mode);post_status(text,kColorScanning);
+    ok=ok&&SimpleUart::getInstance().sendModeWait((int)mode,valid);
+    ok=ok&&s_ack_mode.load()==(int)mode;
+    if(ok){
+        Settings settings("bluetooth",true);
+        bool saved=settings.SetStringSaved("mode",std::to_string((int)mode));
+        printf("BT_MODE_CONFIRMED mode=%d saved=%d\n",(int)mode,saved);
+        if(!saved)post_status("模式已切换，设置保存失败，请重试",kColorError);
     }
+    if(!ok&&!s_phone_audio&&metalio_nt26_get_call_state()==METALIO_CALL_IDLE){
+        // RX/TX may have succeeded even when MODE did not. Restore the whole
+        // previous transaction and require its ACK before advertising it.
+        s_ack_mode=0;
+        BtMode restore=previous==BtMode::kNone?BtMode::kMode1:previous;
+        bool restored=SimpleUart::getInstance().sendModeWait((int)restore,valid)&&s_ack_mode==(int)restore;
+        s_active_mode=restored?restore:BtMode::kNone;
+        post_status(restored?"切换未完成，已恢复原模式":"模式未确认，请重新选择",kColorError);
+    }
+    {std::lock_guard<std::mutex> lock(s_phone_audio_mutex);if(!s_phone_audio)metalio_bt_set_scan_mode(s_active_mode==BtMode::kMode2||s_active_mode==BtMode::kNone);}
+    s_mode_busy=false;
+    // Restore existing microphone/speaker streams after a real mode-1 ACK.
+    // InputData otherwise keeps its old enabled flag after clocks disappeared.
+    if(s_active_mode==BtMode::kMode1&&!s_phone_audio)Application::GetInstance().ArmAssistantWakeWord(true);
 }
 
 void SendModeCommand(BtMode mode)
 {
+    printf("BT_MODE_REQUEST mode=%d active=%d busy=%d profile=%d request=%d phone=%d call=%d exclusive=%d\n",
+        (int)mode,(int)s_active_mode.load(),s_mode_busy.load(),s_profile_busy.load(),s_request_busy.load(),s_phone_audio.load(),metalio_nt26_get_call_state(),Application::GetInstance().GetAudioService().HasExclusiveCapture());
+    if(s_profile_busy||s_phone_audio||metalio_nt26_get_call_state()!=METALIO_CALL_IDLE||
+       Application::GetInstance().GetAudioService().HasExclusiveCapture()){
+        post_status("音频正在使用，请结束录音或通话后再切换",kColorScanning);return;
+    }
+    if(s_mode_busy.exchange(true))return;
     if (!SimpleUart::getInstance().begin()) {
+        s_mode_busy=false;
         post_status(I18n::T("UART 未初始化"), kColorError);
         return;
     }
-    std::thread(RunModeCommand, mode).detach();
+    pthread_t t;pthread_attr_t a;pthread_attr_init(&a);pthread_attr_setstacksize(&a,16384);
+    int rc=hi_task_create_legacy(&t,&a,[](void *p)->void*{RunModeCommand((BtMode)(intptr_t)p);return nullptr;},(void*)(intptr_t)mode);
+    pthread_attr_destroy(&a);if(!rc)pthread_detach(t);else{s_mode_busy=false;post_status("模式切换任务未能启动，请重试",kColorError);printf("BT_MODE_WORKER error=%d\n",rc);}
 }
 
 void ApplyMode(BtMode mode)
 {
-    s_active_mode = mode;
-    RefreshModeButtons();
-    switch (mode) {
-        case BtMode::kMode1:
-            ShowMode1Panel(true);
-            ShowMode2Panel(false);
-            break;
-        case BtMode::kMode2:
-            ShowMode1Panel(false);
-            ShowMode2Panel(true);
-            break;
-        case BtMode::kMode3:
-            ShowMode1Panel(false);
-            ShowMode2Panel(false);
-            break;
-        default:
-            break;
-    }
+    PhoneRouting().boot_restore=false;
+    if(s_mode_busy||s_request_busy||s_profile_busy){UpdateStatus("请等待当前蓝牙操作完成",kColorScanning);return;}
+    ++s_scan_epoch;
+    // Only SET MODE acknowledges the visible mode/panel. A busy or failed
+    // command must not leave the UI claiming a mode the hardware never set.
     SendModeCommand(mode);
 }
 
@@ -305,74 +342,148 @@ void async_after_bt_reset(void * /*user_data*/)
 
 void ResetTask()
 {
+    s_headset_linked=false;s_sco_up=false;s_a2dp_selected=false;
     post_status(I18n::T("正在复位蓝牙..."), kColorScanning);
     metalio_bt_power(false);
     usleep(300 * 1000);
     metalio_bt_power(true);
-    lv_async_call(async_after_bt_reset, nullptr);
+    lv_lock();lv_async_call(async_after_bt_reset, nullptr);lv_unlock();
     post_status(I18n::T("蓝牙电源已复位"), kColorSuccess);
 }
 
 void OnResetClicked(lv_event_t * /*e*/)
 {
-    std::thread(ResetTask).detach();
+    if(s_profile_busy||s_mode_busy||s_request_busy||s_phone_audio||Application::GetInstance().GetAudioService().HasExclusiveCapture())return;
+    HiTask::LegacyThread(ResetTask).detach();
 }
 
 // ---------------------------------------------------------------------------
 // Scan / connect / call / music.
 // ---------------------------------------------------------------------------
 
-void OnScanClicked(lv_event_t * /*e*/)
-{
-    if (s_active_mode != BtMode::kMode2) {
-        UpdateStatus(I18n::T("请先切换到模式2"), kColorError);
-        return;
-    }
-    if (!SimpleUart::getInstance().begin()) {
-        UpdateStatus(I18n::T("UART 未初始化"), kColorError);
-        return;
-    }
-    SendAt("AT+INQUIRING");
-    {
-        std::lock_guard<std::mutex> lock(s_devices_mutex);
-        s_devices.clear();
-    }
-    post_clear_list();
-    UpdateStatus(I18n::T("开始扫描..."), kColorScanning);
+struct BtRequest {unsigned epoch;std::string command;bool scan;};
+void StartRequest(const std::string &command,bool scan) {
+    if(s_phone_audio||Application::GetInstance().GetAudioService().HasExclusiveCapture()){UpdateStatus("音频正在使用，请稍后扫描或连接",kColorScanning);return;}
+    if(s_profile_busy||s_mode_busy||s_request_busy.exchange(true)){UpdateStatus("请等待当前蓝牙操作完成",kColorScanning);return;}
+    auto *job=new BtRequest{++s_scan_epoch,command,scan};
+    s_conn_state=scan?ConnState::kScanning:ConnState::kConnecting;
+    UpdateStatus(scan?"正在扫描附近设备…":"正在连接设备…",kColorScanning);
+    pthread_t t;pthread_attr_t a;pthread_attr_init(&a);pthread_attr_setstacksize(&a,16384);
+    int rc=hi_task_create_legacy(&t,&a,[](void *arg)->void*{
+        auto *j=(BtRequest*)arg;
+        auto valid=[j]{return !s_phone_audio&&j->epoch==s_scan_epoch&&metalio_nt26_get_call_state()==METALIO_CALL_IDLE;};
+        {std::lock_guard<std::mutex> lock(s_phone_audio_mutex);if(valid())metalio_bt_set_scan_mode(true);}
+        bool sent=valid()&&SimpleUart::getInstance().begin()&&SimpleUart::getInstance().sendStringWait(j->command+"\r\n",2000,valid);
+        if(!sent&&j->epoch==s_scan_epoch){s_conn_state=ConnState::kIdle;post_status("蓝牙模块未响应命令，请重试",kColorError);}
+        for(int n=0;sent&&n<(j->scan?220:300)&&j->epoch==s_scan_epoch&&s_screen_active;n++){
+            if(s_conn_state!=(j->scan?ConnState::kScanning:ConnState::kConnecting))break;usleep(100000);
+        }
+        if(sent&&j->epoch==s_scan_epoch&&s_screen_active&&s_conn_state==(j->scan?ConnState::kScanning:ConnState::kConnecting)){
+            s_conn_state=ConnState::kIdle;
+            if(j->scan){size_t count;{std::lock_guard<std::mutex>l(s_devices_mutex);count=s_devices.size();}
+                char status[96];snprintf(status,sizeof(status),count?"扫描结束，共 %u 个设备":"未发现设备，请让目标设备进入配对状态",(unsigned)count);post_status(status,count?kColorSuccess:kColorSubtle);}
+            else post_status("连接超时，请确认设备仍处于配对状态",kColorError);
+        }
+        s_request_busy=false;delete j;return nullptr;
+    },job);pthread_attr_destroy(&a);
+    if(!rc)pthread_detach(t);else{delete job;s_request_busy=false;s_conn_state=ConnState::kIdle;UpdateStatus("系统忙，请重试",kColorError);}
+}
+void OnScanClicked(lv_event_t *) {
+    if(s_mode_busy||s_request_busy){UpdateStatus("请等待当前蓝牙操作完成",kColorScanning);return;}
+    if(s_active_mode!=BtMode::kMode2){UpdateStatus("请先切换到模式2",kColorError);return;}
+    {std::lock_guard<std::mutex>l(s_devices_mutex);s_devices.clear();}
+    post_clear_list();StartRequest("AT+INQUIRING",true);
 }
 
-void MusicModeTask()
-{
-    post_status(I18n::T("切换音乐模式..."), kColorScanning);
-    SendAt("AT+BTSCO=0");
-    usleep(200 * 1000);
-    SendAt("AT+PP=1");
+bool ProfileCommand(bool call,bool cellular=false,unsigned phone_generation=0,unsigned request=0){
+ if(s_profile_busy.exchange(true))return false;
+ const unsigned epoch=s_link_epoch.load();
+ auto valid=[epoch,cellular,phone_generation,request](){auto&r=PhoneRouting();
+  if(phone_generation&&(r.generation!=phone_generation||r.request!=request))return false;
+  bool ownership=cellular?(s_phone_audio&&CellularAudioActive()&&!r.ending):
+      (!CellularAudioActive()&&(!s_phone_audio||metalio_nt26_get_call_state()==METALIO_CALL_INCOMING));
+  return ownership&&s_link_epoch==epoch&&s_active_mode==BtMode::kMode2&&
+      s_headset_linked&&!s_mode_busy&&!s_request_busy;
+ };
+ auto command=[&](const char *cmd){
+  bool sent=valid()&&SimpleUart::getInstance().begin()&&
+      SimpleUart::getInstance().sendStringWait(std::string(cmd)+"\r\n",2500,valid);
+  ESP_LOGW(TAG,"profile %s: TX %s %s",call?"SCO":"A2DP",cmd,sent?"sent":"failed");
+  return sent;
+ };
+ // Do not resend BTSCO=0 to an already closed SCO bearer: that is already
+ // the music state, and an unnecessary command can add an unrelated error.
+ // Nor may an unrelated generic ERROR overrule a later SETUP/DISC SCO.
+ bool ok=valid();
+ if(ok)metalio_bt_leave_voice();
+ const char *failure="蓝牙连接已变化，请重新选择模式";
+ if(ok&&s_sco_up.load()!=call){
+  failure="蓝牙模式命令未发出，请重试";
+  if(call){ok=command("AT+PP=1");if(ok)usleep(700000);}
+  if(ok)ok=command(call?"AT+BTSCO=1":"AT+BTSCO=0");
+  if(ok){
+   failure=call?"耳机未建立通话音频，请确认支持通话模式":"耳机未退出通话音频，请重试";
+   for(int n=0;valid()&&s_sco_up.load()!=call&&n<60;n++)usleep(100000);
+   ok=valid()&&s_sco_up.load()==call;
+  }
+ }
+ if(ok&&!call&&!cellular){
+  // PP=1 starts A2DP, but not every supported module returns a separate
+  // OK/MPLAY. Keep this as a selection, not proof of PCM or audible sound.
+  failure="蓝牙音乐命令未发出，请重试";
+  usleep(200000);ok=command("AT+PP=1");
+ }
+ ok=ok&&valid()&&s_sco_up.load()==call;
+ s_a2dp_selected=ok&&!call&&!cellular;s_profile_busy=false;
+ if(!ok)ESP_LOGW(TAG,"profile %s failed: mode=%d linked=%d sco=%d epoch=%u/%u",
+     call?"SCO":"A2DP",(int)s_active_mode.load(),(int)s_headset_linked.load(),
+     (int)s_sco_up.load(),epoch,s_link_epoch.load());
+ // GPIO edges confirm only P4's external clock, not the wireless profile.
+ // Check them at actual capture/playback time below, with a settle window.
+ post_status(ok?(call?"耳机通话模式已建立":"已选择耳机音乐模式"):failure,ok?kColorSuccess:kColorError);
+ return ok;
 }
 
-void CallModeTask()
-{
-    post_status(I18n::T("切换通话模式..."), kColorScanning);
-    SendAt("AT+PP=1");
-    usleep(200 * 1000);
-    SendAt("AT+BTSCO=1");
+#include "phone_audio_route.inc"
+
+int AcceptHeadsetStream(bool call){
+ const unsigned epoch=s_link_epoch.load();
+ for(int n=0;n<15;n++){
+  if(s_profile_busy||s_mode_busy||s_request_busy)return -EBUSY;
+  if(s_link_epoch!=epoch||s_active_mode!=BtMode::kMode2||!s_headset_linked||
+     (s_phone_audio&&metalio_nt26_get_call_state()!=METALIO_CALL_INCOMING)||CellularAudioActive()||s_sco_up.load()!=call)return -ENOTCONN;
+  if(metalio_bt_accept_headset_stream()==0)return 0;
+  usleep(100000);
+ }
+ ESP_LOGW(TAG,"profile %s: P4 audio clock not present",call?"SCO":"A2DP");
+ post_status("耳机已连接，但音频时钟未就绪",kColorError);
+ return -EIO;
 }
+void MusicModeTask(){(void)ProfileCommand(false);}
+void CallModeTask(){(void)ProfileCommand(true);}
 
 void OnMusicModeClicked(lv_event_t * /*e*/)
 {
+    if(Application::GetInstance().GetAudioService().HasExclusiveCapture()){UpdateStatus("录音或回放中，请结束后再切换",kColorScanning);return;}
+    if(s_profile_busy||s_mode_busy||s_request_busy){UpdateStatus("请等待当前蓝牙操作完成",kColorScanning);return;}
     if (s_conn_state != ConnState::kConnected) {
         UpdateStatus(I18n::T("请先连接蓝牙设备"), kColorError);
         return;
     }
-    std::thread(MusicModeTask).detach();
+    UpdateStatus("正在切换耳机音乐模式…",kColorScanning);
+    HiTask::LegacyThread(MusicModeTask).detach();
 }
 
 void OnCallModeClicked(lv_event_t * /*e*/)
 {
+    if(Application::GetInstance().GetAudioService().HasExclusiveCapture()){UpdateStatus("录音或回放中，请结束后再切换",kColorScanning);return;}
+    if(s_profile_busy||s_mode_busy||s_request_busy){UpdateStatus("请等待当前蓝牙操作完成",kColorScanning);return;}
     if (s_conn_state != ConnState::kConnected) {
         UpdateStatus(I18n::T("请先连接蓝牙设备"), kColorError);
         return;
     }
-    std::thread(CallModeTask).detach();
+    UpdateStatus("正在切换耳机通话模式…",kColorScanning);
+    HiTask::LegacyThread(CallModeTask).detach();
 }
 
 // ---------------------------------------------------------------------------
@@ -389,12 +500,13 @@ void clear_device_list_ui()
 struct AsyncAddDeviceMsg {
     char address[kAddrHexLen + 1];
     char name[64];
+    unsigned epoch;
 };
 
 void async_add_device_item(void *user_data)
 {
     auto *msg = static_cast<AsyncAddDeviceMsg *>(user_data);
-    if (s_ui.device_list == nullptr) {
+    if (!s_screen_active||msg->epoch!=s_ui_epoch||s_ui.device_list == nullptr) {
         delete msg;
         return;
     }
@@ -419,11 +531,9 @@ void async_add_device_item(void *user_data)
                 }
                 char cmd[48];
                 snprintf(cmd, sizeof(cmd), "AT+CONNECT=%s", addr);
-                SendAt(cmd);
-                s_conn_state = ConnState::kConnecting;
-                char status[64];
-                snprintf(status, sizeof(status), I18n::T("连接中: %s..."), addr);
-                post_status(status, kColorScanning);
+                if(s_active_mode!=BtMode::kMode2)return;
+                StartRequest(cmd,false);
+
             },
             LV_EVENT_CLICKED, addr_copy);
         lv_obj_add_event_cb(
@@ -458,12 +568,13 @@ void add_device_to_list(const char *address, const char *name)
     auto *msg = new AsyncAddDeviceMsg{};
     snprintf(msg->address, sizeof(msg->address), "%s", address);
     snprintf(msg->name, sizeof(msg->name), "%s", name);
-    lv_async_call(async_add_device_item, msg);
+    msg->epoch=s_ui_epoch;
+    lv_lock();if(lv_async_call(async_add_device_item, msg)!=LV_RESULT_OK)delete msg;lv_unlock();
 }
 
-void async_clear_list(void * /*user_data*/)
+void async_clear_list(void *user_data)
 {
-    clear_device_list_ui();
+    if(s_screen_active&&(unsigned)(uintptr_t)user_data==s_ui_epoch)clear_device_list_ui();
 }
 
 void post_clear_list()
@@ -471,11 +582,12 @@ void post_clear_list()
     if (!s_screen_active) {
         return;
     }
-    lv_async_call(async_clear_list, nullptr);
+    lv_lock();lv_async_call(async_clear_list,(void*)(uintptr_t)s_ui_epoch.load());lv_unlock();
 }
 
 void async_on_mode1_set(void * /*user_data*/)
 {
+    if(!s_screen_active)return;
     RefreshModeButtons();
     ShowMode1Panel(true);
     ShowMode2Panel(false);
@@ -483,6 +595,7 @@ void async_on_mode1_set(void * /*user_data*/)
 
 void async_on_mode2_set(void * /*user_data*/)
 {
+    if(!s_screen_active)return;
     RefreshModeButtons();
     ShowMode1Panel(false);
     ShowMode2Panel(true);
@@ -490,6 +603,7 @@ void async_on_mode2_set(void * /*user_data*/)
 
 void async_on_mode3_set(void * /*user_data*/)
 {
+    if(!s_screen_active)return;
     RefreshModeButtons();
     ShowMode1Panel(false);
     ShowMode2Panel(false);
@@ -521,11 +635,24 @@ bool parse_bt_device_line(const std::string &line,
                           char *address, size_t addr_sz,
                           char *name, size_t name_sz)
 {
-    constexpr const char *kPrefix = "AT+BT:";
-    if (line.rfind(kPrefix, 0) != 0) {
-        return false;
+    size_t prefix=line.size()>=6&&memcmp(line.data(),"AT+BT:",6)==0?6:line.size()>=4&&memcmp(line.data(),"+BT:",4)==0?4:line.size()>=3&&memcmp(line.data(),"BT:",3)==0?3:0;
+    if(!prefix)return false;
+    std::string payload=line.substr(prefix);size_t at=0,n=0;
+    while(at<payload.size()&&(payload[at]==' '||payload[at]=='\"'))++at;
+    char hex[kAddrHexLen+1]{};
+    while(at<payload.size()&&n<kAddrHexLen){
+        char c=payload[at++];if(is_hex_char(c))hex[n++]=c;
+        else if(c!=':'&&c!='-'&&c!=' ')return false;
     }
-    const std::string payload = line.substr(strlen(kPrefix));
+    if(n!=kAddrHexLen)return false;
+    while(at<payload.size()&&(payload[at]==' '||payload[at]=='\"'||payload[at]==','||payload[at]==':'))++at;
+    std::string device_name=payload.substr(at);trim_line(device_name);
+    if(!device_name.empty()&&device_name.back()=='\"')device_name.pop_back();
+    if(device_name.size()>=name_sz){device_name.resize(name_sz-1);
+        while(!device_name.empty()&&((unsigned char)device_name.back()&0xc0)==0x80)device_name.pop_back();
+        if(!device_name.empty()&&(unsigned char)device_name.back()>=0xc0)device_name.pop_back();}
+    snprintf(address,addr_sz,"%s",hex);snprintf(name,name_sz,"%s",device_name.c_str());return true;
+#if 0
     if (payload.size() < static_cast<size_t>(kAddrHexLen)) {
         return false;
     }
@@ -537,6 +664,7 @@ bool parse_bt_device_line(const std::string &line,
     snprintf(address, addr_sz, "%.*s", kAddrHexLen, payload.c_str());
     snprintf(name, name_sz, "%s", payload.c_str() + kAddrHexLen);
     return true;
+#endif
 }
 
 void handle_response_line(const std::string &raw_line)
@@ -550,24 +678,27 @@ void handle_response_line(const std::string &raw_line)
     ESP_LOGI(TAG, "RX: %s", line.c_str());
 
     if (line.find("SET MODE 1") != std::string::npos) {
+        s_ack_mode=1;
         s_active_mode = BtMode::kMode1;
         s_conn_state  = ConnState::kIdle;
         post_status(I18n::T("模式1 已设置"), kColorSuccess);
-        lv_async_call(async_on_mode1_set, nullptr);
+        lv_lock();lv_async_call(async_on_mode1_set, nullptr);lv_unlock();
         return;
     }
     if (line.find("SET MODE 2") != std::string::npos) {
+        s_ack_mode=2;
         s_active_mode = BtMode::kMode2;
         s_conn_state  = ConnState::kIdle;
         post_status(I18n::T("模式2 已设置，可扫描设备"), kColorSuccess);
-        lv_async_call(async_on_mode2_set, nullptr);
+        lv_lock();lv_async_call(async_on_mode2_set, nullptr);lv_unlock();
         return;
     }
     if (line.find("SET MODE 3") != std::string::npos) {
+        s_ack_mode=3;
         s_active_mode = BtMode::kMode3;
         s_conn_state  = ConnState::kIdle;
         post_status(I18n::T("模式3 已设置"), kColorSuccess);
-        lv_async_call(async_on_mode3_set, nullptr);
+        lv_lock();lv_async_call(async_on_mode3_set, nullptr);lv_unlock();
         return;
     }
 
@@ -596,6 +727,8 @@ void handle_response_line(const std::string &raw_line)
         snprintf(dev.name, sizeof(dev.name), "%s", name);
         {
             std::lock_guard<std::mutex> lock(s_devices_mutex);
+            for(const auto &known:s_devices)if(!strcasecmp(known.address,address))return;
+            if(s_devices.size()>=64)return;
             s_devices.push_back(dev);
         }
         add_device_to_list(address, name);
@@ -619,6 +752,7 @@ void handle_response_line(const std::string &raw_line)
         return;
     }
 
+    if (line.find("DISCONNECT")!=std::string::npos||line.find("CONNECT FAIL")!=std::string::npos){s_conn_state=ConnState::kIdle;post_status("蓝牙连接已断开",kColorSubtle);return;}
     if (line.find("CONNECTING") != std::string::npos) {
         s_conn_state = ConnState::kConnecting;
         post_status(I18n::T("正在连接..."), kColorScanning);
@@ -650,31 +784,14 @@ void handle_response_line(const std::string &raw_line)
     post_status(line.c_str(), kColorSubtle);
 }
 
-void on_uart_data(const std::vector<uint8_t> &data)
-{
-    if (!data.empty()) {
-        s_rx_buffer.append(reinterpret_cast<const char *>(data.data()),
-                           data.size());
-    }
-
-    size_t pos = 0;
-    while (true) {
-        size_t nl = s_rx_buffer.find('\n', pos);
-        if (nl == std::string::npos) {
-            break;
-        }
-        std::string line = s_rx_buffer.substr(pos, nl - pos);
-        handle_response_line(line);
-        pos = nl + 1;
-    }
-    if (pos > 0) {
-        s_rx_buffer.erase(0, pos);
-    }
-
-    if (s_rx_buffer.size() > 2048) {
-        ESP_LOGW(TAG, "RX buffer overflow, clearing");
-        s_rx_buffer.clear();
-    }
+void on_uart_data(const std::vector<uint8_t> &data) {
+    std::vector<std::string> lines;
+    {std::lock_guard<std::mutex>lock(s_rx_mutex);
+     if(!data.empty())s_rx_buffer.append((const char*)data.data(),data.size());
+     size_t pos=0,nl;
+     while((nl=s_rx_buffer.find_first_of("\r\n",pos))!=std::string::npos){if(nl>pos)lines.push_back(s_rx_buffer.substr(pos,nl-pos));pos=nl+1;}
+     if(pos)s_rx_buffer.erase(0,pos);if(s_rx_buffer.size()>2048)s_rx_buffer.clear();}
+    for(const auto &line:lines)handle_response_line(line);
 }
 
 // ---------------------------------------------------------------------------
@@ -907,6 +1024,7 @@ void OnBackClicked(lv_event_t * /*e*/)
 
 void OnScreenUnloaded(lv_event_t * /*e*/)
 {
+    ++s_ui_epoch;++s_scan_epoch;
     s_screen_active = false;
     s_ui.screen = nullptr;
     s_ui.status_label = nullptr;
@@ -933,7 +1051,7 @@ void BluetoothScreen::BuildInto(lv_obj_t *parent)
         return;
     }
     s_screen_active = true;
-    s_rx_buffer.clear();
+    {std::lock_guard<std::mutex>lock(s_rx_mutex);s_rx_buffer.clear();}
     {
         std::lock_guard<std::mutex> lock(s_devices_mutex);
         s_devices.clear();
@@ -944,8 +1062,9 @@ void BluetoothScreen::BuildInto(lv_obj_t *parent)
 
 void BluetoothScreen::ResetUi()
 {
+    ++s_ui_epoch;++s_scan_epoch;
     s_screen_active = false;
-    s_rx_buffer.clear();
+    {std::lock_guard<std::mutex>lock(s_rx_mutex);s_rx_buffer.clear();}
     {
         std::lock_guard<std::mutex> lock(s_devices_mutex);
         s_devices.clear();
@@ -964,10 +1083,105 @@ void BluetoothScreen::ResetUi()
     }
 }
 
+void BluetoothScreen::InitAudioObserver(){
+ static std::atomic<bool> ready{false};if(ready.exchange(true))return;
+ SimpleUart::getInstance().registerAudioObserver([](const std::vector<uint8_t>&data){
+  s_observer_rx.append((const char*)data.data(),data.size());size_t end;
+  while((end=s_observer_rx.find_first_of("\r\n"))!=std::string::npos){
+   std::string line=s_observer_rx.substr(0,end);s_observer_rx.erase(0,end+1);if(line.empty())continue;
+   if(s_profile_busy)ESP_LOGW(TAG,"profile RX: %.160s",line.c_str());
+   if(line.find("SETUP SCO")!=std::string::npos){s_sco_up=true;s_a2dp_selected=false;metalio_bt_leave_voice();}
+   if(line.find("DISC SCO")!=std::string::npos){s_sco_up=false;s_a2dp_selected=false;metalio_bt_leave_voice();}
+   if(line.find("CONNECT SUCCESS")!=std::string::npos){if(!s_headset_linked.exchange(true))++s_link_epoch;s_conn_state=ConnState::kConnected;}
+   if(line.find("DISCONNECT")!=std::string::npos||line.find("CONNECT FAIL")!=std::string::npos||line.find("CONNECT TIMEOUT")!=std::string::npos){++s_link_epoch;s_headset_linked=false;s_conn_state=ConnState::kIdle;s_sco_up=false;s_a2dp_selected=false;metalio_bt_leave_voice();}
+   for(int mode=1;mode<=3;mode++){char token[24];snprintf(token,sizeof(token),"SET MODE %d",mode);
+    if(line.find(token)!=std::string::npos){++s_link_epoch;s_headset_linked=false;s_conn_state=ConnState::kIdle;s_sco_up=false;s_a2dp_selected=false;metalio_bt_leave_voice();s_active_mode=(BtMode)mode;s_ack_mode=mode;}}
+  }
+  if(s_observer_rx.size()>2048)s_observer_rx.clear();
+ });SimpleUart::getInstance().begin();
+ const int saved=Settings("bluetooth").GetInt("mode",1);
+ if(saved==2||saved==3){
+  PhoneRouting().boot_restore=true;
+  lv_timer_create([](lv_timer_t*t){
+   if(!PhoneRouting().boot_restore){lv_timer_delete(t);return;}
+   // Keep local clocks during speech-model initialization. The saved mode
+   // is restored without opening AI or resetting the radio/modem.
+   auto &audio=Application::GetInstance().GetAudioService();
+   if(!audio.IsWakeWordEngineReady()||!audio.IsStarted()||audio.HasExclusiveCapture()||s_mode_busy||s_profile_busy||s_request_busy||s_phone_audio||metalio_nt26_get_call_state()!=METALIO_CALL_IDLE)return;
+   PhoneRouting().boot_restore=false;
+   BluetoothScreen::ApplyDefaultMode();lv_timer_delete(t);
+  },250,nullptr);
+ }
+}
+int WaitForAudioRouteIdle(){
+ // Playback/record workers may arrive just after a mode/profile click.
+ // Wait for that transaction instead of failing a healthy radio/file.
+ for(int n=0;n<220;n++){
+  if(CellularAudioActive()||(s_phone_audio&&metalio_nt26_get_call_state()!=METALIO_CALL_INCOMING))return -EBUSY;
+  if(!s_mode_busy&&!s_profile_busy&&!s_request_busy)return 0;
+  usleep(100000);
+ }
+ return -ETIMEDOUT;
+}
+int BluetoothScreen::PrepareVoiceRoute(){
+ if(CellularAudioActive()||(s_phone_audio&&metalio_nt26_get_call_state()!=METALIO_CALL_INCOMING))return -EBUSY;
+ int ready=WaitForAudioRouteIdle();if(ready<0)return ready;
+ if(s_active_mode==BtMode::kMode2&&s_headset_linked){
+  if(!s_sco_up&&!ProfileCommand(true))return -EIO;
+  return AcceptHeadsetStream(true);
+ }
+ return metalio_bt_ensure_mode1();
+}
+int BluetoothScreen::PreparePlaybackRoute(){
+ if(CellularAudioActive()||(s_phone_audio&&metalio_nt26_get_call_state()!=METALIO_CALL_INCOMING))return -EBUSY;
+ int ready=WaitForAudioRouteIdle();if(ready<0)return ready;
+ if(s_active_mode==BtMode::kMode2&&s_headset_linked){
+  if(!s_a2dp_selected&&!ProfileCommand(false))return -EIO;
+  return AcceptHeadsetStream(false);
+ }
+ return metalio_bt_ensure_mode1();
+}
+
+void BluetoothScreen::BeginPhoneAudio(){
+ auto&r=PhoneRouting();
+ {std::lock_guard<std::mutex> lock(s_phone_audio_mutex);
+  if(!s_phone_audio.exchange(true)){r.before=s_active_mode.load();r.before_sco=s_sco_up.load();++r.generation;++r.request;r.preferred=-1;r.route=0;r.ending=false;}
+  ++s_scan_epoch;metalio_bt_set_scan_mode(IsHeadsetConnected()||metalio_nt26_get_call_state()!=METALIO_CALL_INCOMING);
+ }
+ StartPhoneRouteWorker();
+}
+void BluetoothScreen::EndPhoneAudio(){
+ auto&r=PhoneRouting();
+ {std::lock_guard<std::mutex> lock(s_phone_audio_mutex);if(!s_phone_audio.exchange(false))return;++r.generation;++r.request;}
+ StartPhoneRouteWorker();
+}
+int BluetoothScreen::SelectPhoneOutput(bool headset){
+ if(!CellularAudioActive())return -ENOTCONN;
+ BeginPhoneAudio();auto&r=PhoneRouting();unsigned generation,request;
+ {std::lock_guard<std::mutex> lock(s_phone_audio_mutex);r.preferred=headset?1:0;generation=r.generation;request=++r.request;}
+ std::lock_guard<std::mutex>lock(r.operation);return ApplyPhoneOutput(headset,generation,request);
+}
+void BluetoothScreen::CancelPhoneOutputRequest(){auto&r=PhoneRouting();r.ending=true;++r.request;}
+int BluetoothScreen::PhoneAudioRoute(){
+ auto&r=PhoneRouting();int route=r.route;
+ if(!s_phone_audio||!CellularAudioActive())return 0;
+ return route==2&&(!IsHeadsetConnected()||!s_sco_up)?0:route;
+}
+bool BluetoothScreen::IsVoiceModeForeground(){return s_screen_active&&s_active_mode==BtMode::kMode1&&!s_mode_busy;}
+bool BluetoothScreen::IsHeadsetConnected(){
+ // Clock readiness is also set by a valid mode-2 stream; it is not a
+ // mode-1 indicator. Pairing is owned by the observed link/mode epochs.
+ return metalio_bt_is_powered()&&s_active_mode==BtMode::kMode2&&s_headset_linked;
+}
+bool BluetoothScreen::IsHeadsetCaptureReady(){
+ return IsHeadsetConnected()&&s_sco_up&&!s_profile_busy&&!s_mode_busy;
+}
+
 void BluetoothScreen::ApplyDefaultMode()
 {
-    s_active_mode = BtMode::kMode1;
-    SendModeCommand(BtMode::kMode1);
+    int mode=Settings("bluetooth").GetInt("mode",1);
+    if(mode<1||mode>3)mode=1;
+    SendModeCommand((BtMode)mode);
 }
 
 lv_obj_t *BluetoothScreen::CreateStatic()
@@ -1041,7 +1255,7 @@ void BluetoothScreen::LifecycleCallback(screen_lifecycle_event_t event)
     if (event == SCREEN_LIFECYCLE_LOAD) {
         ESP_LOGI(TAG, "load: bluetooth_screen");
         s_screen_active = true;
-        s_rx_buffer.clear();
+        {std::lock_guard<std::mutex>lock(s_rx_mutex);s_rx_buffer.clear();}
         SimpleUart::getInstance().begin();
         SimpleUart::getInstance().registerCallback(on_uart_data);
     } else {
@@ -1049,5 +1263,6 @@ void BluetoothScreen::LifecycleCallback(screen_lifecycle_event_t event)
         SimpleUart::getInstance().registerCallback(
             std::function<void(const std::vector<uint8_t> &)>());
         s_screen_active = false;
+        ++s_scan_epoch;++s_ui_epoch;
     }
 }

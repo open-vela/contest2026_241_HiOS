@@ -265,7 +265,7 @@ void OtaScreen::Show(const char *version_text)
     s_ui.screen = BuildScreen(version_text);
     s_ui.active = true;
     s_start_time_us = esp_timer_get_time();
-    lv_screen_load(s_ui.screen);
+    screen_load_safe(s_ui.screen);
     UpdateWidgets(0, 0, 0, 0);
     lv_unlock();
     ESP_LOGI(TAG, "OTA screen shown");

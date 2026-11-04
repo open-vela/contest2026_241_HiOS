@@ -108,6 +108,25 @@ void Protocol::SendStartListening(ListeningMode mode)
     SendText(message);
 }
 
+bool Protocol::SendUserText(const std::string &text)
+{
+    if (text.empty() || text.size()>2048 || session_id_.empty()) return false;
+    // listen/detect accepts recognized text as well as a wake phrase. Use
+    // JSON escaping for quotes, newlines and UTF-8; never the wake buffer.
+    cJSON *root=cJSON_CreateObject();
+    if (!root) return false;
+    const bool built=cJSON_AddStringToObject(root,"session_id",session_id_.c_str()) &&
+        cJSON_AddStringToObject(root,"type","listen") &&
+        cJSON_AddStringToObject(root,"state","detect") &&
+        cJSON_AddStringToObject(root,"mode","manual") &&
+        cJSON_AddStringToObject(root,"text",text.c_str());
+    char *json=built?cJSON_PrintUnformatted(root):nullptr;
+    cJSON_Delete(root);
+    if (!json) return false;
+    const bool sent=SendText(std::string(json));
+    cJSON_free(json);return sent;
+}
+
 void Protocol::SendStopListening()
 {
     std::string message = "{\"session_id\":\"" + session_id_ + "\",\"type\":\"listen\",\"state\":\"stop\"}";

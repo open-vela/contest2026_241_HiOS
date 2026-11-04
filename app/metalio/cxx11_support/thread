@@ -23,6 +23,7 @@
 #endif
 
 #include <pthread.h>
+#include "hi_task_policy.h"
 #include <unistd.h>
 #include <errno.h>
 #include <stdio.h>
@@ -144,7 +145,7 @@ private:
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 98304);
-    int rc = pthread_create(&thr_, &attr, &_Entry, start_fn_);
+    int rc = hi_task_create_cpp_default(&thr_, &attr, &_Entry, start_fn_);
     pthread_attr_destroy(&attr);
     if (rc != 0) {
       char dbg[64];

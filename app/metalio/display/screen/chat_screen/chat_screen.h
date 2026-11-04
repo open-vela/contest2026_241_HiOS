@@ -49,6 +49,8 @@ public:
     static void ClearMessages();
 
     static bool IsActive();
+    // Foreground voice session; cached widgets alone do not imply visibility.
+    static bool IsForeground();
 
     // Refresh the device-chat-state label next to the header title.
     // No-op when the screen is not loaded.

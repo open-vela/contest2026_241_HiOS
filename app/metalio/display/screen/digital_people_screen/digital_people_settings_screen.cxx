@@ -19,6 +19,7 @@
 #include "digital_people_settings_screen.h"
 #include "digital_people_prefs.h"
 #include "digital_people_screen.h"
+#include "settings.h"
 #include "i18n.h"
 #include "esp_log_shim.h"
 
@@ -111,6 +112,7 @@ void OnDelaySliderChanged(lv_event_t* e) {
 }
 
 void ApplyFormat(DigitalPeoplePrefs::EmotionFormat format) {
+    Settings prefs("ui",true);prefs.SetInt("dp_custom",1);
     if (format == s_ui.format) {
         return;
     }
@@ -221,7 +223,7 @@ void GoBackToDigitalPeople() {
     lv_obj_t* old_scr = lv_screen_active();
     lv_obj_t* dp = DigitalPeopleScreen::CreateStatic();
     screen_attach_lifecycle(dp, digital_people_lifecycle_cb);
-    lv_screen_load(dp);
+    screen_load_safe(dp);
     if (old_scr != nullptr && old_scr != dp) {
         lv_obj_delete_async(old_scr);
     }
@@ -262,7 +264,7 @@ void BuildHeader(lv_obj_t* parent) {
     lv_obj_center(back_icon);
 
     lv_obj_t* title = lv_label_create(header);
-    lv_label_set_text(title, I18n::T("数字人设置"));
+    lv_label_set_text(title, I18n::T("小白助手设置"));
     lv_obj_set_style_text_color(title, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_font(title, &font_puhui_30_4, LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_LEFT_MID, 16 + kBackBtnSize + 16, 0);
@@ -397,7 +399,7 @@ lv_obj_t* DigitalPeopleSettingsScreen::CreateStatic() {
 
     lv_obj_t* section_hint = lv_label_create(content);
     lv_label_set_text(section_hint,
-                      I18n::T("选择 EAF 动画或 SJPG 静态图"));
+                      I18n::T("内置透明表情；也可选择自定义 EAF / SJPG"));
     lv_obj_set_style_text_color(section_hint, lv_color_hex(kColorSubtle),
                                 LV_PART_MAIN);
     lv_obj_set_style_text_font(section_hint, &font_puhui_20_4, LV_PART_MAIN);
@@ -422,10 +424,13 @@ lv_obj_t* DigitalPeopleSettingsScreen::CreateStatic() {
                         DigitalPeoplePrefs::EmotionFormat::Sjpg,
                         &s_ui.sjpg_mark);
 
+    auto*native=lv_button_create(content);lv_obj_set_size(native,LV_PCT(100),54);
+    auto*native_label=lv_label_create(native);lv_label_set_text(native_label,"使用小白透明表情");lv_obj_set_style_text_font(native_label,&font_puhui_20_4,0);lv_obj_center(native_label);
+    lv_obj_add_event_cb(native,[](lv_event_t*){Settings prefs("ui",true);prefs.SetInt("dp_custom",0);},LV_EVENT_CLICKED,nullptr);
     BuildDelaySection(content, delay_ms);
 
     lv_obj_t* foot = lv_label_create(content);
-    lv_label_set_text(foot, I18n::T("数字人设置会自动保存"));
+    lv_label_set_text(foot, I18n::T("小白助手设置会自动保存"));
     lv_obj_set_style_text_color(foot, lv_color_hex(kColorSubtle), LV_PART_MAIN);
     lv_obj_set_style_text_font(foot, &font_puhui_20_4, LV_PART_MAIN);
 

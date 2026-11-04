@@ -90,11 +90,13 @@ public:
     void OnDisconnected(std::function<void()> callback);
 
     virtual bool Start() = 0;
+    virtual bool OnNetworkReady() { return false; }
     virtual bool OpenAudioChannel() = 0;
     virtual void CloseAudioChannel() = 0;
     virtual bool IsAudioChannelOpened() const = 0;
     virtual bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) = 0;
     virtual bool SendWakeWordDetected(const std::string &wake_word);
+    bool SendUserText(const std::string &text);
     virtual void SendStartListening(ListeningMode mode);
     virtual void SendStopListening();
     virtual void SendAbortSpeaking(AbortReason reason);

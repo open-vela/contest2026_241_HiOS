@@ -1,0 +1,3 @@
+TinyUSB https://github.com/hathach/tinyusb
+Commit 702e55db3899885900b18c8d388a9cf92c624331
+MIT. Selected device/MSC/DWC2 sources. Local NuttX polling port and SRAM section annotations.

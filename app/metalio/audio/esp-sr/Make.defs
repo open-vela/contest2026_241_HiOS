@@ -72,6 +72,7 @@ CSRCS += $(ESP_SR_ROOT)/model_path_nuttx.c
 CSRCS += $(ESP_SR_ROOT)/src/esp_sr_debug.c
 CSRCS += $(ESP_SR_ROOT)/metalio_srmodel_boot.c
 CSRCS += $(ESP_SR_ROOT)/srmodels_bin.c
+CSRCS += $(ESP_SR_ROOT)/esp_mn_speech_commands_nuttx.c
 CSRCS += port/esp_sr_link_exports.c
 
 CSRCS += $(DL_FFT_ROOT)/dl_fft_f32.c
@@ -100,16 +101,30 @@ VPATH += :$(ESP_DSP_ROOT)/modules/dotprod/float
 ESP_SR_LIBDIR = $(APPDIR)/metalio/$(ESP_SR_ROOT)/lib/esp32p4
 ESP_SR_STAGED = libesp_audio_front_end.a libesp_audio_processor.a \
 	libwakenet.a libnsnet.a libvadnet.a libdl_lib.a \
-	libc_speech_features.a libhufzip.a
+	libc_speech_features.a libhufzip.a libmultinet.a libfst.a
 # Keep -l forms for module builds; staging covers the kernel nuttx link.
 # Ensure apps/staging has symlinks (arch link only pulls staging/*.a).
 ESP_SR_STAGE_DIR = $(APPDIR)/staging
+# These four vendor lookup tables are read-only in use. Leaving them in
+# .data consumes 9210 bytes and overflows SRAM when MN7 is linked. Generate
+# a private archive with only their section flags changed; retain originals.
+ESP_SR_PATCHED_LIBDIR = $(ESP_SR_STAGE_DIR)/.metalio-sr
+ESP_SR_OBJCOPY = $(if $(strip $(OBJCOPY)),$(OBJCOPY),$(CROSSDEV)objcopy)
+ESP_SR_PREPARED := $(shell python3 $(APPDIR)/metalio/$(ESP_SR_ROOT)/prepare_sr_lib.py \
+  --source $(ESP_SR_LIBDIR)/libdl_lib.a \
+  --output $(ESP_SR_PATCHED_LIBDIR)/libdl_lib.a \
+  --objcopy "$(ESP_SR_OBJCOPY)" && echo ready)
+ifneq ($(ESP_SR_PREPARED),ready)
+$(error ESP-SR private lookup-table archive could not be prepared)
+endif
 $(shell mkdir -p $(ESP_SR_STAGE_DIR); \
   for f in $(ESP_SR_STAGED); do \
-    ln -sfn ../metalio/$(ESP_SR_ROOT)/lib/esp32p4/$$f $(ESP_SR_STAGE_DIR)/$$f; \
+    src="$(ESP_SR_LIBDIR)/$$f"; \
+    if [ "$$f" = "libdl_lib.a" ]; then src="$(ESP_SR_PATCHED_LIBDIR)/$$f"; fi; \
+    ln -sfn "$$src" $(ESP_SR_STAGE_DIR)/$$f; \
   done)
 
-EXTRA_LIBPATHS += -L$(ESP_SR_LIBDIR)
+EXTRA_LIBPATHS += -L$(ESP_SR_PATCHED_LIBDIR) -L$(ESP_SR_LIBDIR)
 EXTRA_LIBS += -lesp_audio_front_end -lesp_audio_processor
 EXTRA_LIBS += -lwakenet -lnsnet -lvadnet
 EXTRA_LIBS += -ldl_lib -lc_speech_features -lhufzip

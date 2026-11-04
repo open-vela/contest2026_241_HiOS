@@ -74,19 +74,24 @@ class DisplayLockGuard
 public:
     DisplayLockGuard(Display *display) : display_(display)
     {
-        if (display_ && !display_->Lock(30000))
+        locked_ = display_ && display_->Lock(30000);
+        if (display_ && !locked_)
         {
             ESP_LOGE("Display", "Failed to lock display");
         }
     }
     ~DisplayLockGuard()
     {
-        if (display_)
+        if (locked_)
             display_->Unlock();
     }
+    explicit operator bool() const { return locked_; }
+    DisplayLockGuard(const DisplayLockGuard &) = delete;
+    DisplayLockGuard &operator=(const DisplayLockGuard &) = delete;
 
 private:
     Display *display_;
+    bool locked_ = false;
 };
 
 class NoDisplay : public Display

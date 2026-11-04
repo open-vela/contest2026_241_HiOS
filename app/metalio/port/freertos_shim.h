@@ -1,3 +1,4 @@
+#include "hi_task_policy.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -47,7 +48,7 @@ typedef uint32_t EventBits_t;
  * entries as NUL-terminated strings and strlcpy()'s them onto the new
  * task stack, destroying the pointer value.  Use pthread_create() instead:
  * in NuttX pthread_t is pid_t, so TaskHandle_t stays compatible with
- * vTaskDelete()/task_setaffinity().
+ * vTaskDelete()/pthread affinity.
  */
 struct shim_task_wrapper
 {
@@ -68,13 +69,13 @@ static inline void *shim_task_trampoline(void *p)
     return NULL;
 }
 
-static inline BaseType_t xTaskCreate(
+static inline BaseType_t shim_task_create_on_core(
     void (*task_func)(void *),
     const char *name,
     uint16_t stack_depth,
     void *arg,
     UBaseType_t priority,
-    TaskHandle_t *handle)
+    TaskHandle_t *handle, int core_id)
 {
     struct shim_task_wrapper *w =
         (struct shim_task_wrapper *)malloc(sizeof(*w));
@@ -88,6 +89,8 @@ static inline BaseType_t xTaskCreate(
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
+    /* FreeRTOS tasks have no join operation; reclaim them on exit. */
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_attr_setstacksize(&attr, (size_t)stack_depth * sizeof(void *));
 
     struct sched_param sp;
@@ -102,6 +105,22 @@ static inline BaseType_t xTaskCreate(
     pthread_attr_setschedpolicy(&attr, SCHED_RR);
     pthread_attr_setschedparam(&attr, &sp);
     pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+
+#ifdef CONFIG_SMP
+    if (core_id >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (core_id >= CONFIG_SMP_NCPUS) {
+            pthread_attr_destroy(&attr); free(w); return pdFAIL;
+        }
+        CPU_SET(core_id, &cpuset);
+        if (pthread_attr_setaffinity_np(&attr, sizeof(cpuset), &cpuset) != 0) {
+            pthread_attr_destroy(&attr); free(w); return pdFAIL;
+        }
+    }
+#else
+    (void)core_id;
+#endif
 
     pthread_t th;
     write(1, "XC0\n", 4);
@@ -121,40 +140,40 @@ static inline BaseType_t xTaskCreate(
     return pdTRUE;
 }
 
-static inline BaseType_t xTaskCreatePinnedToCore(
-    void (*task_func)(void *),
-    const char *name,
-    uint16_t stack_depth,
-    void *arg,
-    UBaseType_t priority,
-    TaskHandle_t *handle,
+static inline BaseType_t xTaskCreate(void (*fn)(void *), const char *name,
+    uint16_t stack_depth, void *arg, UBaseType_t priority, TaskHandle_t *handle)
+{
+    return shim_task_create_on_core(fn,name,stack_depth,arg,priority,handle,-1);
+}
+
+/* Existing external-device/control tasks retain the original CPU0 owner.
+ * New unpinned background tasks still use xTaskCreate's host policy. */
+static inline BaseType_t xTaskCreateLegacy(void (*fn)(void *), const char *name,
+    uint16_t stack_depth, void *arg, UBaseType_t priority, TaskHandle_t *handle)
+{
+    return shim_task_create_on_core(fn,name,stack_depth,arg,priority,handle,0);
+}
+
+static inline BaseType_t xTaskCreatePinnedToCore(void (*fn)(void *), const char *name,
+    uint16_t stack_depth, void *arg, UBaseType_t priority, TaskHandle_t *handle,
     int core_id)
 {
-    BaseType_t ret = xTaskCreate(task_func, name, stack_depth, arg, priority, handle);
-    if (ret == pdTRUE && core_id >= 0)
-    {
-        /* Pin to core if SMP and valid core id */
-#ifdef CONFIG_SMP
-        if (handle && *handle > 0)
-            task_setaffinity(*handle, (cpu_set_t *)(uintptr_t)(1 << core_id));
-#endif
-    }
-    return ret;
+    /* Affinity is installed before pthread activation, including callers
+     * that do not request a handle. Never cast a CPU mask into a pointer. */
+    return shim_task_create_on_core(fn,name,stack_depth,arg,priority,handle,core_id);
 }
 
 #ifdef __cplusplus
 } /* close extern "C" — keep helper C++-callable from the macro */
 #endif
-/* ESP-IDF allows vTaskDelete(NULL/nullptr) to delete the calling task.
- * NuttX's task_delete takes a pid_t. Use one impl + macro so nullptr
- * (no conversion to pid_t) and TaskHandle_t both work without overloads
- * (overloads conflict when std::nullptr_t collapses to an integral type). */
+/* Tasks in this shim are pthreads. NuttX getpid() is the process ID;
+ * task_delete(getpid()) can terminate the entire application's task group. */
 static inline void vTaskDeleteImpl(TaskHandle_t handle)
 {
-    if (handle)
-        task_delete(handle);
+    if (!handle || pthread_equal((pthread_t)handle, pthread_self()))
+        pthread_exit(NULL);
     else
-        task_delete(getpid());
+        pthread_cancel((pthread_t)handle);
 }
 #define vTaskDelete(h) vTaskDeleteImpl((TaskHandle_t)(uintptr_t)(h))
 #ifdef __cplusplus

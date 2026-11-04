@@ -30,6 +30,11 @@ public:
     // return to the home page (matches the MetalioClaw4 API).
     static lv_obj_t *CreateStatic();
 
+    static bool IsActive();
+    static bool IsEditing();
+    static bool IsHomeObject(lv_obj_t *obj);
+    static lv_obj_t *OpenGrid();
+
     /* Replace the active screen with a fresh HomeScreen. Frees the old
      * screen synchronously first so CreateStatic() does not OOM into the
      * LVGL default-theme blue fallback (boot→home and app→home). */
@@ -38,6 +43,11 @@ public:
     // Force the next CreateStatic() call to start from page 0 (used
     // after locale / theme changes so the user sees the first page).
     static void ResetToFirstPage();
+
+    /* Repaint desktop icons from the saved theme id. Home is kept alive
+     * across app switches, so changing the path strings alone leaves the
+     * old decoded images on screen. */
+    static void ApplyCurrentTheme();
 
     // Refresh the status bar from a non-LVGL thread (schedules an
     // async call onto the LVGL thread).
@@ -67,6 +77,10 @@ public:
     };
     static int GetAppCount();
     static bool GetAppInfo(int index, AppInfo *out);
+    // Shared with recents: preserves procedural game logos and embedded art.
+    // Call on the LVGL thread. Internal application ids remain stable.
+    static lv_obj_t *CreateAppIcon(lv_obj_t *parent, const char *app_id, int size);
     /* Match by id ("camera") or Chinese name ("相机"). Schedules LVGL launch. */
+    static void SyncInstalledAppOrder(bool prefer_current=false);
     static bool LaunchApp(const char *id_or_name);
 };

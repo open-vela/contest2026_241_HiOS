@@ -180,10 +180,24 @@ void AudioCodec::OutputData(const int16_t* data, int samples)
     Write(data, samples);
 }
 
+bool AudioCodec::OutputDataChecked(const int16_t* data, size_t samples)
+{
+    size_t done=0;
+    unsigned idle=0;
+    while(done<samples) {
+        const int n=Write(data+done,static_cast<int>(samples-done));
+        if(n>0 && static_cast<size_t>(n)<=samples-done) {
+            done+=n;idle=0;
+        } else if(n<0 || ++idle>20) return false;
+        else usleep(5000);
+    }
+    return true;
+}
+
 bool AudioCodec::InputData(std::vector<int16_t>& data)
 {
     int samples = Read(data.data(), (int)data.size());
-    return samples > 0;
+    return samples == static_cast<int>(data.size()) && samples > 0;
 }
 
 void AudioCodec::Start()
@@ -219,11 +233,19 @@ void AudioCodec::Start()
 
 void AudioCodec::SetOutputVolume(int volume)
 {
-    output_volume_ = volume;
-    ESP_LOGI(TAG, "Set output volume to %d", output_volume_);
+    SetOutputVolume(volume, true);
+}
 
-    Settings settings("audio", true);
-    settings.SetInt("output_volume", output_volume_);
+void AudioCodec::SetOutputVolume(int volume, bool persist)
+{
+    output_volume_ = volume;
+    ESP_LOGI(TAG, "Set output volume to %d (persist=%d)", output_volume_,
+             persist ? 1 : 0);
+
+    if (persist) {
+        Settings settings("audio", true);
+        settings.SetInt("output_volume", output_volume_);
+    }
 
     /* Apply via NuttX audio FEATURE ioctl (0..1000 scale) */
     if (tx_fd_ >= 0)

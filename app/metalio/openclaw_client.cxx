@@ -1,3 +1,4 @@
+#include "hi_task_cpp.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -582,7 +583,7 @@ bool OpenClawClient::StartVoiceSession()
     }
     voice_active_ = true;
     voice_running_ = true;
-    voice_thread_ = std::thread([this]() { this->WsRxLoop(); });
+    voice_thread_ = HiTask::LegacyThread([this]() { this->WsRxLoop(); });
     ESP_LOGI(TAG, "Voice session started");
     return true;
 }

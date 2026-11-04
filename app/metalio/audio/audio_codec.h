@@ -45,13 +45,17 @@ public:
     virtual ~AudioCodec();
 
     virtual void SetOutputVolume(int volume);
+    virtual void SetOutputVolume(int volume, bool persist);
     virtual void SetInputGain(float gain);
     virtual void EnableInput(bool enable);
     virtual void EnableOutput(bool enable);
 
     virtual void OutputData(std::vector<int16_t>& data);
     virtual void OutputData(const int16_t* data, int samples);
+    // Recording playback retains a PCM block until every sample is written.
+    bool OutputDataChecked(const int16_t* data, size_t samples);
     virtual bool InputData(std::vector<int16_t>& data);
+    virtual void SetRecordingInput(bool) {}
     virtual void Start();
 
     /* Mute / volume convenience (NuttX audio FEATURE ioctls) */

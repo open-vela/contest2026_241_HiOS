@@ -1,3 +1,4 @@
+#include "hi_task_policy.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -22,6 +23,9 @@
 #include <cstdio>
 #include <cstring>
 #include <pthread.h>
+#include <mutex>
+#include <cmath>
+#include <ctime>
 #include <unistd.h>
 
 LV_FONT_DECLARE(font_puhui_20_4);
@@ -51,11 +55,11 @@ constexpr int kTrackW = kCardW - 48;
 constexpr int kBarRangeLsb = 5000;
 constexpr int kSummaryTopY = kCardTopY + kCardH * 3 + kCardGap * 3;
 
-constexpr uint32_t kSamplePeriodMs = 100;
+constexpr uint32_t kSamplePeriodMs = 33;
 constexpr uint32_t kSensorPeriodUs = 50000;
 constexpr uint32_t kArmDelayMs = 600;
 constexpr uint32_t kUiWarmTicks = 4;
-constexpr uint32_t kTextEveryN = 2;
+constexpr uint32_t kTextEveryN = 3;
 
 struct AxisRow {
     lv_obj_t *card = nullptr;
@@ -64,6 +68,8 @@ struct AxisRow {
     lv_obj_t *phys_lbl = nullptr;
     lv_obj_t *bar_track = nullptr;
     lv_obj_t *bar_fill = nullptr;
+    lv_obj_t *cursor = nullptr;
+    float displayed = 0;
 };
 
 struct UiState {
@@ -76,19 +82,23 @@ struct UiState {
     lv_timer_t *arm_timer = nullptr;
     uint32_t tick_n = 0;
     bool sensor_lbl_set = false;
+    int range_lsb = 1000;
+    lv_obj_t *range_lbl = nullptr;
 };
 
 UiState s_ui;
 uint32_t s_frame_cnt = 0;
 
 std::atomic<bool> s_worker_run{false};
-std::atomic<bool> s_sample_ok{false};
-std::atomic<int> s_raw_x{0};
-std::atomic<int> s_raw_y{0};
-std::atomic<int> s_raw_z{0};
-std::atomic<int> s_raw_st{0};
+struct Sample { int16_t axis[3]{}; uint8_t status=0; bool ok=false; uint32_t at=0; };
+std::mutex s_sample_mutex;
+Sample s_sample;
+uint32_t NowMs() {
+    timespec t{};clock_gettime(CLOCK_MONOTONIC,&t);
+    return uint32_t(uint64_t(t.tv_sec)*1000+t.tv_nsec/1000000);
+}
 pthread_t s_worker_tid{};
-bool s_worker_joined = true;
+bool s_worker_started = false;
 
 uint32_t AxisColor(int idx)
 {
@@ -106,15 +116,19 @@ const char *AxisTitle(int idx)
 void *SensorWorker(void * /*arg*/)
 {
     write(1, "MAG_WRK\n", 8);
-    while (s_worker_run.load(std::memory_order_relaxed)) {
+    for (;;) {
+        if (!s_worker_run.load(std::memory_order_relaxed)) {usleep(kSensorPeriodUs);continue;}
         int16_t mx = 0, my = 0, mz = 0;
         uint8_t st = 0;
-        if (metalio_qmc6309_read_raw_ex(&mx, &my, &mz, &st) == 0) {
-            s_raw_x.store(mx, std::memory_order_relaxed);
-            s_raw_y.store(my, std::memory_order_relaxed);
-            s_raw_z.store(mz, std::memory_order_relaxed);
-            s_raw_st.store(st, std::memory_order_relaxed);
-            s_sample_ok.store(true, std::memory_order_relaxed);
+        const int rc=metalio_qmc6309_read_raw_ex(&mx,&my,&mz,&st);
+        {
+            std::lock_guard<std::mutex> guard(s_sample_mutex);
+            s_sample.status=st;
+            if(rc<0 || (st&kQmcStatusOvl)) s_sample.ok=false;
+            else if(st&kQmcStatusDrdy) {
+                s_sample.axis[0]=mx;s_sample.axis[1]=my;s_sample.axis[2]=mz;
+                s_sample.at=NowMs();s_sample.ok=true;
+            }
         }
         usleep(kSensorPeriodUs);
     }
@@ -124,32 +138,25 @@ void *SensorWorker(void * /*arg*/)
 
 void StopSensorWorker()
 {
-    if (s_worker_joined) {
-        return;
-    }
     s_worker_run.store(false, std::memory_order_relaxed);
-    pthread_join(s_worker_tid, nullptr);
-    s_worker_joined = true;
-    write(1, "MAG_WRK_JOIN\n", 13);
 }
 
 void StartSensorWorker()
 {
-    StopSensorWorker();
-    s_sample_ok.store(false, std::memory_order_relaxed);
     s_worker_run.store(true, std::memory_order_relaxed);
-    s_worker_joined = false;
+    if (s_worker_started) return;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 4096);
-    if (pthread_create(&s_worker_tid, &attr, SensorWorker, nullptr) != 0) {
+    if (hi_task_create_legacy(&s_worker_tid, &attr, SensorWorker, nullptr) != 0) {
         pthread_attr_destroy(&attr);
         s_worker_run.store(false, std::memory_order_relaxed);
-        s_worker_joined = true;
         write(1, "MAG_WRK_FAIL\n", 13);
         return;
     }
     pthread_attr_destroy(&attr);
+    s_worker_started = true;
+    pthread_detach(s_worker_tid);
     write(1, "MAG_WRK_OK\n", 11);
 }
 
@@ -159,12 +166,15 @@ void UpdateBarFill(int idx, int16_t raw)
     if (row.bar_fill == nullptr) {
         return;
     }
-    int v = std::clamp(static_cast<int>(raw), -kBarRangeLsb, kBarRangeLsb);
+    row.displayed += (float(raw)-row.displayed)*.38f;
+    if(std::abs(float(raw)-row.displayed)<.5f) row.displayed=raw;
+    int v=std::clamp(int(::lroundf(row.displayed)),-s_ui.range_lsb,s_ui.range_lsb);
     const int half = kTrackW / 2;
-    int w = (std::abs(v) * half) / kBarRangeLsb;
+    int w = (std::abs(v) * half) / s_ui.range_lsb;
     if (w < 2 && v != 0) {
         w = 2;
     }
+    if(row.cursor) lv_obj_set_pos(row.cursor,half+v*half/s_ui.range_lsb-2,0);
     if (v == 0) {
         lv_obj_set_size(row.bar_fill, 2, kBarH);
         lv_obj_set_pos(row.bar_fill, half - 1, 0);
@@ -194,7 +204,7 @@ void UpdateAxisRow(int idx, int16_t raw, bool update_text)
 
 void MaybeSetSensorLabel(bool sensor_ok)
 {
-    if (s_ui.sensor_lbl_set || s_ui.sensor_lbl == nullptr) {
+    if (s_ui.sensor_lbl == nullptr) {
         return;
     }
     s_ui.sensor_lbl_set = true;
@@ -263,7 +273,7 @@ void UpdateUi(int16_t mx, int16_t my, int16_t mz, uint8_t st, bool sensor_ok,
             lv_label_set_text(s_ui.status_lbl, buf);
         } else {
             lv_label_set_text(s_ui.status_lbl,
-                              I18n::T("STATUS=--  未检测到 QMC6309"));
+                              (st&kQmcStatusOvl)?"磁场过强 · 读数溢出":"等待有效磁场数据");
         }
     }
 }
@@ -274,15 +284,24 @@ void OnSampleTick(lv_timer_t * /*t*/)
     if (s_ui.tick_n <= kUiWarmTicks) {
         return;
     }
-    const bool sensor_ok = s_sample_ok.load(std::memory_order_relaxed);
-    const int16_t mx =
-        static_cast<int16_t>(s_raw_x.load(std::memory_order_relaxed));
-    const int16_t my =
-        static_cast<int16_t>(s_raw_y.load(std::memory_order_relaxed));
-    const int16_t mz =
-        static_cast<int16_t>(s_raw_z.load(std::memory_order_relaxed));
-    const uint8_t st =
-        static_cast<uint8_t>(s_raw_st.load(std::memory_order_relaxed));
+    Sample sample;
+    {std::lock_guard<std::mutex> guard(s_sample_mutex);sample=s_sample;}
+    const bool sensor_ok=sample.ok && uint32_t(NowMs()-sample.at)<500;
+    const int16_t mx=sample.axis[0],my=sample.axis[1],mz=sample.axis[2];
+    const uint8_t st=sample.status;
+    // Shared scale keeps X/Y/Z comparable. Expand immediately, contract
+    // gradually after the displayed values have caught up.
+    if(sensor_ok) {
+        int peak=std::max(std::abs(int(mx)),std::max(std::abs(int(my)),std::abs(int(mz))));
+        for(const auto& row:s_ui.axes) peak=std::max(peak,int(std::abs(row.displayed)));
+        int desired=1000;
+        while(desired<peak+peak/4 && desired<32768) desired=std::min(32768,desired*2);
+        if(desired>s_ui.range_lsb || (s_ui.tick_n%60==0 && desired<s_ui.range_lsb)) s_ui.range_lsb=desired;
+    }
+    if(s_ui.range_lbl && s_ui.tick_n%kTextEveryN==0) {
+        char text[96];std::snprintf(text,sizeof(text),"-%.0f uT                 0                 +%.0f uT",s_ui.range_lsb*.1f,s_ui.range_lsb*.1f);
+        lv_label_set_text(s_ui.range_lbl,text);
+    }
     s_frame_cnt++;
     const bool update_text = ((s_ui.tick_n % kTextEveryN) == 0);
     if (update_text) {
@@ -430,6 +449,18 @@ void BuildAxisCard(lv_obj_t *parent, int idx)
     screen_strip_obj_chrome(fill);
     lv_obj_set_size(fill, 2, kBarH);
     lv_obj_set_pos(fill, kTrackW / 2 - 1, 0);
+    lv_obj_t *zero=lv_obj_create(track);
+    lv_obj_remove_style_all(zero);
+    lv_obj_set_size(zero,1,kBarH);lv_obj_set_pos(zero,kTrackW/2,0);
+    lv_obj_set_style_bg_color(zero,lv_color_hex(0x9AA3B2),0);
+    lv_obj_set_style_bg_opa(zero,LV_OPA_COVER,0);
+    auto* cursor=lv_obj_create(track);s_ui.axes[idx].cursor=cursor;
+    lv_obj_remove_style_all(cursor);
+    lv_obj_set_size(cursor,4,kBarH);lv_obj_set_pos(cursor,kTrackW/2-2,0);
+    lv_obj_set_style_bg_color(cursor,lv_color_white(),0);
+    lv_obj_set_style_bg_opa(cursor,LV_OPA_COVER,0);
+    lv_obj_remove_flag(cursor,LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(zero,LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_bg_color(fill, lv_color_hex(color), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(fill, 0, LV_PART_MAIN);
@@ -439,12 +470,19 @@ void BuildAxisCard(lv_obj_t *parent, int idx)
 
 void BuildSummary(lv_obj_t *parent)
 {
+    s_ui.range_lbl=lv_label_create(parent);
+    lv_obj_set_style_text_font(s_ui.range_lbl,&font_puhui_20_4,0);
+    lv_obj_set_style_text_color(s_ui.range_lbl,lv_color_hex(0x9AA3B2),0);
+    lv_obj_set_width(s_ui.range_lbl,kPanelW);
+    lv_obj_set_pos(s_ui.range_lbl,0,kSummaryTopY-14);
+    lv_obj_set_style_text_align(s_ui.range_lbl,LV_TEXT_ALIGN_CENTER,0);
+    lv_label_set_text(s_ui.range_lbl,"-100 uT                 0                 +100 uT");
     lv_obj_t *total = lv_label_create(parent);
     s_ui.total_lbl = total;
     lv_label_set_text(total, "|B| = --");
     lv_obj_set_style_text_color(total, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_font(total, &font_puhui_30_4, LV_PART_MAIN);
-    lv_obj_set_pos(total, 0, kSummaryTopY + 4);
+    lv_obj_set_pos(total, 0, kSummaryTopY + 18);
     lv_obj_set_width(total, kPanelW);
     lv_obj_set_style_text_align(total, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
 
@@ -453,7 +491,7 @@ void BuildSummary(lv_obj_t *parent)
     lv_label_set_text(status, "STATUS=--  FRAME=0");
     lv_obj_set_style_text_color(status, lv_color_hex(0x9AA3B2), LV_PART_MAIN);
     lv_obj_set_style_text_font(status, &font_puhui_20_4, LV_PART_MAIN);
-    lv_obj_set_pos(status, 0, kSummaryTopY + 50);
+    lv_obj_set_pos(status, 0, kSummaryTopY + 58);
     lv_obj_set_width(status, kPanelW);
     lv_obj_set_style_text_align(status, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
 }

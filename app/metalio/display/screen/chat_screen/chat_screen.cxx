@@ -7,11 +7,7 @@
  *
  * openvela / NuttX adaptations:
  *   - ESP-IDF headers → shim headers (esp_log_shim).
- *   - lv_eaf.h (EAF vector animation widget) → not available on NuttX;
- *     the emotion animation is stubbed with a large centered text label
- *     showing the emotion name. The caption bubble, chat bubbles, header
- *     menu, device-state polling, and activation-block dialog are all
- *     ported verbatim.
+ *   - EAF animations use the portable upstream decoder and LVGL widget.
  *   - Application / DeviceState / SdCardManager → available via the
  *     openvela port (application.h, device_state.h, port/SdCardManager.hpp).
  *   - LVGL widget construction code is ported verbatim; only the EAF
@@ -19,15 +15,21 @@
  */
 
 #include "chat_screen.h"
+#include "lv_eaf.h"
+#include <sys/stat.h>
 #include "i18n.h"
 #include "esp_log_shim.h"
 #include "application.h"
+#include "energy_wake_word.h"
 #include "device_state.h"
 #include "settings.h"
 #include "SdCardManager.hpp"
 #include "home_screen/home_screen.h"
+#include "camera_screen/camera_screen.h"
+#include "input_method/hi_input_method.h"
 
 #include <cctype>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -67,9 +69,7 @@ constexpr int32_t kMenuItemH       = 64;
 constexpr int32_t kMenuPanelRadius = 16;
 constexpr int32_t kMenuPanelGap    = 4;
 
-// Emotion: server emotion name → display label. On ESP-IDF this was
-// S:/sdcard/system/chat/{emotion}.eaf played by lv_eaf. On openvela we
-// show the emotion name as large centered text.
+// Emotion: server emotion name maps to S:/sdcard/system/chat/{emotion}.eaf.
 constexpr const char *kDefaultEmotion = "neutral";
 constexpr size_t kEmotionNameMax      = 39;
 
@@ -121,12 +121,13 @@ struct UiState {
     lv_obj_t *menu_item_interrupt_lbl = nullptr;
     lv_obj_t *menu_item_clear   = nullptr;
     lv_obj_t *emotion_panel    = nullptr;
-    lv_obj_t *emotion_label    = nullptr;  // stub for lv_eaf (text label)
+    lv_obj_t *emotion_eaf    = nullptr;  // EAF animation widget
     lv_obj_t *caption_bubble   = nullptr;
     lv_obj_t *caption_label    = nullptr;
     lv_obj_t *activation_mask  = nullptr;
     lv_timer_t *state_timer    = nullptr;
     lv_timer_t *activation_guard_timer = nullptr;
+    lv_timer_t *wake_arm_timer = nullptr;
 };
 
 UiState s_ui;
@@ -135,7 +136,7 @@ ViewMode s_view_mode = ViewMode::Chat;
 bool s_activation_blocked = false;
 bool s_activation_dialog_shows_code = false;
 bool s_header_visible = true;
-bool s_voice_ui_held = false;
+std::atomic<bool> s_voice_ui_held{false};
 
 char s_current_emotion[kEmotionNameMax + 1] = "neutral";
 char s_applied_emotion[kEmotionNameMax + 1] = "";
@@ -253,64 +254,82 @@ void CopyEmotionName(char *dst, size_t dst_size, const char *emotion)
 }
 
 // ---------------------------------------------------------------------------
-// EAF stub — on openvela the EAF vector animation widget is not available.
-// We render a large centered text label showing the emotion name instead.
-// The control flow (ensure / apply / pause / resume / stop) is preserved
-// so that switching to a real animation decoder later is a drop-in change.
+// Original EAF animation source, pause and lifetime handling.
 // ---------------------------------------------------------------------------
-void ensure_emotion_label()
-{
-    if (s_ui.emotion_label != nullptr || s_ui.emotion_panel == nullptr) {
-        return;
-    }
-    s_ui.emotion_label = lv_label_create(s_ui.emotion_panel);
-    lv_label_set_text(s_ui.emotion_label, kDefaultEmotion);
-    lv_obj_set_style_text_font(s_ui.emotion_label, chat_font(), LV_PART_MAIN);
-    lv_obj_set_style_text_color(s_ui.emotion_label,
-                                lv_color_hex(kColorEmotionBubbleText), LV_PART_MAIN);
-    lv_obj_center(s_ui.emotion_label);
-    screen_make_input_passive(s_ui.emotion_label);
+constexpr const char *kEmotionDir = "S:/sdcard/system/chat/";
+constexpr const char *kEmotionPosixDir = "/sdcard/system/chat/";
+constexpr const char *kEmotionExt = ".eaf";
+constexpr uint32_t kEmotionFrameDelayMs = 30;
+char s_emotion_path_buf[128];
+const char* BuildEmotionPath(const char* emotion) {
+    std::snprintf(s_emotion_path_buf, sizeof(s_emotion_path_buf), "%s%s%s",
+                  kEmotionDir, NormalizeEmotionName(emotion), kEmotionExt);
+    return s_emotion_path_buf;
 }
 
-void ApplyEmotionSrc(const char *emotion)
-{
-    if (s_ui.emotion_label == nullptr) {
+bool EmotionFileExists(const char* emotion) {
+    char path[128];
+    std::snprintf(path, sizeof(path), "%s%s%s", kEmotionPosixDir,
+                  NormalizeEmotionName(emotion), kEmotionExt);
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+void ApplyEmotionSrc(const char* emotion) {
+    if (s_ui.emotion_eaf == nullptr) {
         return;
     }
-    const char *name = NormalizeEmotionName(emotion);
+    const char* name = NormalizeEmotionName(emotion);
     if (s_applied_emotion[0] != '\0' &&
         std::strcmp(s_applied_emotion, name) == 0) {
         return;
     }
-    lv_label_set_text(s_ui.emotion_label, name);
-    lv_obj_center(s_ui.emotion_label);
+    if (!SdCardManager::GetInstance().IsMounted() || !EmotionFileExists(name)) {
+        ESP_LOGW(TAG, "emotion file missing: %s%s%s", kEmotionPosixDir, name,
+                 kEmotionExt);
+        return;
+    }
+    lv_eaf_set_src(s_ui.emotion_eaf, BuildEmotionPath(name));
+    lv_eaf_set_frame_delay(s_ui.emotion_eaf, kEmotionFrameDelayMs);
+    // set_src 后尺寸随原图变化，重新居中；不缩放。
+    lv_obj_center(s_ui.emotion_eaf);
     std::strncpy(s_applied_emotion, name, sizeof(s_applied_emotion) - 1);
     s_applied_emotion[sizeof(s_applied_emotion) - 1] = '\0';
 }
 
-void pause_emotion_eaf()
-{
-    // No-op: text label has no animation to pause.
+void pause_emotion_eaf() {
+    if (s_ui.emotion_eaf != nullptr) {
+        lv_eaf_pause(s_ui.emotion_eaf);
+    }
 }
 
-void resume_emotion_eaf()
-{
-    // No-op: text label has no animation to resume.
+void resume_emotion_eaf() {
+    if (s_ui.emotion_eaf != nullptr && lv_eaf_is_loaded(s_ui.emotion_eaf)) {
+        lv_eaf_resume(s_ui.emotion_eaf);
+    }
 }
 
-void stop_emotion_eaf()
-{
-    if (s_ui.emotion_label == nullptr) {
+// 立即停掉表情动画并销毁控件（不能只靠 pause + delete_async）。
+void stop_emotion_eaf() {
+    if (s_ui.emotion_eaf == nullptr) {
         return;
     }
-    lv_obj_delete(s_ui.emotion_label);
-    s_ui.emotion_label = nullptr;
+    lv_eaf_pause(s_ui.emotion_eaf);
+    lv_obj_delete(s_ui.emotion_eaf);
+    s_ui.emotion_eaf = nullptr;
     s_applied_emotion[0] = '\0';
 }
 
-void ensure_emotion_eaf()
-{
-    ensure_emotion_label();
+void ensure_emotion_eaf() {
+    if (s_ui.emotion_eaf != nullptr || s_ui.emotion_panel == nullptr) {
+        return;
+    }
+    if (!SdCardManager::GetInstance().IsMounted()) {
+        return;
+    }
+    s_ui.emotion_eaf = lv_eaf_create(s_ui.emotion_panel);
+    lv_obj_center(s_ui.emotion_eaf);
+    screen_make_input_passive(s_ui.emotion_eaf);
 }
 
 // ---------------------------------------------------------------------------
@@ -329,17 +348,20 @@ void schedule_voice_ui_start()
      * Do NOT auto-RequestWakeSession: only "Hi openvela" (WakeNet) or an
      * explicit tap on「待唤醒」may open the dialogue. */
     s_voice_ui_held = true;
-    lv_timer_t *t = lv_timer_create(
-        [](lv_timer_t *timer) {
-            lv_timer_delete(timer);
+    write(1, "VUI_ON\n", 7);
+    Application::GetInstance().RequestVoiceUiDesired(true);
+    delete_timer(s_ui.wake_arm_timer);
+    s_ui.wake_arm_timer = lv_timer_create(
+        [](lv_timer_t * /*timer*/) {
+            s_ui.wake_arm_timer = nullptr;
             if (!s_voice_ui_held || !ChatScreen::IsActive())
                 return;
-            write(1, "VUI_ON\n", 7);
-            Application::GetInstance().RequestVoiceUiDesired(true);
+            write(1, "VUI_ON2\n", 8);
+            Application::GetInstance().ArmAssistantWakeWord();
         },
-        300, nullptr);
-    if (t != nullptr)
-        lv_timer_set_repeat_count(t, 1);
+        120, nullptr);
+    if (s_ui.wake_arm_timer != nullptr)
+        lv_timer_set_repeat_count(s_ui.wake_arm_timer, 1);
 }
 
 void schedule_voice_ui_stop()
@@ -347,13 +369,15 @@ void schedule_voice_ui_stop()
     if (!s_voice_ui_held)
         return;
     s_voice_ui_held = false;
-    Application::GetInstance().RequestVoiceUiDesired(false);
+    if (!CameraScreen::IsLookAndSeeMode())
+        Application::GetInstance().RequestVoiceUiDesired(false);
 }
 
 void chat_page_leave()
 {
     delete_timer(s_ui.state_timer);
     delete_timer(s_ui.activation_guard_timer);
+    delete_timer(s_ui.wake_arm_timer);
     stop_emotion_eaf();
     schedule_voice_ui_stop();
 }
@@ -369,7 +393,7 @@ bool chat_status_for_state(DeviceState state, const char **text, uint32_t *color
             *color = kColorStateIdle;
             return true;
         case kDeviceStateListening:
-            *text = "聆听中";
+            *text = Application::GetInstance().IsTypedChatMode()?"回复中":"聆听中";
             *color = kColorStateListening;
             return true;
         case kDeviceStateSpeaking:
@@ -381,8 +405,6 @@ bool chat_status_for_state(DeviceState state, const char **text, uint32_t *color
             *color = kColorStateConnecting;
             return true;
         default:
-            /* Never hide the status chip — Activating/Starting/Unknown used
-             * to return false and LV_OBJ_FLAG_HIDDEN the label permanently. */
             *text = "待唤醒";
             *color = kColorStateIdle;
             return true;
@@ -402,17 +424,14 @@ void chat_update_device_state_label()
     const char *shown = I18n::T(text);
     const char *cur = lv_label_get_text(s_ui.status_state_lbl);
 
-    if (state == s_last_device_state &&
-        !lv_obj_has_flag(s_ui.status_state_lbl, LV_OBJ_FLAG_HIDDEN) &&
-        cur != nullptr && std::strcmp(cur, shown) == 0) {
-        return;
+    if (state != s_last_device_state || cur == nullptr ||
+        std::strcmp(cur, shown) != 0) {
+        s_last_device_state = state;
+        lv_label_set_text(s_ui.status_state_lbl, shown);
+        lv_obj_set_style_text_color(s_ui.status_state_lbl, lv_color_hex(color),
+                                    LV_PART_MAIN);
+        lv_obj_remove_flag(s_ui.status_state_lbl, LV_OBJ_FLAG_HIDDEN);
     }
-    s_last_device_state = state;
-
-    lv_label_set_text(s_ui.status_state_lbl, shown);
-    lv_obj_set_style_text_color(s_ui.status_state_lbl, lv_color_hex(color),
-                                LV_PART_MAIN);
-    lv_obj_remove_flag(s_ui.status_state_lbl, LV_OBJ_FLAG_HIDDEN);
 }
 
 void on_chat_status_timer(lv_timer_t * /*timer*/)
@@ -777,7 +796,8 @@ void sync_activation_block_state()
     s_activation_blocked = should_block;
     if (should_block) {
         log_activation_blocked();
-        open_activation_blocked_dialog();
+        if (has_code)
+            open_activation_blocked_dialog();
     } else {
         ESP_LOGI(TAG, "Chat unblocked: device activated/ready");
         close_activation_blocked_dialog();
@@ -796,7 +816,8 @@ bool reject_if_blocked()
     if (!s_activation_blocked) {
         return false;
     }
-    ensure_activation_blocked_dialog();
+    if (Application::GetInstance().HasPendingActivation())
+        ensure_activation_blocked_dialog();
     return true;
 }
 
@@ -804,7 +825,8 @@ void on_status_wake_clicked(lv_event_t * /*e*/)
 {
     if (reject_if_blocked())
         return;
-    /* Xiaozhi-style: tap status to start the same session as wake word. */
+    write(1, "CHAT_TAP_WAKE\n", 14);
+    Application::GetInstance().ArmAssistantWakeWord();
     Application::GetInstance().RequestWakeSession();
 }
 
@@ -812,10 +834,11 @@ void on_status_wake_clicked(lv_event_t * /*e*/)
 // View mode + header dropdown menu (ported verbatim)
 // ---------------------------------------------------------------------------
 enum class MenuAction : uintptr_t {
-    Emotion   = 0,
     Chat      = 1,
     Clear     = 2,
     Interrupt = 3,
+    LookAndSee = 4,
+    TypedChat = 5,
 };
 
 void style_menu_item(lv_obj_t *btn, bool selected)
@@ -967,6 +990,59 @@ void on_interrupt_clicked()
     refresh_header_menu_selection();
 }
 
+void CloseTypedComposer(lv_obj_t *sheet)
+{
+    if (!sheet) return;
+    HiInputMethod_Suspend();
+    if (s_ui.menu_panel && lv_obj_get_user_data(s_ui.menu_panel)==sheet)
+        lv_obj_set_user_data(s_ui.menu_panel,nullptr);
+    lv_obj_add_flag(sheet,LV_OBJ_FLAG_HIDDEN);lv_obj_delete_async(sheet);
+}
+
+void OpenTypedComposer()
+{
+    apply_view_mode(ViewMode::Chat);
+    auto *existing=static_cast<lv_obj_t*>(lv_obj_get_user_data(s_ui.menu_panel));
+    if (existing && lv_obj_is_valid(existing)) {
+        HiInputMethod_Show(static_cast<lv_obj_t*>(lv_obj_get_user_data(existing)),true);
+        return;
+    }
+    // Keep the composer above the physical-screen-sized system keyboard.
+    // Its pointers belong to LVGL objects, not new global UI state.
+    auto *sheet=lv_obj_create(s_ui.screen);screen_strip_obj_chrome(sheet);
+    lv_obj_set_style_pad_all(sheet,0,0);
+    lv_obj_set_size(sheet,kPanelW-32,224);lv_obj_set_pos(sheet,16,kHeaderH+12);
+    lv_obj_remove_flag(sheet,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(sheet,lv_color_hex(kColorMenuPanelBg),0);
+    lv_obj_set_style_bg_opa(sheet,LV_OPA_COVER,0);lv_obj_set_style_radius(sheet,16,0);
+    lv_obj_set_style_text_font(sheet,chat_font_sm(),0);screen_swipe_back_ignore(sheet,true);
+    auto *title=lv_label_create(sheet);lv_label_set_text(title,"Hi 笔聊");lv_obj_set_pos(title,16,10);
+    auto *field=lv_textarea_create(sheet);lv_obj_set_size(field,522,144);lv_obj_set_pos(field,14,58);
+    lv_textarea_set_max_length(field,512);lv_textarea_set_placeholder_text(field,"输入你想说的话…");
+    lv_obj_set_style_text_font(field,chat_font(),0);lv_obj_set_style_bg_color(field,lv_color_hex(kColorBg),0);
+    lv_obj_set_style_text_color(field,lv_color_hex(kColorLeftBubbleText),0);HiInputMethod_Bind(field,true);
+    lv_obj_set_user_data(sheet,field);lv_obj_set_user_data(s_ui.menu_panel,sheet);
+    auto *close=lv_button_create(sheet);lv_obj_set_size(close,96,42);lv_obj_set_pos(close,574,6);
+    auto *label=lv_label_create(close);lv_label_set_text(label,"关闭");lv_obj_center(label);
+    lv_obj_add_event_cb(close,[](lv_event_t *event){CloseTypedComposer(static_cast<lv_obj_t*>(lv_event_get_user_data(event)));},LV_EVENT_CLICKED,sheet);
+    auto *send=lv_button_create(sheet);lv_obj_set_size(send,116,144);lv_obj_set_pos(send,552,58);
+    lv_obj_set_style_bg_color(send,lv_color_hex(0x286D51),0);
+    label=lv_label_create(send);lv_label_set_text(label,"发送");lv_obj_center(label);
+    lv_obj_add_event_cb(send,[](lv_event_t *event){
+        auto *field=static_cast<lv_obj_t*>(lv_event_get_user_data(event));
+        if (!HiInputMethod_Flush(field)) return;
+        std::string text=lv_textarea_get_text(field);
+        if (text.find_first_not_of(" \r\n\t")==std::string::npos) return;
+        if (!Application::GetInstance().RequestTypedChatMessage(text)) {
+            ChatScreen::AddMessage("暂时无法发送，请确认网络已连接且没有通话或录音",ChatMsgDir::Left);
+            return;
+        }
+        CloseTypedComposer(lv_obj_get_parent(field));
+    },LV_EVENT_CLICKED,field);
+    Application::GetInstance().BeginTypedChat();
+    lv_obj_move_foreground(sheet);HiInputMethod_Show(field,true);
+}
+
 void on_menu_item_clicked(lv_event_t *e)
 {
     if (reject_if_blocked()) {
@@ -977,9 +1053,6 @@ void on_menu_item_clicked(lv_event_t *e)
         reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
     close_header_menu();
     switch (action) {
-    case MenuAction::Emotion:
-        apply_view_mode(ViewMode::Emotion);
-        break;
     case MenuAction::Chat:
         apply_view_mode(ViewMode::Chat);
         break;
@@ -988,6 +1061,14 @@ void on_menu_item_clicked(lv_event_t *e)
         break;
     case MenuAction::Interrupt:
         on_interrupt_clicked();
+        break;
+    case MenuAction::LookAndSee:
+        if (!CameraScreen::OpenLookAndSee(false)) {
+            ESP_LOGW(TAG, "could not open look-and-see camera");
+        }
+        break;
+    case MenuAction::TypedChat:
+        OpenTypedComposer();
         break;
     }
 }
@@ -1016,7 +1097,8 @@ lv_obj_t *create_menu_item(lv_obj_t *parent, const char *text, MenuAction action
     lv_obj_set_width(btn, LV_PCT(100));
     lv_obj_set_height(btn, kMenuItemH);
     style_menu_item(btn, false);
-    lv_obj_add_event_cb(btn, on_menu_item_clicked, LV_EVENT_CLICKED,
+    lv_obj_add_event_cb(btn, on_menu_item_clicked,
+                        action==MenuAction::LookAndSee?LV_EVENT_SHORT_CLICKED:LV_EVENT_CLICKED,
                         reinterpret_cast<void *>(static_cast<uintptr_t>(action)));
     screen_swipe_back_ignore(btn, true);
 
@@ -1068,13 +1150,13 @@ void build_header_menu(lv_obj_t *parent)
     lv_obj_add_flag(s_ui.menu_panel, LV_OBJ_FLAG_HIDDEN);
     screen_swipe_back_ignore(s_ui.menu_panel, true);
 
-    s_ui.menu_item_emotion =
-        create_menu_item(s_ui.menu_panel, I18n::T("表情"), MenuAction::Emotion);
     s_ui.menu_item_chat =
         create_menu_item(s_ui.menu_panel, I18n::T("聊天"), MenuAction::Chat);
     s_ui.menu_item_interrupt =
         create_menu_item(s_ui.menu_panel, I18n::T("打断：关"), MenuAction::Interrupt,
                          &s_ui.menu_item_interrupt_lbl);
+    create_menu_item(s_ui.menu_panel, I18n::T("Hi 笔聊"), MenuAction::TypedChat);
+    create_menu_item(s_ui.menu_panel, I18n::T("Hi 视界"), MenuAction::LookAndSee);
     s_ui.menu_item_clear =
         create_menu_item(s_ui.menu_panel, I18n::T("清空"), MenuAction::Clear);
     refresh_header_menu_selection();
@@ -1114,6 +1196,7 @@ void on_screen_unloaded(lv_event_t *e)
      * SwitchToHome can finish without closing UDP on the same LVGL tick. */
     delete_timer(s_ui.state_timer);
     delete_timer(s_ui.activation_guard_timer);
+    delete_timer(s_ui.wake_arm_timer);
     stop_emotion_eaf();
     s_ui = UiState{};
     s_activation_blocked = false;
@@ -1121,7 +1204,10 @@ void on_screen_unloaded(lv_event_t *e)
     s_header_visible = true;
     if (s_voice_ui_held) {
         s_voice_ui_held = false;
-        Application::GetInstance().RequestVoiceUiDesired(false);
+        // Hi 视界 takes over this same voice session. A delayed Chat
+        // teardown must not close its newly-created floating dialog.
+        if (!CameraScreen::IsLookAndSeeMode())
+            Application::GetInstance().RequestVoiceUiDesired(false);
     }
     s_last_device_state = kDeviceStateUnknown;
     s_applied_emotion[0] = '\0';
@@ -1175,21 +1261,36 @@ void build_header(lv_obj_t *parent)
     lv_obj_set_style_text_font(title, chat_font(), LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_LEFT_MID, 16 + kBackBtnSize + 12, 0);
 
-    s_ui.status_state_lbl = lv_label_create(header);
+    lv_obj_t *wake_chip = lv_obj_create(header);
+    lv_obj_remove_style_all(wake_chip);
+    lv_obj_set_size(wake_chip, LV_SIZE_CONTENT, 48);
+    lv_obj_set_style_pad_hor(wake_chip, 16, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(wake_chip, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(wake_chip, lv_color_hex(0x2A3344), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(wake_chip, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(wake_chip, 22, LV_PART_MAIN);
+    lv_obj_set_style_border_width(wake_chip, 0, LV_PART_MAIN);
+    lv_obj_set_style_outline_width(wake_chip, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(wake_chip, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(wake_chip, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align_to(wake_chip, title, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
+    lv_obj_add_event_cb(wake_chip, on_status_wake_clicked, LV_EVENT_CLICKED,
+                        nullptr);
+    screen_swipe_back_ignore(wake_chip, true);
+
+    s_ui.status_state_lbl = lv_label_create(wake_chip);
     lv_label_set_text(s_ui.status_state_lbl, I18n::T("待唤醒"));
     lv_obj_set_style_text_font(s_ui.status_state_lbl, chat_font_sm(), LV_PART_MAIN);
     lv_obj_set_style_text_color(s_ui.status_state_lbl,
                                 lv_color_hex(kColorStateIdle), LV_PART_MAIN);
-    lv_obj_align_to(s_ui.status_state_lbl, title, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
+    lv_obj_center(s_ui.status_state_lbl);
     lv_obj_add_flag(s_ui.status_state_lbl, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_ui.status_state_lbl, on_status_wake_clicked,
                         LV_EVENT_CLICKED, nullptr);
-    screen_swipe_back_ignore(s_ui.status_state_lbl, true);
 
     s_last_device_state = kDeviceStateUnknown;
     chat_update_device_state_label();
-    /* Fast status poll — Speaking/Listening felt lagged at 400ms. */
-    s_ui.state_timer = lv_timer_create(on_chat_status_timer, 250, nullptr);
+    s_ui.state_timer = lv_timer_create(on_chat_status_timer, 500, nullptr);
 
     s_ui.menu_btn = lv_button_create(header);
     lv_obj_remove_style_all(s_ui.menu_btn);
@@ -1274,7 +1375,6 @@ void build_emotion_panel(lv_obj_t *parent)
         screen_make_input_passive(hint);
     }
     // EAF widget creation is deferred to apply_view_mode() → ensure_emotion_eaf().
-    // On openvela the EAF is stubbed as a text label (see ensure_emotion_label()).
 
     BuildCaption(s_ui.emotion_panel);
 }
@@ -1300,9 +1400,8 @@ lv_obj_t *ChatScreen::CreateStatic()
     }
 
     s_activation_blocked = !is_device_activated();
-    if (s_activation_blocked) {
+    if (s_activation_blocked)
         log_activation_blocked();
-    }
 
     lv_obj_t *scr = lv_obj_create(nullptr);
     s_ui.screen = scr;
@@ -1321,15 +1420,22 @@ lv_obj_t *ChatScreen::CreateStatic()
     build_emotion_panel(scr);
     build_header_menu(scr);
 
-    /* No edge swipe-back on chat: mid-gesture noise was stopping voice wake
-     * (CHAT_BACK). Leave via the explicit header back button only. */
+    /* Left-edge swipe-back (same as other apps). Header back button also
+     * calls on_swipe_back. Edge-only so mid-list scroll cannot CHAT_BACK. */
+    screen_attach_swipe_back(scr, on_swipe_back);
+    screen_kill_theme_chrome(scr);
+
     apply_view_mode(s_view_mode);
 
-    if (s_activation_blocked) {
+    /* Only modal-block when a real bind code is pending — not during boot
+     * OTA catch-up (already bound, mqtt in NVS). */
+    if (s_activation_blocked &&
+        Application::GetInstance().HasPendingActivation()) {
         open_activation_blocked_dialog();
     }
+    sync_activation_block_state();
     s_ui.activation_guard_timer =
-        lv_timer_create(on_activation_guard_timer, 500, nullptr);
+        lv_timer_create(on_activation_guard_timer, 250, nullptr);
 
     lv_obj_add_event_cb(scr, on_screen_unloaded, LV_EVENT_SCREEN_UNLOADED, nullptr);
     lv_obj_add_event_cb(
@@ -1337,6 +1443,8 @@ lv_obj_t *ChatScreen::CreateStatic()
         [](lv_event_t *e) {
             if (lv_event_get_code(e) == LV_EVENT_SCREEN_LOADED) {
                 sync_activation_block_state();
+                if (s_ui.header != nullptr)
+                    lv_obj_move_foreground(s_ui.header);
             }
         },
         LV_EVENT_SCREEN_LOADED, nullptr);
@@ -1381,6 +1489,11 @@ void ChatScreen::LifecycleCallback(screen_lifecycle_event_t event)
 bool ChatScreen::IsActive()
 {
     return s_ui.screen != nullptr && s_ui.msg_list != nullptr;
+}
+
+bool ChatScreen::IsForeground()
+{
+    return s_voice_ui_held.load(std::memory_order_acquire);
 }
 
 void ChatScreen::RefreshDeviceState()

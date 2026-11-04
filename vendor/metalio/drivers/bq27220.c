@@ -97,3 +97,25 @@ int metalio_bq27220_read_soc(FAR int *percent)
   *percent = (int)(soc & 0xff);
   return OK;
 }
+
+int metalio_bq27220_read_current_ma(FAR int *ma)
+{
+  uint16_t raw = 0;
+  int ret;
+
+  if (ma == NULL || g_i2c == NULL)
+    {
+      return -EINVAL;
+    }
+
+  /* Current(): signed 16-bit, units of mA. Positive = charging,
+   * negative = discharging (matches the reference Bq27220Gauge). */
+  ret = bq_read16(0x0c, &raw);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  *ma = (int)(int16_t)raw;
+  return OK;
+}

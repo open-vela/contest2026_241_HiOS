@@ -1,3 +1,6 @@
+#include "hi_task_policy.h"
+#include "network_service.h"
+#include <net/if.h>
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -27,6 +30,11 @@
  */
 
 #include "application.h"
+#ifdef HI_VIDEO_TARGET_TEST
+namespace HiApp { void StartVideoTargetTests(); }
+#endif
+#include "radio_screen/radio_player.h"
+#include "app_dns.h"
 #include "board_shim.h"
 #include "metalio_claw_4_board.h"
 #include "display.h"
@@ -35,9 +43,21 @@
 #include "mqtt_protocol.h"
 #include "websocket_protocol.h"
 #include "mcp_server.h"
+#include "camera_screen/camera_screen.h"
+#include "digital_people_screen/digital_people_screen.h"
 #include "home_screen/home_screen.h"
+#include "panel_screen/panel_screen.h"
+#include "smart_home/smart_home.h"
 #include "chat_screen/chat_screen.h"
+#include "system_chrome/system_chrome.h"
+#include "system_chrome/control_center.h"
+#include "energy_wake_word.h"
+#include "audio/wake_words/hi_openvela_command.h"
 #include "chat_local_cmd.h"
+#include "audio_codec.h"
+#include "hi_music_screen/local_music_player.h"
+#include "music_screen/music_screen.h"
+#include "bluetooth_screen/bluetooth_screen.h"
 
 #include <metalio/metalio.h>
 
@@ -59,6 +79,7 @@
 #include <array>
 #include <mutex>
 #include <atomic>
+#include <pthread.h>
 
 #include <unistd.h>
 #include <malloc.h>
@@ -76,7 +97,32 @@
 
 #define TAG "Application"
 
-static bool Eth0HasIpv4();
+namespace {
+struct TypedChatState {
+    std::atomic<bool> active{false};
+    std::string pending,last;
+};
+// Initialized on Start before any app/audio/UI thread, without an early
+// function-local C++ guard or a change to the core Application storage ABI.
+TypedChatState *s_typed_chat=nullptr;
+TypedChatState &TypedChat() { return *s_typed_chat; }
+}
+
+bool Application::IsTypedChatMode() const
+{
+    return s_typed_chat && s_typed_chat->active.load();
+}
+
+static bool ActiveNetworkHasIpv4();
+
+static void *NetworkBootWorker(void * /*arg*/)
+{
+    Board::GetInstance().InitializeNetwork();
+    write(1, "NET1\n", 5);
+    if (ActiveNetworkHasIpv4())
+        Application::GetInstance().OnWifiLinkReady();
+    return nullptr;
+}
 
 /* Diagnostic: set to 1 right before the main event loop first blocks on
  * nanosleep().  The arch idle hook (up_idle) uses this to start printing
@@ -115,7 +161,23 @@ static void *WakeOpenWorkerLoop(void *arg)
         /* Only open the audio channel here. listen/detect+start MUST run on
          * the app thread after io_mutex serializes TLS — doing Publish from
          * this worker while RxLoop ssl_reads caused WAKE_START hang + blue. */
-        bool ok = proto->OpenAudioChannel();
+        // A late local-player cleanup used to erase/reject the first cloud
+        // packets. Wait for its private session and DMA tail on this existing
+        // worker, never on the UI/app thread, before opening the AI channel.
+        auto &audio=app->GetAudioService();
+        for (int waited=0;waited<300 && !audio.VoicePlaybackSettled() &&
+             app->GetDeviceState()==kDeviceStateConnecting &&
+             metalio_nt26_get_call_state()==METALIO_CALL_IDLE && !audio.HasExclusiveCapture();++waited)
+            usleep(10000);
+        bool ok=app->GetDeviceState()==kDeviceStateConnecting &&
+            audio.VoicePlaybackSettled() && !audio.HasExclusiveCapture() &&
+            metalio_nt26_get_call_state()==METALIO_CALL_IDLE;
+        if (ok) ok=BluetoothScreen::PrepareVoiceRoute()>=0;
+        if (ok) {
+            audio.BeginWakeGreetingPlayback();
+            if(auto *codec=audio.GetCodec())codec->EnableOutput(true);
+            ok=proto->OpenAudioChannel();
+        }
         write(1, ok ? "WAKE_CH_OK\n" : "WAKE_CH_FAIL\n", ok ? 11 : 13);
         app->NotifyWakeOpenDone(ok);
     }
@@ -252,10 +314,23 @@ Application::~Application()
 /* Activation / version check                                          */
 /* ------------------------------------------------------------------ */
 
+static bool HasPersistedXiaozhiProtocol()
+{
+    Settings mqtt("mqtt", false);
+    if (!mqtt.GetString("endpoint").empty())
+        return true;
+    Settings ws("websocket", false);
+    return !ws.GetString("url").empty();
+}
+
 void Application::ShowActivationCode(const std::string &code,
                                      const std::string &message)
 {
     if (activation_suspended_)
+        return;
+    /* Ignore stale activation blobs once the device has MQTT/WS or bound NVS. */
+    Settings wifi("wifi", false);
+    if (wifi.GetInt("xiaozhi_bound", 0) != 0 || HasPersistedXiaozhiProtocol())
         return;
     if (code.empty())
         return;
@@ -269,6 +344,10 @@ void Application::ShowActivationCode(const std::string &code,
             return;
     }
     pending_activation_code_ = code;
+    {
+        Settings settings("wifi", true);
+        settings.SetInt("xiaozhi_bound", 0);
+    }
     HomeScreen::RefreshStatusBar();
     {
         char mark[64];
@@ -288,6 +367,10 @@ void Application::ClearPendingActivation()
         return;
     write(1, "ACT_CLEAR\n", 10);
     pending_activation_code_.clear();
+    {
+        Settings settings("wifi", true);
+        settings.SetInt("xiaozhi_bound", 1);
+    }
     if (device_state_ == kDeviceStateActivating)
         SetDeviceState(kDeviceStateIdle);
     HomeScreen::RefreshStatusBar();
@@ -307,10 +390,22 @@ void Application::SyncXiaozhiBindState()
         ~Guard() { f.store(false); }
     } guard{inflight};
 
-    if (!Eth0HasIpv4())
+    if (!ActiveNetworkHasIpv4() || voice_network_preparing_.load())
+        return;
+
+    /* Never POST during a voice session. This TLS poll shares the SDIO
+     * link with the wake worker — a colliding POST delayed UDP setup past
+     * the connect watchdog (连接中 → 待唤醒, never 聆听中). */
+    if (device_state_ != kDeviceStateIdle || wake_connect_inflight_)
         return;
 
     const bool was_pending = HasPendingActivation();
+    Settings binding("wifi", false);
+    // A bound device already has usable cloud credentials. Periodic HTTPS
+    // activation polling competes with live LTE voice and can refresh cloud
+    // configuration underneath an otherwise healthy MQTT/UDP session.
+    // Boot refresh and an explicit activation flow still check the binding.
+    if (!was_pending && binding.GetInt("xiaozhi_bound", 0) != 0) return;
     Ota ota;
     if (ota.CheckVersion() != ESP_OK)
         return;
@@ -347,7 +442,7 @@ void Application::ArmXiaozhiBindSyncTimer()
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 65536);
         pthread_t th;
-        int rc = pthread_create(
+        int rc = hi_task_create_legacy(
             &th, &attr,
             [](void *) -> void * {
                 Application::GetInstance().SyncXiaozhiBindState();
@@ -382,14 +477,14 @@ void Application::SetActivationSuspended(bool suspended)
 
 bool Application::IsDeviceActivated() const
 {
-    /* Chat/wake need a finished OTA path and no pending 6-digit bind.
-     * Do not gate on kDeviceStateActivating: that state stays set through
-     * the whole CheckNewVersion poll and was blocking wake after bind. */
-    if (!boot_ready_)
-        return false;
     if (HasPendingActivation())
         return false;
-    return true;
+    if (boot_ready_)
+        return true;
+    Settings settings("wifi", false);
+    if (settings.GetInt("xiaozhi_bound", 0) != 0)
+        return true;
+    return HasPersistedXiaozhiProtocol();
 }
 
 void Application::StopSystemAudioForStressTest()
@@ -418,8 +513,7 @@ void Application::StopSystemAudioForStressTest()
 
 void Application::RestoreSystemAudioAfterStressTest()
 {
-    if (voice_ui_active_ && device_state_ == kDeviceStateIdle)
-        audio_service_->EnableWakeWordDetection(true);
+    RearmGlobalWakeWord();
     ESP_LOGI(TAG, "System audio restored after stress test (voice_ui=%d)",
              voice_ui_active_ ? 1 : 0);
 }
@@ -524,20 +618,22 @@ void Application::ToggleChatState()
 void Application::RequestWakeSession()
 {
     write(1, "WAKE_REQ\n", 9);
-    /* May be called from LVGL (chat status tap). Arm voice UI + open the
-     * Xiaozhi channel on the app thread — WAKE_REQ with voice_ui_active_==0
-     * previously no-op'd inside OnWakeWordDetected (no VUI_START/WW_ON). */
     Schedule([this]() {
+        if (!audio_service_ || audio_service_->HasExclusiveCapture() ||
+            metalio_nt26_get_call_state() != METALIO_CALL_IDLE) return;
+        if (device_state_ == kDeviceStateIdle) {
+            LocalMusicPlayer::Instance().SetPaused(true);
+            MusicScreen::PauseForVoice();
+            RadioPlayer::Instance().Pause();
+        }
         if (!boot_ready_)
         {
             write(1, "WAKE_NORDY\n", 11);
-            ESP_LOGW(TAG, "Wake ignored: boot not ready");
             return;
         }
         if (!protocol_)
         {
             write(1, "WAKE_NOPROTO\n", 13);
-            ESP_LOGW(TAG, "Wake ignored: protocol not ready");
             return;
         }
         if (!voice_ui_active_)
@@ -548,8 +644,6 @@ void Application::RequestWakeSession()
             CancelVoiceUiHardRelease();
             ApplyVoiceUiStart();
         }
-        /* Tap wake must not depend on Esp/Energy WW running. First enter
-         * often hit VUI_RETRY and cleared voice_ui_active_ → WAKE_NOVUI. */
         if (!voice_ui_active_ && voice_ui_desired_ && boot_ready_ &&
             protocol_ != nullptr)
         {
@@ -559,10 +653,165 @@ void Application::RequestWakeSession()
         if (!voice_ui_active_)
         {
             write(1, "WAKE_NOVUI\n", 11);
-            ESP_LOGW(TAG, "Wake ignored: voice UI failed to start");
             return;
         }
         OnWakeWordDetected();
+    });
+}
+
+void Application::EndFloatAiSession()
+{
+    pending_boot_wake_.store(false, std::memory_order_release);
+    Schedule([this]() {
+        write(1, "FLOAT_END\n", 10);
+        float_listen_idle_sec_ = 0;
+        /* Card is already gone (LVGL hide is synchronous). Idle arms
+         * wake once. A second TryEnableWakeWord here restarted the engine
+         * on the same tick and solid-blued the desktop. */
+        ParkVoiceUiProtocol();
+    });
+}
+
+void Application::BeginTypedChat()
+{
+    Schedule([this]() {
+        if (!ChatScreen::IsForeground() || !audio_service_ ||
+            audio_service_->HasExclusiveCapture() || wake_connect_inflight_ ||
+            metalio_nt26_get_call_state()!=METALIO_CALL_IDLE) return;
+        TypedChat().active.store(true);
+        audio_service_->EnableBargeIn(false);
+        TypedChat().pending.clear();TypedChat().last.clear();
+        CancelVoiceUiHardRelease();
+        voice_ui_desired_=true;voice_ui_active_=true;++voice_ui_epoch_;
+        if (listen_vp_timer_) esp_timer_stop(listen_vp_timer_);
+        listen_vp_deferred_arm_.store(false);
+        if (protocol_ && protocol_->IsAudioChannelOpened() &&
+            (device_state_==kDeviceStateListening || device_state_==kDeviceStateSpeaking))
+            protocol_->SendAbortSpeaking(kAbortReasonNone);
+        audio_service_->EnableVoiceProcessing(false);
+        audio_service_->DiscardUplinkAudio();
+        audio_service_->ResetDecoder();
+        SetDeviceState(kDeviceStateIdle);
+    });
+}
+
+bool Application::RequestTypedChatMessage(const std::string &text)
+{
+    if (text.empty() || text.size()>2048 || !boot_ready_ || !protocol_ ||
+        !NetworkService::Available() || wake_connect_inflight_ ||
+        !audio_service_ || audio_service_->HasExclusiveCapture() ||
+        metalio_nt26_get_call_state()!=METALIO_CALL_IDLE) return false;
+    Schedule([this,text]() {
+        if (!ChatScreen::IsForeground() || !TypedChat().pending.empty() ||
+            wake_connect_inflight_ || !protocol_ || audio_service_->HasExclusiveCapture() ||
+            metalio_nt26_get_call_state()!=METALIO_CALL_IDLE) return;
+        TypedChat().active.store(true);
+        audio_service_->EnableBargeIn(false);
+        voice_ui_desired_=true;voice_ui_active_=true;++voice_ui_epoch_;
+        CancelVoiceUiHardRelease();
+        if (listen_vp_timer_) esp_timer_stop(listen_vp_timer_);
+        listen_vp_deferred_arm_.store(false);
+        if (protocol_->IsAudioChannelOpened() &&
+            (device_state_==kDeviceStateSpeaking || device_state_==kDeviceStateListening))
+            protocol_->SendAbortSpeaking(kAbortReasonNone);
+        audio_service_->EnableVoiceProcessing(false);
+        audio_service_->EnableWakeWordDetection(false);
+        audio_service_->DiscardUplinkAudio();audio_service_->ResetDecoder();
+        LocalMusicPlayer::Instance().SetPaused(true);MusicScreen::PauseForVoice();
+        RadioPlayer::Instance().Pause();
+        TypedChat().pending=text;
+        if (protocol_->IsAudioChannelOpened() && audio_service_->VoicePlaybackSettled()) { SendPendingTypedChat();return; }
+        SetDeviceState(kDeviceStateConnecting);
+        wake_connect_inflight_=true;
+        if (!QueueWakeOpenAudioChannel()) {
+            wake_connect_inflight_=false;TypedChat().pending.clear();
+            SetDeviceState(kDeviceStateIdle);
+            if(auto *display=Board::GetInstance().GetDisplay())
+                display->SetChatMessage("system","连接暂未就绪，请重新发送");
+        }
+    });
+    return true;
+}
+
+void Application::SendPendingTypedChat()
+{
+    if (!protocol_ || TypedChat().pending.empty()) return;
+    protocol_->ClearOpeningAudioGate();wake_connect_inflight_=false;
+    listening_mode_=kListeningModeManualStop;aborted_=false;
+    SetDeviceState(kDeviceStateListening);
+    audio_service_->BeginWakeGreetingPlayback();
+    audio_service_->ArmDownlinkPlaybackProtect();
+    const bool sent=protocol_->SendUserText(TypedChat().pending);
+    if (auto *display=Board::GetInstance().GetDisplay()) {
+        if (sent) display->SetChatMessage("user",TypedChat().pending.c_str());
+        else display->SetChatMessage("system","发送未确认，请检查网络后重新发送");
+    }
+    TypedChat().last=sent?TypedChat().pending:std::string();
+    TypedChat().pending.clear();
+    if (!sent) SetDeviceState(kDeviceStateIdle);
+}
+
+void Application::ScheduleDeferredListenVp()
+{
+    if (listen_vp_timer_ == nullptr)
+    {
+        esp_timer_create_args_t args = {
+            .callback =
+                [](void *arg) {
+                    auto *app = static_cast<Application *>(arg);
+                    app->listen_vp_deferred_arm_.store(true,
+                                                       std::memory_order_release);
+                    if (app->event_group_)
+                        xEventGroupSetBits(app->event_group_,
+                                           MAIN_EVENT_LISTEN_VP);
+                },
+            .arg = this,
+        };
+        if (esp_timer_create(&args, &listen_vp_timer_) != 0)
+            listen_vp_timer_ = nullptr;
+    }
+    if (listen_vp_timer_ == nullptr)
+    {
+        listen_vp_deferred_arm_.store(true, std::memory_order_release);
+        if (event_group_)
+            xEventGroupSetBits(event_group_, MAIN_EVENT_LISTEN_VP);
+        return;
+    }
+    esp_timer_stop(listen_vp_timer_);
+    listen_vp_deferred_arm_.store(false, std::memory_order_release);
+    /* Let the float bubble finish painting before the mic graph starts. */
+    esp_timer_start_once(listen_vp_timer_, 450 * 1000);
+}
+
+void Application::NotifyFloatAiDialogActivity()
+{
+    float_listen_idle_sec_ = 0;
+}
+
+void Application::ArmAssistantWakeWord(bool explicit_mode1_restore)
+{
+    Schedule([this,explicit_mode1_restore]() {
+        if (!CanArmSpokenWake()) return;
+        // Returning to home/standby must not renegotiate A2DP into SCO or
+        // pause a live media session. Only an explicit voice action takes focus.
+        if(!explicit_mode1_restore && (audio_service_->HasLocalPlaybackSession() ||
+            RadioPlayer::Instance().want_play()))return;
+        // Mode 2 keeps its scan/connection lease. Only acknowledged mode 1
+        // or a voice surface may restore local clocks; never reset I2S/DMA.
+        LocalMusicPlayer::Instance().SetPaused(true);
+        MusicScreen::PauseForVoice();
+        if(BluetoothScreen::PrepareVoiceRoute()<0)return;
+        if(auto *codec=audio_service_->GetCodec()){codec->EnableInput(true);codec->EnableOutput(true);}
+        write(1, "WW_ARM_AI\n", 10);
+        if (PanelScreen::IsForeground())
+            write(1, "WAKE_SURFACE_PANEL\n", 19);
+        EnergyWakeWord::SetDesktopStrict(false);
+        if (audio_service_ == nullptr)
+            return;
+        audio_service_->ClearWakeWordMute();
+        if(device_state_!=kDeviceStateConnecting&&device_state_!=kDeviceStateListening&&device_state_!=kDeviceStateSpeaking)
+            audio_service_->EnableVoiceProcessing(false);
+        TryEnableWakeWordForVoiceUi();
     });
 }
 
@@ -637,8 +886,8 @@ void Application::StopListening()
 
 static void SeedSystemTimeFromBuild()
 {
-    /* No RTC yet. Seed from firmware build stamp so the status bar is not
-     * stuck on "--:--" before OTA/NTP. Network time overwrites this. */
+    /* Seed only for TLS date validation. UI remains --:-- until an actual
+     * OTA/NTP synchronization marks the wall clock ready. */
     static const char *const kMonths[12] = {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -681,18 +930,16 @@ static void SeedSystemTimeFromBuild()
 /* One-shot NTP (Claw4 relies on OTA server_time; NTP fills the gap when
  * OTA has not yet applied a clock). Uses UTC + 8h for CN local display
  * because CONFIG_LIBC_LOCALTIME is off on this port. */
-static bool SyncWallClockFromNtp()
+static bool SyncWallClockFromNtpBlocking()
 {
     static bool s_ntp_ok = false;
     if (s_ntp_ok)
         return true;
 
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    struct addrinfo *res = nullptr;
-    if (getaddrinfo("ntp.aliyun.com", "123", &hints, &res) != 0 || res == nullptr)
+    struct sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(123);
+    if (metalio_voice_resolve_ipv4("ntp.aliyun.com", &address.sin_addr.s_addr) < 0)
     {
         write(1, "NTP_DNS_FAIL\n", 13);
         return false;
@@ -701,7 +948,13 @@ static bool SyncWallClockFromNtp()
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0)
     {
-        freeaddrinfo(res);
+        return false;
+    }
+
+    if (metalio_app_bind_active_interface(fd) < 0)
+    {
+        close(fd);
+        write(1, "NTP_BIND_FAIL\n", 14);
         return false;
     }
 
@@ -715,8 +968,7 @@ static bool SyncWallClockFromNtp()
     memset(pkt, 0, sizeof(pkt));
     pkt[0] = 0x1b; /* LI=0 VN=3 Mode=3 (client) */
 
-    ssize_t n = sendto(fd, pkt, sizeof(pkt), 0, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
+    ssize_t n = sendto(fd, pkt, sizeof(pkt), 0, reinterpret_cast<struct sockaddr *>(&address), sizeof(address));
     if (n != (ssize_t)sizeof(pkt))
     {
         close(fd);
@@ -745,9 +997,37 @@ static bool SyncWallClockFromNtp()
     if (settimeofday(&tv, NULL) != 0)
         return false;
 
+    metalio_board_clock_synced();
     s_ntp_ok = true;
     write(1, "NTP_OK\n", 7);
     return true;
+}
+
+// Network leases must never block the application event loop on NTP/DNS.
+// The same resolver/binding follows both Wi-Fi and NT26's selected data path.
+static bool SyncWallClockFromNtp()
+{
+    static std::atomic<bool> ready{false};
+    static std::atomic<bool> running{false};
+    if (ready.load()) return true;
+    if (running.exchange(true)) return false;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 32768);
+    pthread_t thread;
+    int rc = hi_task_create_legacy(&thread, &attr, [](void *) -> void * {
+        if (SyncWallClockFromNtpBlocking())
+        {
+            ready.store(true);
+            Application::GetInstance().Schedule([](){HomeScreen::RefreshStatusBar();});
+        }
+        running.store(false);
+        return nullptr;
+    }, nullptr);
+    pthread_attr_destroy(&attr);
+    if (rc == 0) pthread_detach(thread);
+    else running.store(false);
+    return ready.load();
 }
 
 static void RefreshTimeUi()
@@ -761,7 +1041,10 @@ static void RefreshTimeUi()
 
 void Application::Start()
 {
+    if (!s_typed_chat) s_typed_chat=new TypedChatState;
     auto &board = Board::GetInstance();
+    spoken_wake_enabled_.store(SmartHome_VoiceEnabled());
+    printf("SPOKEN_WAKE_ENABLED %d\n",IsSpokenWakeEnabled());
     SeedSystemTimeFromBuild();
     SetDeviceState(kDeviceStateStarting);
 
@@ -776,12 +1059,20 @@ void Application::Start()
      * radio session fires. */
     audio_service_ = std::make_unique<AudioService>();
 
+    if (HasPersistedXiaozhiProtocol())
+    {
+        Settings settings("wifi", true);
+        settings.SetInt("xiaozhi_bound", 1);
+        pending_activation_code_.clear();
+    }
+
     AudioServiceCallbacks audio_cbs;
     audio_cbs.on_send_queue_available = [this]() {
         if (event_group_)
             xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
     };
-    audio_cbs.on_wake_word_detected = [this](const std::string & /*wake_word*/) {
+    audio_cbs.on_wake_word_detected = [this](const std::string &wake_word) {
+        if (wake_word != HI_OPENVELA_PHRASE || !CanArmSpokenWake()) return;
         if (event_group_)
             xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
     };
@@ -790,11 +1081,15 @@ void Application::Start()
             xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
     audio_cbs.wake_word_allowed = [this]() {
-        /* Idle: normal chat wake. Speaking + AutoStop + AFE: wake-to-abort
-         * (Claw4). EnergyWakeWord must not run during TTS (speaker false hits). */
-        if (!voice_ui_active_ || protocol_ == nullptr || !boot_ready_)
+        /* Idle: chat / desktop AI. Energy must not run during TTS. */
+        const bool want_ww = CanArmSpokenWake();
+        if (!want_ww)
             return false;
         if (device_state_ == kDeviceStateIdle)
+            return true;
+        // Local recognition must not wait for OTA, IP, DNS or cloud setup.
+        if (!boot_ready_ && (device_state_ == kDeviceStateStarting ||
+                            device_state_ == kDeviceStateActivating))
             return true;
         if (device_state_ == kDeviceStateSpeaking &&
             aec_mode_ == kAecOff &&
@@ -814,41 +1109,61 @@ void Application::Start()
     };
 
     audio_service_->SetCallbacks(audio_cbs);
-    audio_service_->Start();
-    write(1, "AS_DONE\n", 8);
 
-    /* Start the LVGL render thread BEFORE the network stack.  esp-hosted
-     * STA association + host-side DHCP can block for tens of seconds; the
-     * boot screen (created in NuttxLvglDisplay's constructor) must be
-     * rendered during that window, otherwise its 5s boot→home timer has
-     * already expired by the time the thread starts and the boot screen is
-     * never shown. */
     auto *display = board.GetDisplay();
     write(1, "DISP0\n", 6);
     if (display && display->IsActive())
         display->StartDisplayThread();
     write(1, "DISP1\n", 6);
-
-    /* Match MetalioClaw4: restore backlight only after LVGL is painting the
-     * boot screen. Lighting earlier flashes blank/garbage framebuffer. */
     if (auto *bl = board.GetBacklight())
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
         bl->RestoreBrightness();
+
+    audio_service_->Start();
+    write(1, "AS_DONE\n", 8);
+    // Load MultiNet while boot UI is visible. The foreground screen arms
+    // capture after its first frame, without blocking LVGL on model creation.
+    const bool wake_prepared=audio_service_->PrepareWakeWordDetection();
+    if (!wake_prepared) write(1, "WAKE_PREPARE_FAIL\n", 18);
+    // The port already documents create/FST versus Home/LVGL startup as an
+    // unsafe overlap. Network and OTA also allocate while create is running.
+    // Finish this bounded initialization before arming Home or those workers;
+    // the display thread continues rendering the boot guide while we yield.
+    if (wake_prepared) {
+        write(1,"WAKE_BOOT_WAIT\n",15);
+        const int64_t deadline=esp_timer_get_time()+20000000;
+        while (!audio_service_->IsWakeWordEngineReady() && esp_timer_get_time()<deadline)
+            usleep(20000);
+        if (audio_service_->IsWakeWordEngineReady()) write(1,"WAKE_BOOT_READY\n",16);
+        else write(1,"WAKE_BOOT_TIMEOUT\n",18);
     }
 
-    write(1, "NET0\n", 5);
-    board.InitializeNetwork();
-    write(1, "NET1\n", 5);
+    {
+        Settings settings("wifi", false);
+        if (settings.GetInt("xiaozhi_bound", 0) != 0)
+            pending_activation_code_.clear();
+    }
 
-    /* Allow boot→home only after Wi-Fi bring-up. Creating HomeScreen while
-     * SDIO/STA init is still allocating DMA buffers exhausts the heap
-     * (MMNULL right after HS0) and leaves a solid blue LVGL fallback.
-     * Do NOT mount FAT here: Slot0 WR still hangs the shared SDMMC host.
-     * UI mounts on demand via SdCardManager::Mount() / metalio_sdcard_mount_ro(). */
+    /* Home after the boot guide — do not block on STA/DHCP (up to ~30s),
+     * which left the guide screen up indefinitely. Wi-Fi continues on a
+     * worker; SDIO init still runs early on that thread while LVGL shows
+     * boot, then home at ~3s. */
     if (display && display->IsActive())
         display->ArmHomeTransition();
     write(1, "HOME_ARMD\n", 10);
+#ifdef HI_VIDEO_TARGET_TEST
+    HiApp::StartVideoTargetTests();
+#endif
+
+    write(1, "NET0\n", 5);
+    pthread_attr_t net_attr;
+    pthread_attr_init(&net_attr);
+    pthread_attr_setstacksize(&net_attr, 65536);
+    pthread_t net_thread;
+    if (hi_task_create_legacy(&net_thread, &net_attr, NetworkBootWorker, nullptr) == 0)
+        pthread_detach(net_thread);
+    else
+        NetworkBootWorker(nullptr);
+    pthread_attr_destroy(&net_attr);
     /* Never EnsureWakeWordReady / Esp preload on the home path — WakeNet
      * create racing home LVGL solid-blues the panel (WW_PRE / EW_IA).
      * Esp upgrades only after chat Idle settles (ScheduleEspWakeWordUpgrade). */
@@ -902,7 +1217,7 @@ void Application::Start()
     pthread_attr_setinheritsched(&ota_attr, PTHREAD_EXPLICIT_SCHED);
 
     pthread_t ota_thread;
-    int ota_rc = pthread_create(
+    int ota_rc = hi_task_create_legacy(
         &ota_thread, &ota_attr,
         [](void *p) -> void * {
             auto *o = static_cast<Ota *>(p);
@@ -930,11 +1245,76 @@ void Application::Start()
     if (clock_timer_handle_ != nullptr)
         esp_timer_start_periodic(clock_timer_handle_, 1000000);
 
+    hi_task_enable_app_balance();
+#ifdef HI_APP_SMP_PROBE
+    extern void hi_task_probe_start();
+    hi_task_probe_start();
+#endif
     MainEventLoop();
+}
+
+void Application::ResumePendingBootWake()
+{
+    Schedule([this]() {
+        if (!boot_ready_ || !protocol_ || voice_network_preparing_.load() ||
+            !pending_boot_wake_.exchange(false, std::memory_order_acq_rel))
+            return;
+        // Closing the early popup cancels the pending conversation.
+        if (ChatScreen::IsForeground() || DigitalPeopleScreen::IsForeground() || SystemChrome_FloatAiOpen())
+        {
+            write(1, "BOOT_WAKE_RESUME\n", 17);
+            OnWakeWordDetected();
+        }
+    });
 }
 
 void Application::OtaBootWorker(Ota *ota)
 {
+    Settings wifi_settings("wifi", false);
+    const bool cached_bound = wifi_settings.GetInt("xiaozhi_bound", 0) != 0;
+    if (cached_bound)
+        pending_activation_code_.clear();
+
+    const bool fast_protocol =
+        cached_bound && ota->LoadPersistedProtocolConfig();
+
+    if (fast_protocol)
+    {
+        write(1, "OTA_FAST\n", 8);
+        auto &mcp_server = McpServer::GetInstance();
+        mcp_server.AddCommonTools();
+        mcp_server.AddUserOnlyTools();
+        InitializeXiaozhiProtocol(*ota);
+        ApplyInterruptPreferenceFromNvs();
+        boot_ready_ = true;
+        device_state_ = kDeviceStateIdle;
+        ResumePendingBootWake();
+        if (!ota->HasServerTime())
+            SyncWallClockFromNtp();
+        HomeScreen::RefreshStatusBar();
+        ArmXiaozhiBindSyncTimer();
+        if (voice_ui_desired_)
+            Schedule([this]() { SyncVoiceUiSession(); });
+
+        /* Already on the OTA worker: HTTPS must not run in MainEventLoop,
+         * where it blocks touch wake and voice-session events on a weak link. */
+        ota_check_silent_ = true;
+        Ota refresh;
+        CheckNewVersion(refresh);
+        ota_check_silent_ = false;
+        HomeScreen::RefreshStatusBar();
+        ChatScreen::RefreshDeviceState();
+        write(1, "OTA1\n", 5);
+        write(1, "P1\n", 3);
+        ESP_LOGE(TAG, "Xiaozhi fast boot ready (mqtt=%d websocket=%d)",
+                 ota->HasMqttConfig() ? 1 : 0, ota->HasWebsocketConfig() ? 1 : 0);
+        {
+            Settings settings("wifi", true);
+            settings.SetInt("xiaozhi_bound", 1);
+        }
+        return;
+    }
+
     CheckNewVersion(*ota);
     write(1, "OTA1\n", 5);
 
@@ -950,6 +1330,7 @@ void Application::OtaBootWorker(Ota *ota)
 
     boot_ready_ = true;
     device_state_ = kDeviceStateIdle;
+    ResumePendingBootWake();
     has_server_time_ = ota->HasServerTime();
     if (!has_server_time_)
         SyncWallClockFromNtp();
@@ -961,6 +1342,12 @@ void Application::OtaBootWorker(Ota *ota)
     /* Chat may have been opened while OTA/MQTT was still starting — arm WW now. */
     if (voice_ui_desired_)
         Schedule([this]() { SyncVoiceUiSession(); });
+
+    if (!HasPendingActivation())
+    {
+        Settings settings("wifi", true);
+        settings.SetInt("xiaozhi_bound", 1);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -990,18 +1377,61 @@ void Application::MainEventLoop()
                 MAIN_EVENT_WAKE_WORD_DETECTED | MAIN_EVENT_VAD_CHANGE |
                 MAIN_EVENT_CLOCK_TICK | MAIN_EVENT_ERROR | MAIN_EVENT_VOICE_UI |
                 MAIN_EVENT_WAKE_DONE | MAIN_EVENT_XIAOZHI_JSON |
-                MAIN_EVENT_TTS_PROMOTE | MAIN_EVENT_BARGE_IN,
+                MAIN_EVENT_TTS_PROMOTE | MAIN_EVENT_BARGE_IN |
+                MAIN_EVENT_LISTEN_VP | MAIN_EVENT_WAKE_PREFERENCE,
             pdTRUE, pdFALSE, portMAX_DELAY);
         g_app_entered_sleep = 0;
+
+        /* WAKE_DONE before any usleep so chat does not sit on「连接中」. */
+        if (bits & MAIN_EVENT_WAKE_DONE)
+        {
+            const int8_t r =
+                wake_open_result_.exchange(-1, std::memory_order_acq_rel);
+            if (r >= 0)
+                CompleteWakeFromWorker(r != 0);
+        }
 
         if (bits & MAIN_EVENT_BARGE_IN)
         {
             /* Interrupt: local energy barge while TTS uplink was gated. */
-            if (device_state_ == kDeviceStateSpeaking &&
-                aec_mode_ == kAecOnDeviceSide && voice_ui_active_)
+            if (!TypedChat().active.load() && device_state_ == kDeviceStateSpeaking &&
+                audio_service_ && audio_service_->IsBargeInEnabled() && voice_ui_active_ &&
+                !audio_service_->HasExclusiveCapture() &&
+                metalio_nt26_get_call_state()==METALIO_CALL_IDLE &&
+                voice_ui_request_.load(std::memory_order_acquire) != 0)
             {
                 write(1, "BARGE_APP\n", 10);
                 AbortSpeaking(kAbortReasonNone);
+                if (audio_service_->IsBargeInEnabled() && voice_ui_active_)
+                    SetListeningMode(kListeningModeAutoStop);
+            }
+        }
+
+        if (bits & MAIN_EVENT_LISTEN_VP)
+        {
+            /* Next-loop VP Start after Speaking→Listening / wake relisten.
+             * Same-tick EnableVP while LVGL paints the last bubble raced
+             * the FB (solid blue) and left STT dead on「聆听中」.
+             * Desktop float defers one more beat so the card can flip. */
+            const bool float_open = SystemChrome_FloatAiOpen();
+            const bool arm_now =
+                listen_vp_deferred_arm_.exchange(false,
+                                                 std::memory_order_acq_rel);
+            if (TypedChat().active.load())
+            {
+                if (audio_service_) audio_service_->EnableVoiceProcessing(false);
+            }
+            else if (float_open && !arm_now)
+            {
+                ScheduleDeferredListenVp();
+            }
+            else if (device_state_ == kDeviceStateListening && audio_service_ &&
+                     !audio_service_->IsAudioProcessorRunning())
+            {
+                write(1, "LISTEN_VP\n", 10);
+                audio_service_->SetTtsUplinkGate(false);
+                audio_service_->EnableVoiceProcessing(true);
+                audio_service_->EnableWakeWordDetection(false);
             }
         }
 
@@ -1031,14 +1461,6 @@ void Application::MainEventLoop()
             }
         }
 
-        if (bits & MAIN_EVENT_WAKE_DONE)
-        {
-            const int8_t r =
-                wake_open_result_.exchange(-1, std::memory_order_acq_rel);
-            if (r >= 0)
-                CompleteWakeFromWorker(r != 0);
-        }
-
         if (bits & MAIN_EVENT_ERROR)
         {
             SetDeviceState(kDeviceStateIdle);
@@ -1051,13 +1473,11 @@ void Application::MainEventLoop()
             /* While TTS is active, drop uplink so echo is not STT'd.
              * Do not Discard during the short post-TTS settle — that wiped
              * the first Opus frames of the user's next utterance. */
-            if (audio_service_ && audio_service_->ShouldSuppressUplink() &&
-                (audio_service_->IsTtsUplinkGated() ||
-                 audio_service_->HasPendingPlayback()))
+            if (audio_service_ && (TypedChat().active.load() || audio_service_->IsTtsUplinkGated()))
             {
                 audio_service_->DiscardUplinkAudio();
             }
-            else if (audio_service_ && !audio_service_->ShouldSuppressUplink())
+            else if (audio_service_)
             {
                 while (auto packet = audio_service_->PopPacketFromSendQueue())
                 {
@@ -1067,7 +1487,16 @@ void Application::MainEventLoop()
             }
         }
 
-        if (bits & MAIN_EVENT_WAKE_WORD_DETECTED)
+        if (bits & MAIN_EVENT_WAKE_PREFERENCE)
+        {
+            if (!IsSpokenWakeEnabled() && audio_service_)
+                audio_service_->EnableWakeWordDetection(false);
+            // Manual listening/TTS is left intact by the wake switch.
+        }
+        if ((bits & MAIN_EVENT_VAD_CHANGE) && audio_service_ &&
+            audio_service_->IsVoiceDetected())
+            NotifyFloatAiDialogActivity();
+        if ((bits & MAIN_EVENT_WAKE_WORD_DETECTED) && CanArmSpokenWake())
             OnWakeWordDetected();
 
         if (bits & MAIN_EVENT_SCHEDULE)
@@ -1087,9 +1516,22 @@ void Application::MainEventLoop()
         if (bits & MAIN_EVENT_CLOCK_TICK)
         {
             clock_ticks_++;
+            if (TypedChat().active.load() && device_state_==kDeviceStateListening && clock_ticks_>=30) {
+                if (protocol_) protocol_->SendAbortSpeaking(kAbortReasonNone);
+                SetDeviceState(kDeviceStateIdle);
+                if (auto *display=Board::GetInstance().GetDisplay())
+                    display->SetChatMessage("system","暂未收到回复，请检查网络后重试");
+            }
             /* Skip display->UpdateStatusBar(): corrupts LVGL heap on this port. */
             /* Wake OpenAudioChannel can hang on TLS/DNS; free the session. */
-            if (device_state_ == kDeviceStateConnecting && clock_ticks_ >= 15)
+            /* Wake OpenAudioChannel runs on the wake worker and is bounded
+             * (hello ≤8s + UDP/DNS a few s). Do NOT abort while it is
+             * inflight — the old 6s kill reset to Idle, then the worker's
+             * success arrived and the fresh channel was closed (连接中 loop).
+             * Only a lost worker result (not inflight) or a genuine 20s
+             * hang frees the session. */
+            if (device_state_ == kDeviceStateConnecting &&
+                clock_ticks_ >= 20 && !wake_connect_inflight_)
             {
                 write(1, "WAKE_TO\n", 8);
                 wake_connect_inflight_ = false;
@@ -1097,11 +1539,107 @@ void Application::MainEventLoop()
                     protocol_->CloseAudioChannel();
                 SetDeviceState(kDeviceStateIdle);
             }
+            else if (device_state_ == kDeviceStateConnecting &&
+                     wake_connect_inflight_ && clock_ticks_ >= 28)
+            {
+                write(1, "WAKE_TO\n", 8);
+                wake_connect_inflight_ = false;
+                if (protocol_ && protocol_->IsAudioChannelOpened())
+                    protocol_->CloseAudioChannel();
+                SetDeviceState(kDeviceStateIdle);
+            }
+            else if (device_state_ == kDeviceStateConnecting &&
+                     clock_ticks_ == 2 && protocol_ &&
+                     !wake_connect_inflight_)
+            {
+                write(1, "WAKE_RETRY\n", 11);
+                QueueWakeOpenAudioChannel();
+            }
+            /* Desktop float AI: after silence in「聆听中」, park the session and
+             * dismiss the card (AutoStop otherwise keeps Listening forever).
+             * One re-arm first — a wedged uplink left the chip on「聆听中」
+             * with STT dead. Closing + wake-arm on that same tick then
+             * solid-blued the panel. */
+            constexpr int kFloatListenRearmSec = 12;
+            constexpr int kFloatListenIdleSec = 30;
+            if (!SystemChrome_ChatOwnsAssistantUi() && SystemChrome_FloatAiOpen() &&
+                !CameraScreen::IsLookAndSeeMode() &&
+                !McpServer::GetInstance().IsVisionAnalysisPending())
+            {
+                if (device_state_ == kDeviceStateListening)
+                {
+                    const int idle = float_listen_idle_sec_.fetch_add(
+                                         1, std::memory_order_relaxed) +
+                                     1;
+                    if (idle == kFloatListenRearmSec &&
+                        float_listen_idle_sec_.load(std::memory_order_relaxed) >=
+                            kFloatListenRearmSec &&
+                        protocol_ && audio_service_)
+                    {
+                        write(1, "LISTEN_REARM\n", 13);
+                        audio_service_->SetTtsUplinkGate(false);
+                        audio_service_->DiscardUplinkAudio();
+                        protocol_->SendStartListening(listening_mode_);
+                        audio_service_->EnableVoiceProcessing(false);
+                        listen_vp_deferred_arm_.store(false,
+                                                      std::memory_order_release);
+                        if (event_group_)
+                            xEventGroupSetBits(event_group_,
+                                               MAIN_EVENT_LISTEN_VP);
+                    }
+                    if (idle >= kFloatListenIdleSec &&
+                        float_listen_idle_sec_.load(std::memory_order_relaxed) >=
+                            kFloatListenIdleSec)
+                    {
+                        float_listen_idle_sec_.store(0, std::memory_order_relaxed);
+                        write(1, "FLOAT_IDLE\n", 11);
+                        if (listen_vp_timer_ != nullptr)
+                            esp_timer_stop(listen_vp_timer_);
+                        listen_vp_deferred_arm_.store(false,
+                                                      std::memory_order_release);
+                        if (audio_service_)
+                        {
+                            audio_service_->EnableVoiceProcessing(false);
+                            audio_service_->SetTtsUplinkGate(false);
+                        }
+                        if (protocol_)
+                        {
+                            protocol_->SendStopListening();
+                            if (protocol_->IsAudioChannelOpened())
+                                protocol_->CloseAudioChannel();
+                        }
+                        SystemChrome_CloseFloatAi();
+                        Schedule([this]() {
+                            if (ChatScreen::IsForeground())
+                                return;
+                            if (device_state_ != kDeviceStateListening &&
+                                device_state_ != kDeviceStateSpeaking &&
+                                device_state_ != kDeviceStateConnecting)
+                                return;
+                            /* Wake stays off while the card delete is still
+                             * queued. The Idle WW_REARM tick picks it up. */
+                            skip_idle_wake_arm_ = SystemChrome_FloatAiOpen();
+                            SetDeviceState(kDeviceStateIdle);
+                            skip_idle_wake_arm_ = false;
+                        });
+                    }
+                }
+                else if (device_state_ == kDeviceStateSpeaking ||
+                         device_state_ == kDeviceStateConnecting)
+                {
+                    float_listen_idle_sec_ = 0;
+                }
+            }
+            else
+            {
+                float_listen_idle_sec_ = 0;
+            }
             /* Missed tts/stop left UI on「讲话中」forever with VP off.
              * Require ~2 s of empty playback (not wall time since Speaking)
              * so brief underruns mid-TTS do not false-trigger. */
             static int s_speak_idle_sec = 0;
-            if (device_state_ == kDeviceStateSpeaking && audio_service_)
+            if (device_state_ == kDeviceStateSpeaking && audio_service_ &&
+                !McpServer::GetInstance().IsVisionAnalysisPending())
             {
                 if (tts_stop_pending_ && !audio_service_->HasPendingPlayback())
                 {
@@ -1126,20 +1664,49 @@ void Application::MainEventLoop()
                         SetDeviceState(kDeviceStateListening);
                 }
             }
-            else
+            else if (McpServer::GetInstance().IsVisionAnalysisPending())
             {
                 s_speak_idle_sec = 0;
             }
-
-            /* Intermittent wake: Idle+chat but WW stopped (WW_BLOCK / SoftStop
-             * race / prior session). Re-arm once per second. */
-            if (device_state_ == kDeviceStateIdle && voice_ui_active_ &&
-                voice_ui_desired_ && !wake_connect_inflight_ &&
-                audio_service_ && !audio_service_->IsWakeWordRunning())
+            /* Reconcile Idle wake state on every voice surface, including
+             * a visible assistant card. A stale service bit or downlink gate
+             * must not require leaving the page or rebooting to listen again.
+             * Wait for a quiet tick with the already-prepared model (two
+             * ticks if still preparing), preserve real
+             * calls/recorders/media and never reset an active command window. */
+            static unsigned wake_idle_quiet_ticks=0;
+            const bool idle_wake_surface=(device_state_ == kDeviceStateIdle ||
+                 (!boot_ready_ && (device_state_ == kDeviceStateStarting ||
+                                   device_state_ == kDeviceStateActivating)));
+            const bool idle_wake_eligible=idle_wake_surface &&
+                !wake_connect_inflight_ &&
+                audio_service_ &&
+                CanArmSpokenWake() &&
+                !audio_service_->HasLocalPlaybackSession() &&
+                !RadioPlayer::Instance().want_play() &&
+                !audio_service_->HasPendingPlayback() &&
+                !McpServer::GetInstance().IsVisionAnalysisPending();
+            if (!idle_wake_eligible) wake_idle_quiet_ticks=0;
+            else if (wake_idle_quiet_ticks<3) ++wake_idle_quiet_ticks;
+            const unsigned quiet_ticks_needed = audio_service_ &&
+                audio_service_->IsWakeWordEngineReady() &&
+                !SystemChrome_FloatAiOpen() ? 1 : 2;
+            if (idle_wake_eligible && wake_idle_quiet_ticks>=quiet_ticks_needed &&
+                (!SystemChrome_FloatAiOpen() ||
+                 audio_service_->IsWakeWordEngineReady()))
             {
-                write(1, "WW_REARM\n", 9);
-                audio_service_->EnableVoiceProcessing(false);
-                TryEnableWakeWordForVoiceUi();
+                EnergyWakeWord::SetDesktopStrict(
+                    HomeScreen::IsActive() && !ChatScreen::IsForeground() &&
+                    !SystemChrome_FloatAiOpen());
+                if (audio_service_->IsAudioProcessorRunning())
+                    audio_service_->EnableVoiceProcessing(false);
+                if (audio_service_->IsTtsUplinkGated())
+                    audio_service_->SetTtsUplinkGate(false);
+                if (audio_service_->IsDownlinkPlaybackProtected())
+                    audio_service_->ClearDownlinkPlaybackProtect();
+                // Leave timed ringtone/notification echo suppression intact.
+                // An already-running model's Start() does not clear its PCM.
+                audio_service_->EnableWakeWordDetection(true);
             }
         }
     }
@@ -1171,7 +1738,7 @@ void Application::EnsureWakeOpenWorker()
     /* TLS + MQTT hello + DNS — allocate once at boot, not on each wake. */
     pthread_attr_setstacksize(&attr, 96 * 1024);
     pthread_t tid;
-    const int rc = pthread_create(&tid, &attr, WakeOpenWorkerLoop, this);
+    const int rc = hi_task_create_legacy(&tid, &attr, WakeOpenWorkerLoop, this);
     pthread_attr_destroy(&attr);
     if (rc != 0)
     {
@@ -1200,14 +1767,63 @@ void Application::OnWakeWordDetected()
     /* MetalioClaw4 OnWakeWordDetected + CONFIG_SEND_WAKE_WORD_DATA.
      * OpenAudioChannel runs on the persistent wake worker (no per-wake
      * 96KB pthread — that blue-screened Chat when saying 你好小智). */
-    if (!voice_ui_active_ || !protocol_ || !boot_ready_)
+    // Native conversation belongs to the actual foreground chat/Xiaobai.
+    // Every other screen gets the ordinary assistant card, never camera entry.
+    const bool chat = SystemChrome_ChatOwnsAssistantUi();
+    if (audio_service_)
+        audio_service_->SetVisualConversation(CameraScreen::IsLookAndSeeMode());
+    const bool float_ai = SystemChrome_FloatAiOpen();
+    if (audio_service_->HasExclusiveCapture() ||
+        metalio_nt26_get_call_state() != METALIO_CALL_IDLE)
     {
         write(1, "WAKE_SKIP\n", 10);
         return;
     }
+    // A real wake/manual wake explicitly returns from typing to voice chat.
+    if (TypedChat().active.exchange(false)) ApplyInterruptPreferenceFromNvs();
+    TypedChat().pending.clear();TypedChat().last.clear();
+
+    if (!protocol_ || !boot_ready_ || voice_network_preparing_.load())
+    {
+        // Respond to the real local command now. Only online conversation
+        // waits for protocol setup; the popup can already acknowledge it.
+        pending_boot_wake_.store(true, std::memory_order_release);
+        if (audio_service_)
+            audio_service_->EnableWakeWordDetection(false);
+        if (!chat && !float_ai)
+            SystemChrome_EnsureFloatAi(true);
+        write(1, "BOOT_WAKE_LOCAL\n", 16);
+        return;
+    }
+
+    /* Desktop float AI: paint the card first. Opening UDP/EnableVP on the
+     * same tick as the overlay solid-blues home. */
+    if (!chat && !SystemChrome_FloatAiOpen())
+    {
+        SystemChrome_EnsureFloatAi(true);
+        write(1, "WAKE_FLOAT\n", 11);
+        return;
+    }
+
+    if (!voice_ui_active_)
+    {
+        write(1, "WAKE_ARM_WW\n", 12);
+        voice_ui_desired_ = true;
+        ++voice_ui_epoch_;
+        CancelVoiceUiHardRelease();
+        ApplyVoiceUiStart();
+        if (!voice_ui_active_ && voice_ui_desired_ && boot_ready_ && protocol_)
+            voice_ui_active_ = true;
+        if (!voice_ui_active_)
+        {
+            write(1, "WAKE_NOVUI\n", 11);
+            return;
+        }
+    }
 
     if (wake_connect_inflight_)
     {
+        pending_boot_wake_.store(true, std::memory_order_release);
         write(1, "WAKE_BUSY\n", 10);
         return;
     }
@@ -1222,6 +1838,9 @@ void Application::OnWakeWordDetected()
     if (device_state_ == kDeviceStateIdle)
     {
         aborted_ = false;
+        LocalMusicPlayer::Instance().SetPaused(true);MusicScreen::PauseForVoice();
+        RadioPlayer::Instance().Pause();
+        audio_service_->ResetDecoder();
         audio_service_->EnableWakeWordDetection(false);
         /* EnergyWakeWord has no wake PCM — Encode+Pop blocked the app thread
          * waiting on an empty opus queue and first tap never reached Listening. */
@@ -1256,8 +1875,8 @@ void Application::OnWakeWordDetected()
         {
             protocol_->SendStartListening(listening_mode_);
             audio_service_->SetTtsUplinkGate(false);
-            if (!audio_service_->IsAudioProcessorRunning())
-                audio_service_->EnableVoiceProcessing(true);
+            if (!audio_service_->IsAudioProcessorRunning() && event_group_)
+                xEventGroupSetBits(event_group_, MAIN_EVENT_LISTEN_VP);
         }
         ChatScreen::RefreshDeviceState();
     }
@@ -1290,6 +1909,7 @@ void Application::CompleteWakeFromWorker(bool channel_ok)
         protocol_->ClearOpeningAudioGate();
         if (channel_ok)
             protocol_->CloseAudioChannel();
+        ResumePendingBootWake();
         return;
     }
 
@@ -1297,6 +1917,11 @@ void Application::CompleteWakeFromWorker(bool channel_ok)
     {
         wake_connect_inflight_ = false;
         protocol_->ClearOpeningAudioGate();
+        if (TypedChat().active.load() && !TypedChat().pending.empty()) {
+            TypedChat().pending.clear();
+            if (auto *display=Board::GetInstance().GetDisplay())
+                display->SetChatMessage("system","连接未成功，请检查网络后重新发送");
+        }
         SetDeviceState(kDeviceStateIdle);
         if (voice_ui_active_)
             audio_service_->EnableWakeWordDetection(true);
@@ -1308,7 +1933,8 @@ void Application::CompleteWakeFromWorker(bool channel_ok)
      * the UI stuck on「聆听中」with no greeting and no dialogue. */
     protocol_->ClearOpeningAudioGate();
     wake_connect_inflight_ = false;
-    EnterListeningAfterWake();
+    if (TypedChat().active.load() && !TypedChat().pending.empty()) SendPendingTypedChat();
+    else EnterListeningAfterWake();
 }
 
 void Application::EnterListeningAfterWake()
@@ -1336,7 +1962,7 @@ void Application::EnterListeningAfterWake()
         DeviceStateEventManager::GetInstance().PostStateChangeEvent(
             previous_state, kDeviceStateListening);
         write(1, "LISTEN_ON\n", 10);
-        if (ChatScreen::IsActive())
+        if (ChatScreen::IsForeground())
             ChatScreen::RefreshDeviceState();
     }
 
@@ -1354,11 +1980,11 @@ void Application::EnterListeningAfterWake()
     }
 
     write(1, "WAKE_DET\n", 9);
-    if (!protocol_->SendWakeWordDetected("Hi openvela"))
+    if (!protocol_->SendWakeWordDetected(HI_OPENVELA_PHRASE))
     {
         write(1, "WAKE_DET_RETRY\n", 15);
         usleep(50 * 1000);
-        if (!protocol_->SendWakeWordDetected("Hi openvela"))
+        if (!protocol_->SendWakeWordDetected(HI_OPENVELA_PHRASE))
             write(1, "WAKE_DET_FAIL\n", 14);
         else
             write(1, "WAKE_DET_OK\n", 12);
@@ -1372,16 +1998,8 @@ void Application::EnterListeningAfterWake()
     protocol_->SendStartListening(listening_mode_);
     write(1, "WAKE_TX_OK\n", 11);
 
-    /* Extra settle so Listening header paint finishes before VP Start —
-     * same-tick EnableVP after first WAKE_LISTEN raced LVGL (solid blue).
-     * Do NOT Schedule(std::function) here — that has hung after chat enter. */
-    usleep(350 * 1000);
-    if (audio_service_ && device_state_ == kDeviceStateListening)
-    {
-        write(1, "LISTEN_VP\n", 10);
-        audio_service_->SetTtsUplinkGate(false);
-        audio_service_->EnableVoiceProcessing(true);
-    }
+    if (event_group_)
+        xEventGroupSetBits(event_group_, MAIN_EVENT_LISTEN_VP);
 }
 
 void Application::AbortSpeaking(AbortReason reason)
@@ -1438,7 +2056,8 @@ void Application::SetDeviceState(DeviceState state)
     device_state_ = state;
     DeviceStateEventManager::GetInstance().PostStateChangeEvent(previous_state, state);
 
-    const bool chat_fg = ChatScreen::IsActive();
+    const bool chat_fg = SystemChrome_ChatOwnsAssistantUi();
+    const bool popup_was_open = SystemChrome_FloatAiOpen();
 
     switch (state)
     {
@@ -1446,6 +2065,10 @@ void Application::SetDeviceState(DeviceState state)
     case kDeviceStateIdle:
         wake_connect_inflight_ = false;
         aborted_ = false;
+        float_listen_idle_sec_ = 0;
+        if (!chat_fg && SystemChrome_FloatAiOpen() &&
+            !CameraScreen::IsLookAndSeeMode())
+            SystemChrome_CloseFloatAi();
         if (audio_service_)
         {
             audio_service_->ClearDownlinkPlaybackProtect();
@@ -1459,9 +2082,15 @@ void Application::SetDeviceState(DeviceState state)
         {
             audio_service_->EnableVoiceProcessing(false);
             audio_service_->ResetDecoder();
-            if (voice_ui_active_)
-                audio_service_->EnableWakeWordDetection(true);
-            else
+            /* Skip the arm while the float card is still on the top layer.
+             * EnableWakeWord in the same refresh as that delete solid-blued
+             * the desktop after a stuck「聆听中」session. */
+            EnergyWakeWord::SetDesktopStrict(
+                HomeScreen::IsActive() && !ChatScreen::IsForeground() &&
+                !SystemChrome_FloatAiOpen());
+            if (!skip_idle_wake_arm_ && !popup_was_open)
+                RearmGlobalWakeWord();
+            else if (!CanArmSpokenWake())
             {
                 audio_service_->EnableWakeWordDetection(false);
                 /* Do not ReleaseWakeWordEngine() on Idle: voice-open MCP
@@ -1471,7 +2100,7 @@ void Application::SetDeviceState(DeviceState state)
             }
             /* Wake session ended — Esp upgrade may resume safely. */
             audio_service_->SetWakeWordUpgradeAllowed(true);
-            if (voice_ui_active_ && ChatScreen::IsActive())
+            if (voice_ui_active_ && ChatScreen::IsForeground())
                 ScheduleEspWakeWordUpgrade();
         }
         break;
@@ -1481,9 +2110,18 @@ void Application::SetDeviceState(DeviceState state)
             audio_service_->EnableWakeWordDetection(false);
             /* Arm before hello/UDP so early greeting frames are kept. */
             audio_service_->ArmDownlinkPlaybackProtect();
+            // The wake worker primes TX after the previous media DMA drains.
         }
         break;
     case kDeviceStateListening:
+        if (TypedChat().active.load()) {
+            if (audio_service_) {
+                audio_service_->EnableVoiceProcessing(false);
+                audio_service_->EnableWakeWordDetection(false);
+                audio_service_->DiscardUplinkAudio();
+            }
+            break;
+        }
         /* Do not clear aborted_ here. AbortSpeaking→Listening must keep
          * rejecting leftover assistant TTS text/audio until STT arrives. */
         write(1, "LISTEN_ON\n", 10);
@@ -1494,16 +2132,21 @@ void Application::SetDeviceState(DeviceState state)
             if (previous_state == kDeviceStateSpeaking)
             {
                 audio_service_->ClearDownlinkPlaybackProtect();
-                audio_service_->SetTtsUplinkGate(false);
                 audio_service_->DiscardUplinkAudio();
+                /* Drop leftover TTS before opening the gate. Clearing the
+                 * gate first let echo Opus occupy the send queue and the
+                 * header stayed on「聆听中」. */
+                audio_service_->ResetDecoder();
+                audio_service_->SetTtsUplinkGate(false);
             }
             if (!audio_service_->IsAudioProcessorRunning())
             {
                 write(1, "LISTEN_TX\n", 10);
                 protocol_->SendStartListening(listening_mode_);
                 audio_service_->SetTtsUplinkGate(false);
-                audio_service_->EnableVoiceProcessing(true);
                 audio_service_->EnableWakeWordDetection(false);
+                if (event_group_)
+                    xEventGroupSetBits(event_group_, MAIN_EVENT_LISTEN_VP);
             }
             else
             {
@@ -1520,10 +2163,20 @@ void Application::SetDeviceState(DeviceState state)
              * Realtime keeps input enabled for infrequent barge peeks. */
             audio_service_->SetTtsUplinkGate(true);
             audio_service_->EnableVoiceProcessing(false);
+            if (!TypedChat().active.load() && audio_service_->IsBargeInEnabled() && !audio_service_->HasExclusiveCapture() &&
+                metalio_nt26_get_call_state()==METALIO_CALL_IDLE) {
+                if (auto *c = audio_service_->GetCodec()) c->EnableInput(true);
+            }
+            /* No device AEC here. Realtime would keep the mic DMA reading
+             * during TTS and chop playback on the shared I2S. */
+            if (listening_mode_ == kListeningModeRealtime &&
+                !audio_service_->SupportsDeviceAec())
+                listening_mode_ = kListeningModeAutoStop;
             if (listening_mode_ != kListeningModeRealtime)
             {
                 audio_service_->EnableWakeWordDetection(
-                    voice_ui_active_ && audio_service_->IsAfeWakeWord());
+                    voice_ui_active_ && audio_service_->IsAfeWakeWord() &&
+                    audio_service_->SupportsDeviceAec());
             }
             else
             {
@@ -1550,10 +2203,17 @@ void Application::SetDeviceState(DeviceState state)
     {
         ChatScreen::RefreshDeviceState();
     }
+    if (SystemChrome_FloatAiOpen() &&
+        (state == kDeviceStateConnecting || state == kDeviceStateListening ||
+         state == kDeviceStateSpeaking || state == kDeviceStateIdle))
+    {
+        SystemChrome_FloatAiSyncState();
+    }
 }
 
 void Application::Reboot()
 {
+    ControlCenter_SaveBeforePowerOff();
     write(1, "REBOOT\n", 7);
     ESP_LOGI(TAG, "Rebooting...");
     /* Dim backlight before reset to avoid transitional 花屏; do not
@@ -1575,6 +2235,8 @@ void Application::OnWifiLinkReady()
     Schedule([this]() {
         write(1, "WIFI_UP\n", 8);
         ESP_LOGE(TAG, "OnWifiLinkReady: new STA+DHCP lease");
+        if (protocol_)
+            voice_network_preparing_.store(protocol_->OnNetworkReady());
 
         /* Prefer OTA server_time (Claw4); NTP fills in if OTA has not. */
         if (!has_server_time_)
@@ -1593,6 +2255,13 @@ void Application::OnWifiLinkReady()
         /* Boot OTA already finished (often after DNS failures on the
          * Kconfig SSID). Always re-run CheckVersion so an unbound device
          * can mint the 6-digit xiaozhi.me code on the new network. */
+        // A data-path switch does not invalidate an already bound device.
+        // Keep activation polling from stealing state / bandwidth from the
+        // voice connection while NT26 acquires its new route.
+        Settings binding("wifi", false);
+        if (binding.GetInt("xiaozhi_bound", 0) != 0 && !HasPendingActivation())
+            return;
+
         ESP_LOGE(TAG, "OnWifiLinkReady: forcing OTA recheck for activation");
         StartXiaozhiOtaRecheck();
     });
@@ -1621,7 +2290,7 @@ void Application::StartXiaozhiOtaRecheck()
     pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
 
     pthread_t th;
-    int rc = pthread_create(
+    int rc = hi_task_create_legacy(
         &th, &attr,
         [](void *p) -> void * {
             Application::GetInstance().OtaRecheckWorker(static_cast<Ota *>(p));
@@ -1656,6 +2325,25 @@ void Application::OtaRecheckWorker(Ota *ota)
 
         if (!HasPendingActivation())
         {
+            // Configuration is already persisted. Keep an active dialogue's
+            // protocol alive; replacing it races the wake worker and kills RX.
+            if (protocol_ && (wake_connect_inflight_ ||
+                device_state_ == kDeviceStateConnecting ||
+                device_state_ == kDeviceStateListening ||
+                device_state_ == kDeviceStateSpeaking))
+            {
+                delete ota;
+                return;
+            }
+            if (protocol_ && ota->HasMqttConfig() && protocol_->OnNetworkReady())
+            {
+                boot_ready_ = true;
+                has_server_time_ = ota->HasServerTime();
+                ResumePendingBootWake();
+                if (voice_ui_desired_ || ChatScreen::IsForeground()) SyncVoiceUiSession();
+                delete ota;
+                return;
+            }
             if (protocol_ && protocol_->IsAudioChannelOpened())
                 protocol_->CloseAudioChannel();
             protocol_.reset();
@@ -1664,6 +2352,7 @@ void Application::OtaRecheckWorker(Ota *ota)
                 ESP_LOGW(TAG, "OTA recheck: protocol Start() failed");
             boot_ready_ = true;
             device_state_ = kDeviceStateIdle;
+            ResumePendingBootWake();
             has_server_time_ = ota->HasServerTime();
             if (!has_server_time_)
                 SyncWallClockFromNtp();
@@ -1680,9 +2369,9 @@ void Application::OtaRecheckWorker(Ota *ota)
                 SyncWallClockFromNtp();
             HomeScreen::RefreshStatusBar();
         }
-        if (voice_ui_desired_ || ChatScreen::IsActive())
+        if (voice_ui_desired_ || ChatScreen::IsForeground())
         {
-            if (ChatScreen::IsActive())
+            if (ChatScreen::IsForeground())
                 voice_ui_desired_ = true;
             SyncVoiceUiSession();
         }
@@ -1745,6 +2434,8 @@ bool Application::UpgradeFirmware(Ota &ota, const std::string &url)
 
 void Application::WakeWordInvoke(const std::string &wake_word)
 {
+    if (!CanArmSpokenWake()) return;
+    if (wake_word != HI_OPENVELA_PHRASE) return;
     if (!voice_ui_active_ || !protocol_)
         return;
 
@@ -1762,7 +2453,7 @@ void Application::WakeWordInvoke(const std::string &wake_word)
         }
 
         ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
-        protocol_->SendWakeWordDetected(wake_word);
+        protocol_->SendWakeWordDetected(HI_OPENVELA_PHRASE);
         SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop
                                               : kListeningModeRealtime);
     }
@@ -1801,32 +2492,20 @@ void Application::SendMcpMessage(const std::string &payload)
 
 void Application::SetAecMode(AecMode mode)
 {
-    if (mode != kAecOff && mode != kAecOnDeviceSide)
-    {
-        ESP_LOGW(TAG, "unsupported AecMode %d, fallback Off", static_cast<int>(mode));
-        mode = kAecOff;
-    }
-
-    const bool want_interrupt = (mode == kAecOnDeviceSide);
-    {
-        Settings settings("audio", true);
-        settings.SetBool("interrupt", want_interrupt);
-    }
-    aec_mode_ = mode;
-    audio_service_->EnableDeviceAec(want_interrupt);
-    ESP_LOGI(TAG, "AEC mode=%s", want_interrupt ? "on" : "off");
-
-    Schedule([this, want_interrupt]() {
-        auto *display = Board::GetInstance().GetDisplay();
-        if (display)
-        {
-            if (want_interrupt)
-                display->ShowNotification(Lang::Strings::RTC_MODE_ON);
-            else
-                display->ShowNotification(Lang::Strings::RTC_MODE_OFF);
-        }
-        if (protocol_ && protocol_->IsAudioChannelOpened())
-            protocol_->CloseAudioChannel();
+    if (!audio_service_) return;
+    const bool want_interrupt = mode == kAecOnDeviceSide;
+    const bool actual_aec = want_interrupt && audio_service_->SupportsDeviceAec();
+    if (audio_service_->IsBargeInEnabled() == want_interrupt &&
+        aec_mode_ == (actual_aec ? kAecOnDeviceSide : kAecOff)) return;
+    { Settings settings("audio", true); settings.SetBool("interrupt", want_interrupt); }
+    // Do not pretend that NoAudioProcessor supplies AEC. Barge-in uses the
+    // local gated-microphone path; server listening remains AutoStop.
+    aec_mode_ = actual_aec ? kAecOnDeviceSide : kAecOff;
+    audio_service_->EnableDeviceAec(actual_aec);
+    audio_service_->EnableBargeIn(want_interrupt && !TypedChat().active.load());
+    Schedule([want_interrupt]() {
+        if (auto *display = Board::GetInstance().GetDisplay())
+            display->ShowNotification(want_interrupt ? "打断已开启" : "打断已关闭");
     });
 }
 
@@ -1834,8 +2513,12 @@ void Application::ApplyInterruptPreferenceFromNvs()
 {
     Settings settings("audio");
     const bool interrupt_on = settings.GetBool("interrupt", false);
-    aec_mode_ = interrupt_on ? kAecOnDeviceSide : kAecOff;
-    audio_service_->EnableDeviceAec(interrupt_on);
+    const bool actual_aec = interrupt_on && audio_service_ && audio_service_->SupportsDeviceAec();
+    aec_mode_ = actual_aec ? kAecOnDeviceSide : kAecOff;
+    if (audio_service_) {
+        audio_service_->EnableDeviceAec(actual_aec);
+        audio_service_->EnableBargeIn(interrupt_on && !TypedChat().active.load());
+    }
     ESP_LOGI(TAG, "interrupt preference: %s", interrupt_on ? "on" : "off");
 }
 
@@ -1857,8 +2540,8 @@ void Application::SoftStopVoiceAudioPaths()
         audio_service_->ClearDownlinkPlaybackProtect();
         audio_service_->EnableWakeWordDetection(false);
         audio_service_->EnableVoiceProcessing(false);
-        if (auto *c = audio_service_->GetCodec())
-            c->EnableOutput(false);
+        if (!audio_service_->HasLocalPlaybackSession() && !audio_service_->HasExclusiveCapture())
+            if (auto *c = audio_service_->GetCodec())c->EnableOutput(false);
     }
 }
 
@@ -1931,6 +2614,11 @@ void Application::ScheduleVoiceUiStartRetry(uint32_t epoch)
 
 bool Application::TryEnableWakeWordForVoiceUi()
 {
+    if (!CanArmSpokenWake())
+    {
+        if (audio_service_) audio_service_->EnableWakeWordDetection(false);
+        return true; // User disabled recognition; do not retry indefinitely.
+    }
     if (device_state_ == kDeviceStateConnecting ||
         device_state_ == kDeviceStateListening ||
         device_state_ == kDeviceStateSpeaking)
@@ -1941,8 +2629,16 @@ bool Application::TryEnableWakeWordForVoiceUi()
     if (audio_service_->IsAudioProcessorRunning())
         audio_service_->EnableVoiceProcessing(false);
 
+    /* Idle chat has no TTS. Stale DL protect / ring mute used to eat every
+     * Energy feed (ShouldSuppressWakeWord) so「Hi openvela」never fired. */
+    audio_service_->ClearWakeWordMute();
+    audio_service_->ClearDownlinkPlaybackProtect();
+
     /* Arm Energy immediately; EspWakeWord swaps in after chat paint settles
      * so the first「Hi openvela」works without racing CreateStatic (solid blue). */
+    EnergyWakeWord::SetDesktopStrict(
+        HomeScreen::IsActive() && !ChatScreen::IsForeground() &&
+        !SystemChrome_FloatAiOpen());
     audio_service_->EnableWakeWordDetection(true);
     if (!audio_service_->IsAfeWakeWord())
         ScheduleEspWakeWordUpgrade();
@@ -2013,8 +2709,13 @@ void Application::SetVoiceUiDesired(bool desired)
 
     if (!desired)
     {
+        if (TypedChat().active.exchange(false)) ApplyInterruptPreferenceFromNvs();
+        TypedChat().pending.clear();TypedChat().last.clear();
         voice_ui_active_ = false;
         wake_connect_inflight_ = false;
+        float_listen_idle_sec_ = 0;
+        if (!ChatScreen::IsForeground() && SystemChrome_FloatAiOpen())
+            SystemChrome_CloseFloatAi();
         /* Soft-stop immediately. Do NOT SetDeviceState(Idle) here:
          * Idle→ReleaseWakeWordEngine races LVGL chat→app swaps from
          * voice MCP open (slow / APP_NULL / solid blue). CloseAudioChannel
@@ -2046,6 +2747,19 @@ void Application::RequestVoiceUiDesired(bool desired)
     write(1, desired ? "VUI_REQ1\n" : "VUI_REQ0\n", 9);
     if (event_group_)
         xEventGroupSetBits(event_group_, MAIN_EVENT_VOICE_UI);
+}
+
+bool Application::CanArmSpokenWake() const
+{
+    return IsSpokenWakeEnabled() && audio_service_ &&
+        !audio_service_->HasExclusiveCapture() &&
+        metalio_nt26_get_call_state() == METALIO_CALL_IDLE;
+}
+
+void Application::RequestSpokenWakeEnabled(bool enabled)
+{
+    spoken_wake_enabled_.store(enabled, std::memory_order_release);
+    if (event_group_) xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_PREFERENCE);
 }
 
 void Application::ParkVoiceUiProtocol()
@@ -2092,8 +2806,12 @@ void Application::SyncVoiceUiSession()
 void Application::ApplyVoiceUiStart()
 {
     write(1, "VUI_AS0\n", 8);
-    /* Stale flag from a hung prior wake would block OnWakeWordDetected. */
-    wake_connect_inflight_ = false;
+    /* Do not clear wake_connect_inflight_ during Connecting — chat VUI
+     * re-arm used to drop the flag and leave the header on「连接中」. */
+    if (device_state_ != kDeviceStateConnecting &&
+        device_state_ != kDeviceStateListening &&
+        device_state_ != kDeviceStateSpeaking)
+        wake_connect_inflight_ = false;
 
     if (!voice_ui_desired_)
     {
@@ -2174,13 +2892,39 @@ void Application::ApplyVoiceUiStop()
 {
     wake_connect_inflight_ = false;
     voice_ui_active_ = false;
+    float_listen_idle_sec_ = 0;
+    const bool popup_was_open = SystemChrome_FloatAiOpen();
+    if (!ChatScreen::IsForeground() && popup_was_open)
+        SystemChrome_CloseFloatAi();
     /* Soft teardown only — keep EnergyWakeWord initialized so chat re-enter
      * does not re-allocate and blue-screen the LVGL heap. */
     TearDownVoiceAudioPaths(false);
     ParkVoiceUiProtocol();
-    SoftStopVoiceAudioPaths();
+    // This delayed cleanup belongs to the closed conversation, not to the
+    // global recognizer. Do not stop it again after Idle has re-armed it.
+    // If a popup was just deleted, the quiet clock tick re-arms it instead.
+    if (!popup_was_open) RearmGlobalWakeWord();
     write(1, "VUI_STOP\n", 9);
     ESP_LOGI(TAG, "ApplyVoiceUiStop: voice paths parked (WW kept)");
+}
+
+void Application::RearmGlobalWakeWord()
+{
+    // Page-independent local recognition. Reuse the warm engine only; never
+    // construct a model, reopen the cloud or renegotiate audio on a UI swap.
+    if (device_state_ != kDeviceStateIdle || !CanArmSpokenWake() ||
+        wake_connect_inflight_ || skip_idle_wake_arm_ ||
+        SystemChrome_FloatAiOpen() || !audio_service_->IsWakeWordEngineReady() ||
+        audio_service_->HasLocalPlaybackSession() ||
+        RadioPlayer::Instance().want_play() || audio_service_->HasPendingPlayback() ||
+        McpServer::GetInstance().IsVisionAnalysisPending()) return;
+    EnergyWakeWord::SetDesktopStrict(
+        HomeScreen::IsActive() && !ChatScreen::IsForeground());
+    if (audio_service_->IsAudioProcessorRunning())
+        audio_service_->EnableVoiceProcessing(false);
+    audio_service_->SetTtsUplinkGate(false);
+    audio_service_->ClearDownlinkPlaybackProtect();
+    audio_service_->EnableWakeWordDetection(true);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2189,6 +2933,7 @@ void Application::ApplyVoiceUiStop()
 
 void Application::InitializeXiaozhiProtocol(Ota &ota)
 {
+    const auto protocol_generation = ++protocol_generation_;
     if (ota.HasMqttConfig())
     {
         ESP_LOGI(TAG, "Using MQTT protocol from xiaozhi.me OTA config");
@@ -2205,7 +2950,33 @@ void Application::InitializeXiaozhiProtocol(Ota &ota)
         protocol_ = std::make_unique<MqttProtocol>();
     }
 
-    protocol_->OnConnected([this]() { DismissAlert(); });
+    protocol_->OnConnected([this, protocol_generation]() {
+        // Match OnDisconnected's event-loop ownership. A fast reconnect can
+        // otherwise clear preparing here before the old disconnect's queued
+        // task runs, which sets it back forever despite a live new socket.
+        Schedule([this, protocol_generation]() {
+            if (protocol_generation_.load() != protocol_generation) return;
+            voice_network_preparing_.store(false);
+            DismissAlert();
+            ResumePendingBootWake();
+        });
+    });
+    protocol_->OnDisconnected([this, protocol_generation]() {
+        Schedule([this, protocol_generation]() {
+            if (protocol_generation_.load() != protocol_generation) return;
+            voice_network_preparing_.store(true);
+            if (device_state_ == kDeviceStateListening ||
+                device_state_ == kDeviceStateSpeaking ||
+                device_state_ == kDeviceStateConnecting)
+            {
+                // Retain a real wake that arrived during network preparation.
+                if (!TypedChat().active.load() && wake_connect_inflight_ && device_state_ == kDeviceStateConnecting)
+                    pending_boot_wake_.store(true, std::memory_order_release);
+                // A disconnected cloud socket must not leave a live-listen UI.
+                SetDeviceState(kDeviceStateIdle);
+            }
+        });
+    });
     protocol_->OnNetworkError([this](const std::string &message) {
         last_error_message_ = message;
         if (event_group_)
@@ -2262,13 +3033,20 @@ void Application::InitializeXiaozhiProtocol(Ota &ota)
             device_state_ == kDeviceStateConnecting)
         {
             auto *type = cJSON_GetObjectItem(root, "type");
-            if (!cJSON_IsString(type) ||
+            if (cJSON_IsString(type) &&
+                strcmp(type->valuestring, "hello") == 0)
+            {
+                /* Server hello must reach the MQTT waiter — skipping it
+                 * left the chat header on「连接中」until timeout. */
+            }
+            else if (!cJSON_IsString(type) ||
                 strcmp(type->valuestring, "mcp") != 0)
             {
                 write(1, "JSON_SKIP\n", 10);
                 return;
             }
-            write(1, "JSON_MCP\n", 9);
+            else
+                write(1, "JSON_MCP\n", 9);
         }
         if (!EnqueueXiaozhiJson(root))
             write(1, "JSON_DROP\n", 10);
@@ -2337,16 +3115,22 @@ void Application::DrainXiaozhiJsonQueue()
 void Application::FinishTtsStop()
 {
     tts_stop_pending_ = false;
-    if (audio_service_)
-    {
-        audio_service_->ClearDownlinkPlaybackProtect();
-        audio_service_->SetTtsUplinkGate(false);
-    }
     if (device_state_ != kDeviceStateSpeaking)
+    {
+        /* Late tts/stop outside Speaking: drop the gate. The Speaking →
+         * Listening handoff clears it only after the decoder is reset. */
+        if (audio_service_)
+        {
+            audio_service_->ClearDownlinkPlaybackProtect();
+            audio_service_->SetTtsUplinkGate(false);
+        }
         return;
+    }
+    if (audio_service_)
+        audio_service_->ClearDownlinkPlaybackProtect();
     /* Match Claw4 tts/stop: ManualStop → Idle「待唤醒」; otherwise Listening
      * so「聆听中」returns after「讲话中」. Left-chat still parks Idle. */
-    if (listening_mode_ == kListeningModeManualStop ||
+    if (TypedChat().active.load() || listening_mode_ == kListeningModeManualStop ||
         voice_ui_request_.load(std::memory_order_acquire) == 0)
         SetDeviceState(kDeviceStateIdle);
     else
@@ -2375,6 +3159,8 @@ void Application::HandleIncomingXiaozhiJson(Display *display, const cJSON *root)
              * barges in locally; uplink stays muted until Listening. */
             if (audio_service_)
             {
+                if (!audio_service_->HasPendingPlayback())
+                    audio_service_->BeginWakeGreetingPlayback();
                 audio_service_->SetTtsUplinkGate(true);
                 audio_service_->ArmDownlinkPlaybackProtect();
                 /* Prime TX early — waiting for first PCM to EnableOutput
@@ -2392,6 +3178,8 @@ void Application::HandleIncomingXiaozhiJson(Display *display, const cJSON *root)
         else if (strcmp(state->valuestring, "stop") == 0)
         {
             write(1, "TTS_STOP\n", 9);
+            if (audio_service_ && !aborted_)
+                audio_service_->NotifyTtsStreamEnded();
             if (device_state_ == kDeviceStateSpeaking)
             {
                 /* PCM may still be draining; clearing protect/gate here
@@ -2406,7 +3194,7 @@ void Application::HandleIncomingXiaozhiJson(Display *display, const cJSON *root)
                     FinishTtsStop();
                 }
             }
-            else if (device_state_ == kDeviceStateListening && audio_service_ &&
+            else if (!TypedChat().active.load() && device_state_ == kDeviceStateListening && audio_service_ &&
                      protocol_ && !aborted_ &&
                      voice_ui_request_.load(std::memory_order_acquire) != 0)
             {
@@ -2415,8 +3203,8 @@ void Application::HandleIncomingXiaozhiJson(Display *display, const cJSON *root)
                 write(1, "LISTEN_TX\n", 10);
                 protocol_->SendStartListening(listening_mode_);
                 audio_service_->SetTtsUplinkGate(false);
-                if (!audio_service_->IsAudioProcessorRunning())
-                    audio_service_->EnableVoiceProcessing(true);
+                if (!audio_service_->IsAudioProcessorRunning() && event_group_)
+                    xEventGroupSetBits(event_group_, MAIN_EVENT_LISTEN_VP);
             }
         }
         else if (strcmp(state->valuestring, "sentence_start") == 0)
@@ -2467,12 +3255,18 @@ void Application::HandleIncomingXiaozhiJson(Display *display, const cJSON *root)
             aborted_ = false;
             write(1, "STT_OK\n", 7);
             ESP_LOGE(TAG, ">> %s", text->valuestring);
-            display->SetChatMessage("user", text->valuestring);
+            const std::string command_text =
+                ChatLocalCmd_NormalizeVisionOpenCommand(text->valuestring);
+            const bool typed_echo=TypedChat().active.load() && TypedChat().last==text->valuestring;
+            if (!typed_echo) display->SetChatMessage("user", command_text.c_str());
+            if (typed_echo) TypedChat().last.clear();
 
             /* Local device control (音量/背光/蓝牙/开应用) — do not wait
              * for cloud MCP. Abort cloud TTS for this turn if handled. */
-            if (ChatScreen::IsActive() &&
-                ChatLocalCmd_TryHandle(text->valuestring))
+            if ((ChatScreen::IsForeground() || SystemChrome_FloatAiOpen() ||
+                 DigitalPeopleScreen::IsActive() ||
+                 DigitalPeopleScreen::IsForeground()) &&
+                ChatLocalCmd_TryHandle(command_text))
             {
                 write(1, "LOC_CMD\n", 8);
                 aborted_ = true;
@@ -2483,7 +3277,7 @@ void Application::HandleIncomingXiaozhiJson(Display *display, const cJSON *root)
     else if (strcmp(type->valuestring, "llm") == 0)
     {
         /* Chat text mode: skip emotion widget updates (wake blue). */
-        if (ChatScreen::IsActive())
+        if (ChatScreen::IsForeground())
             return;
         auto emotion = cJSON_GetObjectItem(root, "emotion");
         if (cJSON_IsString(emotion) && display)
@@ -2535,11 +3329,9 @@ void Application::HandleIncomingXiaozhiJson(Display *display, const cJSON *root)
 /* OTA / version check loop                                            */
 /* ------------------------------------------------------------------ */
 
-static bool Eth0HasIpv4()
+static bool ActiveNetworkHasIpv4()
 {
-    struct in_addr addr;
-    memset(&addr, 0, sizeof(addr));
-    return netlib_get_ipv4addr("eth0", &addr) == 0 && addr.s_addr != 0;
+    return NetworkService::Available();
 }
 
 void Application::CheckNewVersion(Ota &ota)
@@ -2548,26 +3340,33 @@ void Application::CheckNewVersion(Ota &ota)
     int retry_count = 0;
     int retry_delay = 10;
 
+    Settings wifi_settings("wifi", false);
+    const bool cached_bound = wifi_settings.GetInt("xiaozhi_bound", 0) != 0;
+    const bool silent = ota_check_silent_ ||
+        (boot_ready_ && cached_bound && !HasPendingActivation());
+
     auto &board = Board::GetInstance();
     while (true)
     {
-        SetDeviceState(kDeviceStateActivating);
+        if (!silent)
+            SetDeviceState(kDeviceStateActivating);
         auto *display = board.GetDisplay();
-        if (display)
+        if (display && !silent)
             display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
 
         /* Boot often starts OTA before STA/DHCP succeeds (Kconfig SSID
          * timeout). Wait for an address — or a UI WiFi connect poke —
          * otherwise getaddrinfo(api.tenclass.net) fails and the 6-digit
          * code never appears. */
-        if (!Eth0HasIpv4())
+        if (!ActiveNetworkHasIpv4())
         {
-            ESP_LOGE(TAG, "CheckNewVersion: waiting for eth0 IPv4…");
+            ESP_LOGE(TAG, "CheckNewVersion: waiting for active network IPv4…");
             write(1, "OTA_WAIT_IP\n", 12);
             bool have_ip = false;
-            for (int i = 0; i < 180; ++i)
+            const int max_wait = (cached_bound || silent) ? 150 : 180;
+            for (int i = 0; i < max_wait; ++i)
             {
-                if (Eth0HasIpv4())
+                if (ActiveNetworkHasIpv4())
                 {
                     have_ip = true;
                     break;
@@ -2576,13 +3375,16 @@ void Application::CheckNewVersion(Ota &ota)
                 {
                     wifi_recheck_requested_ = false;
                     ESP_LOGE(TAG, "CheckNewVersion: WiFi poke while waiting for IP");
-                    if (Eth0HasIpv4())
+                    if (ActiveNetworkHasIpv4())
                         have_ip = true;
                     break;
                 }
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (cached_bound || silent)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                else
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
             }
-            if (!have_ip && !Eth0HasIpv4())
+            if (!have_ip && !ActiveNetworkHasIpv4())
             {
                 ESP_LOGW(TAG, "CheckNewVersion: still no IP, trying OTA anyway");
             }
@@ -2591,12 +3393,13 @@ void Application::CheckNewVersion(Ota &ota)
                 char ipbuf[32] = {};
                 struct in_addr addr;
                 memset(&addr, 0, sizeof(addr));
-                if (netlib_get_ipv4addr("eth0", &addr) == 0)
+                if (netlib_get_ipv4addr(metalio_dual_network_path() == 1 ? "eth1" : "eth0", &addr) == 0)
                     snprintf(ipbuf, sizeof(ipbuf), "%s", inet_ntoa(addr));
-                ESP_LOGE(TAG, "CheckNewVersion: eth0 up ip=%s", ipbuf);
+                ESP_LOGE(TAG, "CheckNewVersion: active network ip=%s", ipbuf);
                 write(1, "OTA_HAVE_IP\n", 12);
                 /* Brief settle so DNS nameserver from DHCP is usable. */
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                const int settle_ms = (cached_bound || silent) ? 80 : 500;
+                std::this_thread::sleep_for(std::chrono::milliseconds(settle_ms));
             }
         }
 

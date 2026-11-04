@@ -16,7 +16,13 @@
 #include <stdint.h>
 
 #include <metalio/metalio.h>
+#ifdef CONFIG_ESPRESSIF_MIPI_DSI
+#include "espressif/esp_mipi_dsi.h"
+#endif
 
+#ifdef CONFIG_METALIO_FLASH32
+#include "kvflash32.inc"
+#else
 /* ROM SPI flash — already linked; avoid pulling esp-hal headers into board. */
 typedef enum
 {
@@ -34,9 +40,12 @@ esp_rom_spiflash_result_t esp_rom_spiflash_read(uint32_t src_addr,
                                                 uint32_t *dest,
                                                 int32_t len);
 
-/* 32 MiB flash: keep clear of nuttx.bin at 0x2000 (~8 MiB used). */
+/* Keep settings below the ROM's 24-bit addressing boundary and beyond the
+ * firmware's enforced 0x00fe0000 end limit. On this early P4 ROM, the old
+ * 0x01f00000 access aliases 0x00f00000, which the current image now occupies.
+ * The host installer migrates the checksummed MIO1 blob before this update. */
 #ifndef METALIO_KVFLASH_ADDR
-#  define METALIO_KVFLASH_ADDR  0x01f00000u
+#  define METALIO_KVFLASH_ADDR  0x00ff0000u
 #endif
 
 #ifndef METALIO_KVFLASH_SIZE
@@ -144,6 +153,10 @@ int metalio_kvflash_write(FAR const void *buf, size_t len)
     }
 
   sector_num = METALIO_KVFLASH_ADDR / METALIO_KVFLASH_SIZE;
+#ifdef CONFIG_ESPRESSIF_MIPI_DSI
+  int guard = esp_mipi_dsi_begin_flash();
+  if (guard < 0) return guard;
+#endif
 
   flags = up_irq_save();
   (void)esp_rom_spiflash_unlock();
@@ -156,6 +169,9 @@ int metalio_kvflash_write(FAR const void *buf, size_t len)
     }
 
   up_irq_restore(flags);
+#ifdef CONFIG_ESPRESSIF_MIPI_DSI
+  esp_mipi_dsi_end_flash();
+#endif
 
   if (rr != ESP_ROM_SPIFLASH_RESULT_OK)
     {
@@ -167,3 +183,5 @@ int metalio_kvflash_write(FAR const void *buf, size_t len)
          (unsigned)len, (unsigned)METALIO_KVFLASH_ADDR);
   return OK;
 }
+
+#endif /* CONFIG_METALIO_FLASH32 */

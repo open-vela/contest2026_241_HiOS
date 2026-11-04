@@ -132,7 +132,7 @@ CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_IO_ROOT)/include
 CXXFLAGS += -I$(APPDIR)/metalio/$(GMF_IO_ROOT)/http_lib/gzip/include
 CXXFLAGS += -I$(TOPDIR)/arch/risc-v/src/esp32p4/esp-hal-3rdparty/components/esp_rom/esp32p4
 
-# ------ NuttX HTTP adapter -------------------------------------------------
+# ------ NuttX HTTP adapter (plain HTTP + mbedTLS client for HTTPS) ---------
 CSRCS += $(GMF_HTTP_ADAPTER)/nuttx_http_adapter.c
 
 # ------ gmf_io core elements ----------------------------------------------
@@ -444,6 +444,7 @@ CXXFLAGS += -I$(APPDIR)/metalio/$(EAC_ROOT)/include/simple_dec
 CSRCS += $(EAC_ROOT)/src/audio_decoder_reg.c
 CSRCS += $(EAC_ROOT)/src/audio_encoder_reg.c
 CSRCS += $(EAC_ROOT)/src/simple_decoder_reg.c
+CSRCS += $(GMF_SHIMS)/esp_chip_info_stub.c
 
 # Prebuilt chip-specific archives (RV32 IMAC). Final nuttx link only
 # auto-picks apps/staging/*.a — symlink required archives there.
@@ -457,6 +458,7 @@ EXTRA_LIBPATHS += -L$(EAC_LIBDIR)
 EXTRA_LIBS     += -lesp_audio_codec -lesp_audio_simple_dec
 
 VPATH += :audio/esp-gmf/components/esp_audio_codec/src
+VPATH += :audio/esp-gmf/nuttx_shims
 
 CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable
 CFLAGS += -Wno-format -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-undef

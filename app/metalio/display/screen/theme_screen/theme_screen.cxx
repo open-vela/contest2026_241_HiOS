@@ -243,11 +243,13 @@ void OnConfirmClicked(lv_event_t * /*e*/)
     ThemeManager::SetCurrentThemeId(target);
     s_ui.current_theme = target;
     HomeScreen::ResetToFirstPage();
+    HomeScreen::ApplyCurrentTheme();
     GoHomeWithCurrentTheme();
 }
 
 void GoHomeWithCurrentTheme()
-{    HomeScreen::SwitchToHome();
+{
+    HomeScreen::SwitchToHome();
 }
 
 void OpenConfirmDialog(int theme_id)

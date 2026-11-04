@@ -1,56 +1,60 @@
+#include "hi_task_policy.h"
 /*
- * SPDX-FileCopyrightText: 2024 openvela port
+ * SPDX-FileCopyrightText: 2026 openvela port
  * SPDX-License-Identifier: Apache-2.0
  *
- * RadioPlayer — rewritten for stable playback on ESP32-P4 / NuttX.
- *
- * Design goals vs the previous state machine:
- *   - One session thread owns HLS create/run/destroy
- *   - One PCM drain thread writes fixed 960-sample chunks every ~55 ms
- *     (same pacing as TTS — avoids starving display GDMA / blue screen)
- *   - No dedicated spectrum thread; bands updated from the drain path
- *   - Flat flags (want_play / leave) instead of Starting/Stopping/zombie
- *
- * Pipeline: progressive HTTP MP3 → esp_audio_simple_player + HTTP IO
- *           → OutCallback → 16 kHz mono ring → PcmDrain → /dev/audio/pcm0
- * Soft-start: open I2S only after first PCM; fade-in; fail-once on error.
+ * Internet radio: HTTP/HTTPS HLS (m3u8) or progressive MP3 via GMF, PCM played
+ * through AudioService (never open /dev/audio/pcm0 — that raced LCDC).
+ * HLS ring is sized for one CNR TS segment, not the upstream 600 KB default.
  */
 
 #include "radio_player.h"
+#include "radio_connect_policy.h"
+#include "app_dns.h"
 
 #include "application.h"
 #include "audio_service.h"
+#include "bluetooth_screen/bluetooth_screen.h"
+#include "settings.h"
 #include "esp_audio_simple_player.h"
 #include "esp_audio_simple_player_advance.h"
+#include "esp_gmf_audio_dec.h"
+#include "esp_gmf_info.h"
 #include "esp_gmf_io_http.h"
 #include "esp_gmf_obj.h"
+#include "esp_gmf_pipeline.h"
+#include "esp_gmf_pool.h"
+#include "esp_gmf_io.h"
+#include "esp_gmf_new_databus.h"
+#include "esp_hls_io.h"
+#include "esp_http_client.h"
 #include "esp_log_shim.h"
 #include "media_lib_adapter.h"
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
-#include <climits>
-#include <cstdint>
 #include <cstring>
-#include <errno.h>
-#include <fcntl.h>
 #include <mutex>
+#include <memory>
+#include <cstdlib>
 #include <pthread.h>
 #include <strings.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
-#include <vector>
-#include <nuttx/audio/audio.h>
+#include <pthread.h>
+#include <sched.h>
 
 namespace {
 
-constexpr size_t kPlayStack = 48 * 1024;
-constexpr size_t kDrainStack = 16 * 1024;
-constexpr size_t kPcmRingSize = 4096;
-constexpr size_t kI2sChunkSamples = 960;
+constexpr size_t kPlayStack = 28 * 1024;
+constexpr size_t kDrainStack = 8 * 1024;
+constexpr size_t kHttpStack = 12 * 1024;
+constexpr size_t kHlsStack = 12 * 1024;
+constexpr size_t kPlayerStack = 16 * 1024;
+constexpr size_t kHlsBuf = 300 * 1024;
+constexpr size_t kPcmRingSize = 384000; // 24 seconds at 16 kHz, allocated on demand
+constexpr size_t kOutChunk = 960;
 constexpr int kDecodeBlockFrames = 256;
-constexpr int kBarCount = RadioPlayer::kBandCount;
-constexpr int kRadioSampleRate = RadioPlayer::kSampleRate;
 
 std::atomic<int> s_station_index{kDefaultRadioStationIndex};
 std::atomic<int> s_status{static_cast<int>(RadioStatus::Idle)};
@@ -62,19 +66,32 @@ std::atomic<bool> s_media_lib_ready{false};
 std::atomic<bool> s_audio_occupied{false};
 std::atomic<int> s_pcm_channels{2};
 std::atomic<int> s_pcm_sample_rate{44100};
-std::atomic<int> s_volume{70};
-std::atomic<bool> s_asp_stop_busy{false};
-/* Soft-start: ramp PCM gain after OpenTx to avoid DAC crack → blue. */
-std::atomic<int> s_fade_left{0};
-std::atomic<bool> s_tx_armed{false};
+std::atomic<bool> s_need_reopen{false};
+// Control requests and asynchronous player events share this short state lock.
+// Never hold it while stopping/joining a player or waiting for PCM capacity.
+std::mutex s_request_mu;
+std::atomic<uint32_t> s_request_id{1};
+std::atomic<uint32_t> s_active_id{0};
+std::atomic<bool> s_attempt_failed{false};
+std::atomic<uint32_t> s_last_submit_ms{0};
+std::atomic<uint32_t> s_attempt_start_ms{0}, s_last_decode_ms{0};
+std::atomic<int> s_attempt_network{-1};
 
-int s_tx_fd = -1;
-std::mutex s_tx_mu;
-std::vector<int32_t> s_tx_scratch;
-std::atomic<bool> s_tx_logged{false};
+uint32_t RadioMonotonicMs()
+{
+    return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+bool CurrentAttempt(uint32_t id)
+{
+    return id != 0 && id == s_request_id.load() && id == s_active_id.load() &&
+           s_want_play.load() && !s_leave.load();
+}
+std::atomic<uint32_t> s_hls_format{0};
 
 std::mutex s_bar_mu;
-uint8_t s_bar_levels[kBarCount] = {};
+uint8_t s_bar_levels[RadioPlayer::kBandCount] = {};
 
 pthread_t s_drain_thread{};
 bool s_drain_joinable = false;
@@ -83,18 +100,66 @@ std::atomic<bool> s_drain_run{false};
 esp_asp_handle_t s_player = nullptr;
 
 struct PcmRing {
-    int16_t buf[kPcmRingSize];
+    int16_t *buf = nullptr; // process-lifetime reusable playback allocation
+    uint32_t epoch = 0; // Changes on every reset, including same-station retries.
+    bool buffering = true;
+    size_t start_threshold = 160000; // two HLS segments plus render/network jitter
+    size_t rebuffer_threshold = 192000;
     size_t head = 0;
     size_t tail = 0;
     size_t count = 0;
 };
 PcmRing s_pcm = {};
+std::atomic<bool> s_segmented{true};
 std::mutex s_pcm_mu;
+#ifdef HI_STABILITY_PROBE
+std::atomic<uint32_t> s_probe_produced{0},s_probe_submitted{0},s_probe_rebuffer{0};
+#endif
 
-OpusResampler s_resampler;
+// Keep interpolation phase across decoder blocks. Resetting at each 256
+// input samples drops the fractional remainder and introduces periodic gaps.
+class RadioResampler {
+public:
+    void Configure(int input_rate, int output_rate) {
+        input_rate_ = input_rate; output_rate_ = output_rate;
+        phase_ = 0; have_previous_ = false;
+    }
+    // Fixed output. The old vector grew on every decoder block and stalled
+    // the panel allocator; a missed scan is a solid blue frame.
+    size_t Process(const int16_t *input, size_t count, int16_t *output, size_t cap) {
+        size_t n = 0;
+        if (output == nullptr || cap == 0 || input_rate_ <= 0 || output_rate_ <= 0)
+            return 0;
+        for (size_t i = 0; i < count && n < cap; ++i) {
+            const int32_t current = input[i];
+            if (!have_previous_) {
+                output[n++] = static_cast<int16_t>(current);
+                previous_ = current; have_previous_ = true; phase_ = input_rate_;
+                continue;
+            }
+            while (phase_ <= output_rate_ && n < cap) {
+                const int64_t value = static_cast<int64_t>(previous_) * output_rate_ +
+                    static_cast<int64_t>(current - previous_) * phase_;
+                output[n++] = static_cast<int16_t>(value / output_rate_);
+                phase_ += input_rate_;
+            }
+            phase_ -= output_rate_;
+            previous_ = current;
+        }
+        return n;
+    }
+private:
+    int input_rate_ = 16000, output_rate_ = 16000;
+    int64_t phase_ = 0;
+    int32_t previous_ = 0;
+    bool have_previous_ = false;
+};
+RadioResampler s_resampler;
 std::atomic<int> s_resampler_rate{0};
-std::vector<int16_t> s_mono_buf;
-std::vector<int16_t> s_resampled_buf;
+// One decoder callback at a time. 6x covers an 8 kHz stream at 16 kHz out.
+constexpr size_t kResampleCap = static_cast<size_t>(kDecodeBlockFrames) * 6;
+int16_t s_mono_buf[kDecodeBlockFrames];
+int16_t s_resampled_buf[kResampleCap];
 
 void SetStatus(RadioStatus kind)
 {
@@ -103,9 +168,8 @@ void SetStatus(RadioStatus kind)
 
 int ClampStationIndex(int idx)
 {
-    if (idx < 0 || idx >= static_cast<int>(kRadioStationCount)) {
+    if (idx < 0 || idx >= static_cast<int>(kRadioStationCount))
         return kDefaultRadioStationIndex;
-    }
     return idx;
 }
 
@@ -114,31 +178,55 @@ const RadioStation &StationAt(int idx)
     return kRadioStations[static_cast<size_t>(ClampStationIndex(idx))];
 }
 
-bool SpawnThread(pthread_t *out, void *(*entry)(void *), void *arg,
-                 size_t stack_bytes)
+bool SpawnThread(pthread_t *out, void *(*entry)(void *), void *arg, size_t stack)
 {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, stack_bytes);
+    pthread_attr_setstacksize(&attr, stack);
     pthread_t th = 0;
-    const int rc = pthread_create(&th, &attr, entry, arg);
+    const int rc = hi_task_create_legacy(&th, &attr, entry, arg);
     pthread_attr_destroy(&attr);
-    if (rc != 0) {
+    if (rc != 0)
         return false;
-    }
-    if (out != nullptr) {
+    if (out != nullptr)
         *out = th;
-    } else {
+    else
         pthread_detach(th);
-    }
     return true;
+}
+
+// Persist outside LVGL so flash writes do not block touch callbacks.
+std::atomic<bool> s_station_save_running{false};
+std::atomic<int> s_station_saved{-1};
+void SaveStationAsync();
+void *SaveStationEntry(void *)
+{
+    int index;
+    do {
+        index = s_station_index.load();
+        Settings settings("radio", true);
+        settings.SetString("last_station", StationAt(index).name);
+        s_station_saved.store(index);
+    } while (index != s_station_index.load());
+    s_station_save_running.store(false);
+    if (s_station_saved.load() != s_station_index.load()) SaveStationAsync();
+    return nullptr;
+}
+void SaveStationAsync()
+{
+    if (s_station_saved.load() == s_station_index.load()) return;
+    bool expected = false;
+    if (!s_station_save_running.compare_exchange_strong(expected, true)) return;
+    if (!SpawnThread(nullptr, SaveStationEntry, nullptr, 8192)) {
+        s_station_save_running.store(false);
+        write(1, "RADIO_SAVE_DEFERRED\n", 20);
+    }
 }
 
 void JoinThread(pthread_t *th, bool *joinable)
 {
-    if (th == nullptr || joinable == nullptr || !*joinable) {
+    if (th == nullptr || joinable == nullptr || !*joinable)
         return;
-    }
     pthread_join(*th, nullptr);
     *joinable = false;
     *th = {};
@@ -152,14 +240,12 @@ void ClearBars()
 
 void UpdateBandsFromPcm(const int16_t *samples, size_t n)
 {
-    if (samples == nullptr || n == 0) {
+    if (samples == nullptr || n == 0)
         return;
-    }
-    /* Time-domain energy bands: split the chunk into 12 slices. Cheap,
-     * no extra thread, enough motion for the visualizer. */
-    uint8_t levels[kBarCount];
-    const size_t slice = std::max<size_t>(1, n / static_cast<size_t>(kBarCount));
-    for (int b = 0; b < kBarCount; ++b) {
+    uint8_t levels[RadioPlayer::kBandCount];
+    const size_t slice =
+        std::max<size_t>(1, n / static_cast<size_t>(RadioPlayer::kBandCount));
+    for (int b = 0; b < RadioPlayer::kBandCount; ++b) {
         const size_t begin = static_cast<size_t>(b) * slice;
         if (begin >= n) {
             levels[b] = 0;
@@ -171,52 +257,70 @@ void UpdateBandsFromPcm(const int16_t *samples, size_t n)
             const int v = samples[i];
             acc += static_cast<uint64_t>(v < 0 ? -v : v);
         }
-        const size_t count = end - begin;
-        const uint32_t mean =
-            count > 0 ? static_cast<uint32_t>(acc / count) : 0;
-        /* Map ~0..8000 toward 0..255 with mild boost on lower bars. */
+        uint32_t mean =
+            (end > begin) ? static_cast<uint32_t>(acc / (end - begin)) : 0;
         uint32_t scaled = (mean * 255u) / 6000u;
-        if (b < 4) {
-            scaled = (scaled * 5u) / 4u;
-        }
-        if (scaled > 255u) {
+        if (scaled > 255u)
             scaled = 255u;
-        }
         levels[b] = static_cast<uint8_t>(scaled);
     }
-
     std::lock_guard<std::mutex> lock(s_bar_mu);
-    for (int i = 0; i < kBarCount; ++i) {
-        const int prev = s_bar_levels[i];
-        const int next = levels[i];
-        /* Attack fast / release slow so bars stay readable at 55 ms cadence. */
-        s_bar_levels[i] = static_cast<uint8_t>(
-            next >= prev ? prev + (next - prev + 1) / 2
-                         : prev - (prev - next + 3) / 4);
-    }
+    std::memcpy(s_bar_levels, levels, sizeof(s_bar_levels));
 }
 
-void PushPcm(const int16_t *samples, size_t n)
+void PushPcm(const int16_t *samples, size_t n, uint32_t id)
 {
-    if (samples == nullptr || n == 0) {
+    if (samples == nullptr || n == 0)
         return;
-    }
-    std::lock_guard<std::mutex> lock(s_pcm_mu);
-    for (size_t i = 0; i < n; ++i) {
-        s_pcm.buf[s_pcm.head] = samples[i];
-        s_pcm.head = (s_pcm.head + 1) % kPcmRingSize;
-        if (s_pcm.count < kPcmRingSize) {
-            s_pcm.count++;
-        } else {
-            s_pcm.tail = (s_pcm.tail + 1) % kPcmRingSize;
+    size_t i = 0;
+    while (i < n) {
+        if (!CurrentAttempt(id))
+            return;
+        {
+            std::lock_guard<std::mutex> lock(s_pcm_mu);
+            // Cancellation can happen between the first check and this lock.
+            // Never insert an old station's last block after ClearPcm().
+            if (!CurrentAttempt(id)) return;
+            if (!s_pcm.buf) return;
+            const size_t previous = i;
+            while (i < n && s_pcm.count < kPcmRingSize) {
+                s_pcm.buf[s_pcm.head] = samples[i++];
+                s_pcm.head = (s_pcm.head + 1) % kPcmRingSize;
+                s_pcm.count++;
+#ifdef HI_STABILITY_PROBE
+                ++s_probe_produced;
+#endif
+            }
+            if (i != previous) s_last_decode_ms.store(RadioMonotonicMs());
+            if (i >= n)
+                return;
         }
+        usleep(4000);
     }
 }
 
-size_t PopPcm(int16_t *out, size_t n)
+size_t PopPcm(int16_t *out, size_t n, uint32_t &epoch)
 {
     std::lock_guard<std::mutex> lock(s_pcm_mu);
-    const size_t to_read = (s_pcm.count < n) ? s_pcm.count : n;
+    epoch = s_pcm.epoch;
+    if (!s_pcm.buf) return 0;
+    if (s_pcm.buffering) {
+        if (s_pcm.count < s_pcm.start_threshold) return 0;
+        s_pcm.buffering = false;
+    }
+    // Queue capacity is measured in frames, so never fill it with tiny
+    // decoder fragments. Leave a partial frame here until it is complete.
+    if (s_pcm.count < n) {
+        // Once the reserve is exhausted, rebuild it instead of playing each
+        // arriving fragment with another audible gap after every frame.
+        s_pcm.buffering = true;
+        s_pcm.start_threshold = s_pcm.rebuffer_threshold;
+#ifdef HI_STABILITY_PROBE
+        ++s_probe_rebuffer;
+#endif
+        return 0;
+    }
+    const size_t to_read = n;
     for (size_t i = 0; i < to_read; ++i) {
         out[i] = s_pcm.buf[s_pcm.tail];
         s_pcm.tail = (s_pcm.tail + 1) % kPcmRingSize;
@@ -228,91 +332,79 @@ size_t PopPcm(int16_t *out, size_t n)
 void ClearPcm()
 {
     std::lock_guard<std::mutex> lock(s_pcm_mu);
+    ++s_pcm.epoch;
     s_pcm.head = s_pcm.tail = s_pcm.count = 0;
+    s_pcm.buffering = true;
+    s_pcm.start_threshold = s_segmented.load() ? 160000 : 64000;
+    s_pcm.rebuffer_threshold = s_segmented.load() ? 192000 : 96000;
 }
 
-int OutCallback(uint8_t *data, int data_size, void * /*ctx*/)
+int OutCallback(uint8_t *data, int data_size, void *ctx)
 {
-    if (!s_want_play.load(std::memory_order_relaxed) ||
-        s_leave.load(std::memory_order_relaxed)) {
+    const uint32_t id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ctx));
+    // Drop superseded PCM while acknowledging the write. Returning zero
+    // makes GMF retry the canceled output and can block station teardown.
+    if (!CurrentAttempt(id))
+        return data_size > 0 ? data_size : 0;
+    if (data == nullptr || data_size <= 0)
         return 0;
-    }
-    if (data == nullptr || data_size <= 0) {
-        return 0;
-    }
+    const int consumed = data_size;
 
     const int16_t *pcm = reinterpret_cast<const int16_t *>(data);
     const int total_samples = data_size / static_cast<int>(sizeof(int16_t));
     const int channels = s_pcm_channels.load(std::memory_order_relaxed);
-    if (channels <= 0 || total_samples <= 0) {
+    if (channels <= 0 || total_samples <= 0)
         return 0;
-    }
     const int frames = total_samples / channels;
-    if (frames <= 0) {
+    if (frames <= 0)
         return 0;
-    }
 
     const int src_rate = s_pcm_sample_rate.load(std::memory_order_relaxed);
     int frame_off = 0;
     while (frame_off < frames) {
-        if (!s_want_play.load(std::memory_order_relaxed) ||
-            s_leave.load(std::memory_order_relaxed)) {
-            return 0;
-        }
+        if (!CurrentAttempt(id))
+            return consumed;
         const int block = std::min(frames - frame_off, kDecodeBlockFrames);
-        s_mono_buf.resize(static_cast<size_t>(block));
         for (int i = 0; i < block; ++i) {
             int32_t mix = 0;
             const int src = (frame_off + i) * channels;
-            for (int c = 0; c < channels; ++c) {
+            for (int c = 0; c < channels; ++c)
                 mix += pcm[src + c];
-            }
-            s_mono_buf[static_cast<size_t>(i)] =
-                static_cast<int16_t>(mix / channels);
+            s_mono_buf[i] = static_cast<int16_t>(mix / channels);
         }
-
-        const int16_t *out = s_mono_buf.data();
-        size_t out_n = s_mono_buf.size();
-        if (src_rate > 0 && src_rate != kRadioSampleRate) {
+        const int16_t *out = s_mono_buf;
+        size_t out_n = static_cast<size_t>(block);
+        if (src_rate > 0 && src_rate != RadioPlayer::kSampleRate) {
             if (s_resampler_rate.load(std::memory_order_relaxed) != src_rate) {
-                s_resampler.Configure(src_rate, kRadioSampleRate);
+                s_resampler.Configure(src_rate, RadioPlayer::kSampleRate);
                 s_resampler_rate.store(src_rate, std::memory_order_relaxed);
             }
-            const size_t resampled_n =
-                s_resampler.GetOutputSamples(s_mono_buf.size());
-            s_resampled_buf.resize(resampled_n);
-            s_resampler.Process(s_mono_buf.data(), s_mono_buf.size(),
-                                s_resampled_buf.data());
-            out = s_resampled_buf.data();
-            out_n = s_resampled_buf.size();
+            out_n = s_resampler.Process(s_mono_buf, static_cast<size_t>(block),
+                                        s_resampled_buf, kResampleCap);
+            out = s_resampled_buf;
         }
-
-        PushPcm(out, out_n);
+        PushPcm(out, out_n, id);
         frame_off += block;
     }
-
-    if (!s_reported_playing.exchange(true, std::memory_order_acq_rel)) {
-        write(1, "RADIO_PCM\n", 10);
-        SetStatus(RadioStatus::Playing);
-    }
-    return 0;
+    /* GMF treats 0 as "wrote nothing" and stalls — that looked like
+     * 正在播放 with silence. Echo the input size we accepted. */
+    return consumed;
 }
 
-int EventCallback(esp_asp_event_pkt_t *pkt, void * /*ctx*/)
+int EventCallback(esp_asp_event_pkt_t *pkt, void *ctx)
 {
-    if (pkt == nullptr) {
+    const uint32_t id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ctx));
+    std::lock_guard<std::mutex> lock(s_request_mu);
+    if (!CurrentAttempt(id)) return 0;
+    if (pkt == nullptr)
         return 0;
-    }
     if (pkt->type == ESP_ASP_EVENT_TYPE_STATE && pkt->payload != nullptr &&
         pkt->payload_size >= static_cast<int>(sizeof(esp_asp_state_t))) {
         esp_asp_state_t state = ESP_ASP_STATE_NONE;
         std::memcpy(&state, pkt->payload, sizeof(state));
-        if (state == ESP_ASP_STATE_RUNNING &&
-            s_want_play.load(std::memory_order_relaxed)) {
-            /* Stay Connecting until first OutCallback PCM — avoids false Playing. */
-        } else if (state == ESP_ASP_STATE_ERROR) {
-            SetStatus(RadioStatus::Failed);
-            s_want_play.store(false, std::memory_order_relaxed);
+        // A live station finishing is not a usable silent Playing state.
+        if (state == ESP_ASP_STATE_ERROR || state == ESP_ASP_STATE_FINISHED) {
+            s_attempt_failed.store(true);
         }
     } else if (pkt->type == ESP_ASP_EVENT_TYPE_MUSIC_INFO &&
                pkt->payload != nullptr &&
@@ -320,23 +412,78 @@ int EventCallback(esp_asp_event_pkt_t *pkt, void * /*ctx*/)
                    static_cast<int>(sizeof(esp_asp_music_info_t))) {
         esp_asp_music_info_t info = {};
         std::memcpy(&info, pkt->payload, sizeof(info));
-        if (info.channels > 0) {
+        if (info.channels > 0)
             s_pcm_channels.store(info.channels, std::memory_order_relaxed);
-        }
-        if (info.sample_rate > 0) {
-            s_pcm_sample_rate.store(info.sample_rate,
-                                    std::memory_order_relaxed);
-        }
+        if (info.sample_rate > 0)
+            s_pcm_sample_rate.store(info.sample_rate, std::memory_order_relaxed);
         write(1, "RADIO_INFO\n", 11);
     }
     return 0;
 }
 
+int HlsSegCb(esp_hls_file_seg_info_t *info, void *ctx)
+{
+    if (info == nullptr || info->format == 0)
+        return 0;
+    const uint32_t prev = s_hls_format.load(std::memory_order_relaxed);
+    if (prev == info->format)
+        return 0;
+    s_hls_format.store(info->format, std::memory_order_relaxed);
+    auto player = static_cast<esp_asp_handle_t>(ctx);
+    if (player == nullptr)
+        return 0;
+    esp_gmf_pipeline_handle_t pipeline = nullptr;
+    if (esp_audio_simple_player_get_pipeline(player, &pipeline) !=
+            ESP_GMF_ERR_OK ||
+        pipeline == nullptr)
+        return 0;
+    esp_gmf_element_handle_t dec_el = nullptr;
+    if (esp_gmf_pipeline_get_el_by_name(pipeline, "aud_dec", &dec_el) !=
+            ESP_GMF_ERR_OK ||
+        dec_el == nullptr)
+        return 0;
+    esp_gmf_info_sound_t music_info = {};
+    music_info.format_id = info->format;
+    music_info.sample_rates = s_pcm_sample_rate.load(std::memory_order_relaxed);
+    music_info.channels =
+        static_cast<uint16_t>(s_pcm_channels.load(std::memory_order_relaxed));
+    music_info.bits = 16;
+    (void)esp_gmf_audio_dec_reconfig_by_sound_info(dec_el, &music_info);
+    write(1, "RADIO_HLS\n", 10);
+    return 0;
+}
+
+int HttpHook(http_stream_event_msg_t *msg)
+{
+    if (msg == nullptr || msg->http_client == nullptr)
+        return ESP_GMF_ERR_OK;
+    const uint32_t id=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(msg->user_data));
+    if (!CurrentAttempt(id)) return ESP_GMF_ERR_FAIL;
+    if (msg->event_id == HTTP_STREAM_PRE_REQUEST) {
+        auto client = static_cast<esp_http_client_handle_t>(msg->http_client);
+        esp_http_client_set_cancel_cb(client, [](void *ctx) -> bool {
+            const uint32_t request = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ctx));
+            return !CurrentAttempt(request) || s_attempt_failed.load() ||
+                   s_need_reopen.load() || s_attempt_network.load() != metalio_app_cellular_active();
+        }, msg->user_data);
+        // Limit only radio's cellular TCP packets. Large Ethernet bursts on
+        // the UART-backed modem lost partial frames and starved later DNS.
+        // Other HTTP clients and Wi-Fi retain their original TCP defaults.
+        if (esp_http_client_set_transport_mss(client, metalio_app_cellular_active() ? 512 : 0) != ESP_OK)
+            return ESP_GMF_ERR_FAIL;
+        esp_http_client_set_header(client, "User-Agent",
+                                   "Mozilla/5.0 (HiOS Radio)");
+        esp_http_client_set_header(client, "Icy-MetaData", "0");
+        esp_http_client_set_header(client, "Accept", "*/*");
+        esp_http_client_set_header(client, "Connection", "keep-alive");
+    }
+    return ESP_GMF_ERR_OK;
+}
+
 void EnsureMediaLibAdapter()
 {
-    if (s_media_lib_ready.load(std::memory_order_relaxed)) {
+    if (s_media_lib_ready.load(std::memory_order_relaxed))
         return;
-    }
     media_lib_add_default_adapter();
     s_media_lib_ready.store(true, std::memory_order_relaxed);
 }
@@ -345,27 +492,29 @@ esp_gmf_err_t HttpTlsGetScore(esp_gmf_io_handle_t /*handle*/, const char *url,
                               int *score)
 {
     *score = ESP_GMF_IO_SCORE_NONE;
-    if (url == nullptr) {
+    if (url == nullptr)
         return ESP_GMF_ERR_OK;
-    }
-    /* Prefer HTTP IO for progressive audio; leave .m3u8 to HLS IO. */
-    if (strstr(url, ".m3u8") != nullptr || strstr(url, ".M3U8") != nullptr) {
+    /* HLS demuxer owns .m3u8; progressive http(s):// uses esp_gmf_io_http. */
+    if (strstr(url, ".m3u8") != nullptr || strstr(url, ".M3U8") != nullptr)
         return ESP_GMF_ERR_OK;
-    }
-    if (strncasecmp(url, "http://", 7) == 0 ||
-        strncasecmp(url, "https://", 8) == 0) {
+    if (strncasecmp(url, "https://", 8) == 0 ||
+        strncasecmp(url, "http://", 7) == 0) {
         *score = ESP_GMF_IO_SCORE_STANDARD + 10;
     }
     return ESP_GMF_ERR_OK;
 }
 
-bool RegisterHttp(esp_asp_handle_t player)
+bool RegisterHttp(esp_asp_handle_t player, uint32_t id)
 {
     http_io_cfg_t http_cfg = HTTP_STREAM_CFG_DEFAULT();
     http_cfg.dir = ESP_GMF_IO_DIR_READER;
     http_cfg.crt_bundle_attach = nullptr;
-    http_cfg.io_cfg.thread.stack = 48 * 1024;
-
+    http_cfg.event_handle = HttpHook;
+    http_cfg.user_data = reinterpret_cast<void *>(static_cast<uintptr_t>(id));
+    http_cfg.io_cfg.thread.stack = kHttpStack;
+    http_cfg.io_cfg.thread.prio = 5;
+    http_cfg.io_cfg.thread.stack_in_ext = true;
+    http_cfg.io_cfg.buffer_cfg.buffer_size = 96 * 1024;
     esp_gmf_io_handle_t http_io = nullptr;
     if (esp_gmf_io_http_init(&http_cfg, &http_io) != ESP_GMF_ERR_OK ||
         http_io == nullptr) {
@@ -380,237 +529,194 @@ bool RegisterHttp(esp_asp_handle_t player)
     return true;
 }
 
+bool RegisterHls(esp_asp_handle_t player)
+{
+    esp_gmf_pool_handle_t pool = nullptr;
+    if (esp_audio_simple_player_get_pool(player, &pool) != ESP_GMF_ERR_OK ||
+        pool == nullptr) {
+        write(1, "RADIO_HLS_POOL\n", 15);
+        return false;
+    }
+    esp_hls_io_cfg_t hls_cfg = {};
+    hls_cfg.name = "io_hls";
+    hls_cfg.file_seg_cb = HlsSegCb;
+    hls_cfg.ctx = player;
+    hls_cfg.pool = pool;
+    hls_cfg.io_cfg.thread.stack = kHlsStack;
+    hls_cfg.io_cfg.thread.prio = 5;
+    hls_cfg.io_cfg.thread.core = 0;
+    hls_cfg.io_cfg.thread.stack_in_ext = true;
+    hls_cfg.io_cfg.buffer_cfg.io_size = 512;
+    hls_cfg.io_cfg.buffer_cfg.buffer_size = kHlsBuf;
+    esp_gmf_io_handle_t hls_io = nullptr;
+    if (esp_gmf_io_hls_init(&hls_cfg, &hls_io) != ESP_GMF_ERR_OK ||
+        hls_io == nullptr) {
+        write(1, "RADIO_HLS_FAIL\n", 15);
+        return false;
+    }
+    if (esp_audio_simple_player_register_io(player, hls_io) != ESP_GMF_ERR_OK) {
+        esp_gmf_obj_delete(hls_io);
+        return false;
+    }
+    return true;
+}
+
 void DestroyPlayer()
 {
-    if (s_player == nullptr) {
+    if (s_player == nullptr)
         return;
-    }
+    { std::lock_guard<std::mutex> lock(s_request_mu); s_active_id.store(0); }
     esp_asp_handle_t player = s_player;
     s_player = nullptr;
     esp_audio_simple_player_stop(player);
     esp_audio_simple_player_destroy(player);
 }
 
-bool CreatePlayer()
+esp_gmf_err_t AbortRadioInput(void *ctx)
+{
+    esp_gmf_io_handle_t input = nullptr;
+    auto pipeline = static_cast<esp_gmf_pipeline_handle_t>(ctx);
+    if (esp_gmf_pipeline_get_in(pipeline, &input) != ESP_GMF_ERR_OK || !input)
+        return ESP_GMF_ERR_OK;
+    auto *io = reinterpret_cast<esp_gmf_io_t *>(input);
+    // Wake the decoder BEFORE asking its task to stop. Previously stop
+    // waited for a task blocked on this bus, while closing/aborting the bus
+    // was queued behind that very same task: an indefinite teardown wait.
+    if (io->data_bus) esp_gmf_db_abort(io->data_bus);
+    if (io->prev_close) io->prev_close(io);
+    return ESP_GMF_ERR_OK;
+}
+
+int PrepareRadioPipeline(esp_asp_handle_t *, void *ctx)
+{
+    const auto player = *static_cast<esp_asp_handle_t *>(ctx);
+    esp_gmf_pipeline_handle_t pipeline = nullptr;
+    const auto rc = esp_audio_simple_player_get_pipeline(player, &pipeline);
+    if (rc != ESP_GMF_ERR_OK || !pipeline) return ESP_GMF_ERR_FAIL;
+    return esp_gmf_pipeline_set_prev_stop_cb(pipeline, AbortRadioInput, pipeline);
+}
+
+bool CreatePlayer(uint32_t id)
 {
     DestroyPlayer();
     s_pcm_channels.store(2, std::memory_order_relaxed);
     s_pcm_sample_rate.store(44100, std::memory_order_relaxed);
     s_resampler_rate.store(0, std::memory_order_relaxed);
-
+    s_hls_format.store(0, std::memory_order_relaxed);
     esp_asp_cfg_t cfg = {};
     cfg.out.cb = OutCallback;
-    cfg.out.user_ctx = nullptr;
+    cfg.out.user_ctx = reinterpret_cast<void *>(static_cast<uintptr_t>(id));
     cfg.task_prio = 5;
-    cfg.task_stack = 32 * 1024;
-    cfg.prev = nullptr;
-    cfg.prev_ctx = nullptr;
-
+    cfg.task_stack = kPlayerStack;
+    cfg.task_core = hi_task_supported_cpus() > 1 ? 1 : 0;
+    cfg.prev = PrepareRadioPipeline;
+    cfg.prev_ctx = &s_player;
     if (esp_audio_simple_player_new(&cfg, &s_player) != ESP_GMF_ERR_OK ||
         s_player == nullptr) {
         write(1, "RADIO_NEW_FAIL\n", 15);
         return false;
     }
-
-    /* Progressive MP3 only — skip HLS (48k stack + stuck Connecting). */
-    if (!RegisterHttp(s_player)) {
+    if (!RegisterHttp(s_player, id) || !RegisterHls(s_player)) {
         DestroyPlayer();
         return false;
     }
-
-    esp_audio_simple_player_set_event(s_player, EventCallback, nullptr);
+    esp_audio_simple_player_set_event(s_player, EventCallback, cfg.out.user_ctx);
     return true;
-}
-
-void AspStopWorker()
-{
-    esp_asp_handle_t player = s_player;
-    if (player != nullptr) {
-        esp_audio_simple_player_stop(player);
-    }
-    s_asp_stop_busy.store(false, std::memory_order_release);
-}
-
-void *AspStopThreadEntry(void * /*arg*/)
-{
-    AspStopWorker();
-    return nullptr;
-}
-
-void RequestAspStop()
-{
-    bool expected = false;
-    if (!s_asp_stop_busy.compare_exchange_strong(expected, true)) {
-        return;
-    }
-    if (!SpawnThread(nullptr, AspStopThreadEntry, nullptr, 8 * 1024)) {
-        s_asp_stop_busy.store(false, std::memory_order_release);
-        AspStopWorker();
-    }
-}
-
-void OpenTx()
-{
-    std::lock_guard<std::mutex> lock(s_tx_mu);
-    if (s_tx_fd >= 0) {
-        return;
-    }
-    s_tx_fd = open("/dev/audio/pcm0", O_WRONLY | O_NONBLOCK);
-    if (s_tx_fd < 0) {
-        s_tx_fd = open("/dev/audio/pcm0", O_WRONLY);
-    }
-    if (s_tx_fd < 0) {
-        return;
-    }
-    struct audio_caps_s caps;
-    std::memset(&caps, 0, sizeof(caps));
-    caps.ac_type = AUDIO_TYPE_OUTPUT;
-    caps.ac_subtype = AUDIO_FMT_PCM;
-    caps.ac_channels = 2;
-    caps.ac_controls.hw[0] = 16000 & 0xffff;
-    caps.ac_controls.b[3] = (16000 >> 16) & 0xff;
-    caps.ac_controls.b[2] = 32;
-    ioctl(s_tx_fd, AUDIOIOC_CONFIGURE, (unsigned long)(uintptr_t)&caps);
-    ioctl(s_tx_fd, AUDIOIOC_START, 0);
-    s_tx_logged.store(false, std::memory_order_relaxed);
-    /* ~240 ms gain ramp after open — avoids DAC crack → blue. */
-    s_fade_left.store(kRadioSampleRate * 24 / 100, std::memory_order_relaxed);
-}
-
-void CloseTx()
-{
-    std::lock_guard<std::mutex> lock(s_tx_mu);
-    if (s_tx_fd >= 0) {
-        ioctl(s_tx_fd, AUDIOIOC_STOP, 0);
-        close(s_tx_fd);
-        s_tx_fd = -1;
-    }
-    s_tx_logged.store(false, std::memory_order_relaxed);
-    s_tx_armed.store(false, std::memory_order_relaxed);
-    s_fade_left.store(0, std::memory_order_relaxed);
-}
-
-void WriteI2sChunk(const int16_t *data, size_t samples)
-{
-    if (data == nullptr || samples == 0) {
-        return;
-    }
-
-    int vol = s_volume.load(std::memory_order_relaxed);
-    if (vol < 0) {
-        vol = 0;
-    }
-    if (vol > 100) {
-        vol = 100;
-    }
-    const double v = static_cast<double>(vol) / 100.0;
-    const double v2 = v * v;
-    const int32_t vf_full = static_cast<int32_t>(v2 * 65536.0 + 0.5);
-    int fade = s_fade_left.load(std::memory_order_relaxed);
-    const int fade_total = kRadioSampleRate * 24 / 100;
-
-    const size_t need = samples * 2;
-    if (s_tx_scratch.size() < need) {
-        s_tx_scratch.resize(need);
-    }
-    for (size_t i = 0; i < samples; ++i) {
-        int32_t vf = vf_full;
-        if (fade > 0 && fade_total > 0) {
-            const double f =
-                1.0 - static_cast<double>(fade) / static_cast<double>(fade_total);
-            const double g = (f < 0.0) ? 0.0 : (f > 1.0 ? 1.0 : f);
-            vf = static_cast<int32_t>(v2 * g * g * 65536.0 + 0.5);
-            --fade;
-        }
-        const int64_t t =
-            static_cast<int64_t>(data[i]) * static_cast<int64_t>(vf);
-        int32_t p;
-        if (t > INT32_MAX) {
-            p = INT32_MAX;
-        } else if (t < INT32_MIN) {
-            p = INT32_MIN;
-        } else {
-            p = static_cast<int32_t>(t);
-        }
-        s_tx_scratch[i * 2] = p;
-        s_tx_scratch[i * 2 + 1] = p;
-    }
-    s_fade_left.store(fade > 0 ? fade : 0, std::memory_order_relaxed);
-
-    const size_t total = need * sizeof(int32_t);
-    size_t off = 0;
-    std::lock_guard<std::mutex> lock(s_tx_mu);
-    if (s_tx_fd < 0) {
-        return;
-    }
-    while (off < total) {
-        const ssize_t w =
-            write(s_tx_fd,
-                  reinterpret_cast<const uint8_t *>(s_tx_scratch.data()) + off,
-                  total - off);
-        if (w <= 0) {
-            return;
-        }
-        off += static_cast<size_t>(w);
-    }
-    if (!s_tx_logged.exchange(true, std::memory_order_acq_rel)) {
-        write(1, "RADIO_I2S\n", 10);
-    }
 }
 
 void *PcmDrainEntry(void * /*arg*/)
 {
-    int16_t chunk[kI2sChunkSamples];
+
+    int policy=0;sched_param priority{};
+    if(pthread_getschedparam(pthread_self(),&policy,&priority)==0){
+        priority.sched_priority=std::max(priority.sched_priority,CONFIG_METALIO_APP_PRIORITY+12);
+        (void)pthread_setschedparam(pthread_self(),SCHED_RR,&priority);
+    }
+    int16_t chunk[kOutChunk];
+    uint32_t session=0, request=0, epoch=0;
+    uint32_t watchdog_ms = RadioMonotonicMs();
+    auto &as = Application::GetInstance().GetAudioService();
+    const auto check_progress = [&watchdog_ms]() {
+        const uint32_t now = RadioMonotonicMs();
+        if (now - watchdog_ms >= 200) {
+            watchdog_ms = now;
+            // Connection recovery must run even when LVGL is busy or the
+            // radio is covered by the standby clock.
+            RadioPlayer::Instance().AbortConnectTimeout();
+        }
+    };
     while (s_drain_run.load(std::memory_order_relaxed)) {
+        check_progress();
         if (!s_want_play.load(std::memory_order_relaxed) ||
             s_leave.load(std::memory_order_relaxed)) {
-            usleep(10000);
+            if(session){as.EndLocalPlayback(session);session=0;}
+            usleep(12000);
             continue;
         }
-
-        const size_t got = PopPcm(chunk, kI2sChunkSamples);
+        const uint32_t current=s_request_id.load();
+        if(request!=current){if(session)as.EndLocalPlayback(session);session=0;request=current;}
+        uint32_t chunk_epoch=0;
+        const size_t got = PopPcm(chunk, kOutChunk, chunk_epoch);
+        if(epoch!=chunk_epoch){if(session)as.EndLocalPlayback(session);session=0;epoch=chunk_epoch;}
         if (got == 0) {
             usleep(8000);
             continue;
         }
-
-        /* Open DAC only after real PCM — empty OpenTx cracked then blue'd. */
-        if (!s_tx_armed.exchange(true, std::memory_order_acq_rel)) {
-            OpenTx();
-            write(1, "RADIO_TX\n", 9);
-        }
-
+        if (!CurrentAttempt(request)) continue;
+        if(!session)session=as.BeginLocalPlayback(5760);
         UpdateBandsFromPcm(chunk, got);
-
-        size_t off = 0;
-        while (off < got) {
-            if (!s_want_play.load(std::memory_order_relaxed) ||
-                s_leave.load(std::memory_order_relaxed)) {
+        /* The shared AudioService queue is bounded. Retrying here applies
+         * backpressure instead of silently dropping every block while the
+         * I2S writer is busy, which left the UI reporting Playing without
+         * continuous audible output. */
+        bool submitted=false;
+        while (s_drain_run.load(std::memory_order_relaxed) &&
+               s_want_play.load(std::memory_order_relaxed) &&
+               !s_leave.load(std::memory_order_relaxed) &&
+               CurrentAttempt(request)) {
+            {
+                std::lock_guard<std::mutex> lock(s_pcm_mu);
+                if(epoch!=s_pcm.epoch || !CurrentAttempt(request)) break;
+                submitted=as.TryEnqueueLocalPcm(session, chunk, got);
+            }
+            if(submitted) {
+                s_last_submit_ms.store(RadioMonotonicMs());
+#ifdef HI_STABILITY_PROBE
+                s_probe_submitted.fetch_add(got);
+#endif
                 break;
             }
-            const size_t n = std::min(got - off, kI2sChunkSamples);
-            WriteI2sChunk(chunk + off, n);
-            off += n;
-            usleep(60000);
+            check_progress();
+            usleep(5000);
         }
+        {
+            std::lock_guard<std::mutex> lock(s_request_mu);
+            if(submitted && CurrentAttempt(request) && !s_reported_playing.exchange(true)) {
+                write(1,"RADIO_PCM\n",10);
+                SetStatus(RadioStatus::Playing);
+            }
+        }
+        // The I2S writer is the clock. Queue backpressure already paces us;
+        // sleeping for another block duration here drains the jitter reserve
+        // and adds a gap after every scheduling/network delay.
     }
-    CloseTx();
+    if(session)as.EndLocalPlayback(session);
     return nullptr;
 }
 
 void StartDrain()
 {
+    if (!s_pcm.buf) s_pcm.buf = static_cast<int16_t *>(std::malloc(kPcmRingSize * sizeof(int16_t)));
+    if (!s_pcm.buf) { s_want_play.store(false); return; }
     s_drain_run.store(false, std::memory_order_release);
     JoinThread(&s_drain_thread, &s_drain_joinable);
     ClearPcm();
     s_drain_run.store(true, std::memory_order_release);
     if (!SpawnThread(&s_drain_thread, PcmDrainEntry, nullptr, kDrainStack)) {
         s_drain_run.store(false, std::memory_order_relaxed);
-        write(1, "RADIO_OUT_FAIL\n", 15);
         return;
     }
     s_drain_joinable = true;
-    write(1, "RADIO_OUT\n", 10);
 }
 
 void StopDrain()
@@ -623,181 +729,146 @@ void StopDrain()
 
 void OccupySystemAudio()
 {
-    if (s_audio_occupied.exchange(true, std::memory_order_acq_rel)) {
+    if (s_audio_occupied.exchange(true, std::memory_order_acq_rel))
         return;
-    }
-    write(1, "RADIO_OCC0\n", 11);
-    auto &as = Application::GetInstance().GetAudioService();
-    /* Soft occupy only — EnableVoiceProcessing(false) on this worker path
-     * cracked the DAC then solid-blued the display flush. */
-    as.ArmDownlinkPlaybackProtect();
-    int vol = as.GetVolume();
-    if (vol < 10) {
-        vol = 70;
-    }
-    if (vol > 100) {
-        vol = 100;
-    }
-    s_volume.store(vol, std::memory_order_relaxed);
-    write(1, "RADIO_OCC1\n", 11);
+    /* Do not ArmDownlink / MUTE / open pcm0 here. Radio PCM goes through
+     * the existing AudioService playback queue (same I2S as TTS). Exclusive
+     * arming stole the voice TX path and left radio "Playing" with TX off. */
+    // Playback never changes the system volume, including mute.
 }
 
 void ReleaseSystemAudio()
 {
-    if (!s_audio_occupied.exchange(false, std::memory_order_acq_rel)) {
-        return;
-    }
+    s_audio_occupied.store(false, std::memory_order_release);
     auto &as = Application::GetInstance().GetAudioService();
     as.ClearDownlinkPlaybackProtect();
-    /* Do not re-enable wake word here — chat/home owns that lifecycle. */
+    as.ClearWakeWordMute();
 }
 
-void SessionMain()
+void EnsureSession();
+
+void *SessionEntry(void * /*arg*/)
 {
-    write(1, "RADIO_PLAY\n", 11);
     OccupySystemAudio();
     EnsureMediaLibAdapter();
-    write(1, "RADIO_ADAPT\n", 12);
-
-    ClearPcm();
-    ClearBars();
-    s_reported_playing.store(false, std::memory_order_relaxed);
-    s_tx_armed.store(false, std::memory_order_relaxed);
-
-    {
-        auto &as = Application::GetInstance().GetAudioService();
-        as.SetTtsUplinkGate(false);
-        /* Do not ResetDecoder here — hard reset + OpenTx cracked then blue'd. */
+    if(BluetoothScreen::PreparePlaybackRoute()<0){
+        s_want_play=false;SetStatus(RadioStatus::Failed);
+        ReleaseSystemAudio();s_session_alive=false;return nullptr;
     }
-
     StartDrain();
+    write(1, "RADIO_PLAY\n", 11);
 
-    if (!CreatePlayer()) {
-        write(1, "RADIO_NEW_FAIL\n", 15);
-        SetStatus(RadioStatus::Failed);
-        StopDrain();
-        ReleaseSystemAudio();
-        s_session_alive.store(false, std::memory_order_release);
-        return;
-    }
-    write(1, "RADIO_ASP_OK\n", 13);
-
-    while (!s_leave.load(std::memory_order_relaxed)) {
-        if (!s_want_play.load(std::memory_order_relaxed)) {
-            usleep(40000);
-            continue;
+    uint32_t fallback_request = 0, retry_request = 0;
+    unsigned retry_count = 0;
+    while (!s_leave.load()) {
+        uint32_t id;
+        int playing_station;
+        {
+            std::lock_guard<std::mutex> lock(s_request_mu);
+            id = s_request_id.load();
+            playing_station = s_station_index.load();
+            s_need_reopen.store(false);
         }
-
-        /* Ensure previous run_to_end fully stopped before restarting. */
-        for (int i = 0; i < 50 && s_asp_stop_busy.load(std::memory_order_relaxed);
-             ++i) {
-            usleep(20000);
-        }
-
-        if (s_player != nullptr) {
-            esp_asp_state_t asp_st = ESP_ASP_STATE_NONE;
-            if (esp_audio_simple_player_get_state(s_player, &asp_st) ==
-                    ESP_GMF_ERR_OK &&
-                (asp_st == ESP_ASP_STATE_RUNNING ||
-                 asp_st == ESP_ASP_STATE_PAUSED)) {
-                esp_audio_simple_player_stop(s_player);
-                usleep(50000);
-            }
-        }
-
-        if (s_leave.load(std::memory_order_relaxed)) {
-            break;
-        }
-        if (!s_want_play.load(std::memory_order_relaxed)) {
-            continue;
-        }
-
-        s_reported_playing.store(false, std::memory_order_relaxed);
+        if (!s_want_play.load()) { usleep(20000); continue; }
+        if (retry_request != id) { retry_request = id; retry_count = 0; }
         ClearPcm();
-        ClearBars();
-        SetStatus(RadioStatus::Connecting);
-
-        const char *url =
-            StationAt(s_station_index.load(std::memory_order_relaxed)).url;
-        write(1, "RADIO_RUN\n", 10);
-
-        const esp_gmf_err_t err =
-            esp_audio_simple_player_run_to_end(s_player, url, nullptr);
-
-        if (s_leave.load(std::memory_order_relaxed)) {
-            break;
-        }
-        if (!s_want_play.load(std::memory_order_relaxed)) {
-            continue;
-        }
-        if (err != ESP_GMF_ERR_OK) {
-            write(1, "RADIO_RUN_FAIL\n", 15);
-            /* Fail once — no 1.2s reconnect storm under audio occupy. */
-            SetStatus(RadioStatus::Failed);
-            s_want_play.store(false, std::memory_order_relaxed);
-            continue;
-        }
-        write(1, "RADIO_RUN_OK\n", 13);
-        usleep(100000);
-    }
-
-    write(1, "RADIO_PLAY_END\n", 15);
-    DestroyPlayer();
-    StopDrain();
-    s_mono_buf.clear();
-    s_resampled_buf.clear();
-    s_tx_scratch.clear();
-
-    ReleaseSystemAudio();
-    SetStatus(RadioStatus::Idle);
-    s_session_alive.store(false, std::memory_order_release);
-    write(1, "RADIO_STOP_DONE\n", 16);
-
-    /* Late Start() while we were tearing down — spawn a fresh session. */
-    if (s_want_play.load(std::memory_order_relaxed) &&
-        !s_leave.load(std::memory_order_relaxed)) {
-        bool expected = false;
-        if (s_session_alive.compare_exchange_strong(expected, true)) {
-            OccupySystemAudio();
-            if (!SpawnThread(nullptr,
-                             [](void *) -> void * {
-                                 SessionMain();
-                                 return nullptr;
-                             },
-                             nullptr, kPlayStack)) {
-                s_session_alive.store(false, std::memory_order_release);
-                ReleaseSystemAudio();
-                SetStatus(RadioStatus::Failed);
+        const auto &selected = StationAt(playing_station);
+        const char *url = fallback_request == id && selected.fallback_url
+                            ? selected.fallback_url : selected.url;
+        s_segmented.store(strstr(url,".m3u8")!=nullptr || strstr(url,".M3U8")!=nullptr);
+        ClearPcm();
+        const bool created = CreatePlayer(id);
+        bool run = false;
+        {
+            std::lock_guard<std::mutex> lock(s_request_mu);
+            if (id == s_request_id.load() && s_want_play.load() && !s_leave.load()) {
+                s_active_id.store(id);
+                s_attempt_failed.store(!created);
+                s_reported_playing.store(false);
+                const uint32_t now = RadioMonotonicMs();
+                s_attempt_start_ms.store(now);
+                s_last_submit_ms.store(now);
+                s_last_decode_ms.store(now);
+                s_attempt_network.store(metalio_app_cellular_active());
+                SetStatus(RadioStatus::Connecting);
+                run = created;
             }
         }
+        if (run) {
+            write(1, "RADIO_RUN\n", 10);
+            const int rc = esp_audio_simple_player_run(s_player, url, nullptr);
+            if (rc != ESP_GMF_ERR_OK) {
+                std::lock_guard<std::mutex> lock(s_request_mu);
+                if (CurrentAttempt(id)) s_attempt_failed.store(true);
+            }
+            while (CurrentAttempt(id) && !s_attempt_failed.load() && !s_need_reopen.load())
+                usleep(80000);
+        }
+        // Invalidate events BEFORE stop: cancellation errors belong to the old stream.
+        const bool failed = s_attempt_failed.load();
+        DestroyPlayer();
+        ClearPcm();
+        {
+            std::lock_guard<std::mutex> lock(s_request_mu);
+            if (id == s_request_id.load() && s_want_play.load() && !s_leave.load() && failed) {
+                if (fallback_request != id && selected.fallback_url) {
+                    // Do not spend another full connection timeout on the
+                    // same silent primary before trying its alternate.
+                    fallback_request = id;
+                    retry_count = 0;
+                    SetStatus(RadioStatus::Connecting);
+                } else if (retry_count++ == 0) {
+                    SetStatus(RadioStatus::Connecting);
+                } else {
+                    s_want_play.store(false);
+                    SetStatus(RadioStatus::Failed);
+                    write(1, "RADIO_REQUEST_FAILED\n", 21);
+                }
+            }
+        }
+        usleep(50000);
     }
-}
 
-void *SessionThreadEntry(void * /*arg*/)
-{
-    SessionMain();
+    StopDrain();
+    DestroyPlayer();
+    ReleaseSystemAudio();
+    s_session_alive.store(false, std::memory_order_release);
+    { std::lock_guard<std::mutex> lock(s_request_mu);
+      if (s_leave.load()) SetStatus(RadioStatus::Idle); }
+    write(1, "RADIO_END\n", 10);
+    // A new start may arrive while the previous worker is releasing audio.
+    if (s_want_play.load() && !s_leave.load()) EnsureSession();
     return nullptr;
 }
 
 void EnsureSession()
 {
     bool expected = false;
-    if (!s_session_alive.compare_exchange_strong(expected, true)) {
-        return;
-    }
-    write(1, "RADIO_SPWN\n", 11);
-    /* Detached: Stop() must not join from LVGL. Session self-exits. */
-    if (!SpawnThread(nullptr, SessionThreadEntry, nullptr, kPlayStack)) {
-        write(1, "RADIO_SPWN_FAIL\n", 16);
-        s_session_alive.store(false, std::memory_order_release);
+    if (!s_session_alive.compare_exchange_strong(expected, true)) return;
+    if (!SpawnThread(nullptr, SessionEntry, nullptr, kPlayStack)) {
+        s_session_alive.store(false);
         SetStatus(RadioStatus::Failed);
-        ReleaseSystemAudio();
-        return;
+        s_want_play.store(false, std::memory_order_relaxed);
     }
-    write(1, "RADIO_START_DONE\n", 17);
 }
 
 }  // namespace
+
+RadioPlayer::RadioPlayer()
+{
+    write(1, "RADIO_RESTORE_BEGIN\n", 20);
+    Settings settings("radio");
+    write(1, "RADIO_RESTORE_READ\n", 19);
+    const auto saved = settings.GetString("last_station");
+    write(1, "RADIO_RESTORE_DONE\n", 19);
+    for (size_t i = 0; i < kRadioStationCount; ++i) {
+        if (saved == kRadioStations[i].name) {
+            s_station_index.store(static_cast<int>(i));
+            s_station_saved.store(static_cast<int>(i));
+            break;
+        }
+    }
+}
 
 RadioPlayer &RadioPlayer::Instance()
 {
@@ -807,120 +878,94 @@ RadioPlayer &RadioPlayer::Instance()
 
 void RadioPlayer::Start()
 {
+    std::lock_guard<std::mutex> lock(s_request_mu);
+    ++s_request_id;
     write(1, "RADIO_START\n", 12);
     s_leave.store(false, std::memory_order_relaxed);
     s_want_play.store(true, std::memory_order_relaxed);
+    s_reported_playing.store(false, std::memory_order_relaxed);
     SetStatus(RadioStatus::Connecting);
-    /* OccupySystemAudio runs inside SessionMain (worker) — doing it on the
-     * LVGL play/load path blue'd after chat (radio_crash.log). */
     EnsureSession();
 }
 
 void RadioPlayer::Stop()
 {
+    std::lock_guard<std::mutex> lock(s_request_mu);
+    ++s_request_id;
     write(1, "RADIO_STOP\n", 11);
+    SaveStationAsync();
     s_want_play.store(false, std::memory_order_relaxed);
     s_leave.store(true, std::memory_order_relaxed);
     ClearBars();
-    RequestAspStop();
+    // The session worker owns stop/destroy; UI callbacks never race its handle.
 }
 
 void RadioPlayer::AbortConnectTimeout()
 {
-    if (static_cast<RadioStatus>(s_status.load(std::memory_order_relaxed)) !=
-        RadioStatus::Connecting) {
+    std::lock_guard<std::mutex> lock(s_request_mu);
+    if (!CurrentAttempt(s_request_id.load()) || s_attempt_failed.load())
+        return;
+    const int network = metalio_app_cellular_active();
+    if (network != s_attempt_network.load()) {
+        s_need_reopen.store(true);
+        SetStatus(RadioStatus::Connecting);
         return;
     }
-    if (!s_want_play.load(std::memory_order_relaxed)) {
-        return;
-    }
-    if (s_reported_playing.load(std::memory_order_relaxed)) {
-        return;
-    }
-    write(1, "RADIO_TIMEOUT\n", 14);
-    s_want_play.store(false, std::memory_order_relaxed);
-    SetStatus(RadioStatus::Failed);
-    RequestAspStop();
+    const bool playing = s_reported_playing.load();
+    const bool expired = RadioProgressExpired(network != 0, playing, RadioMonotonicMs(),
+        s_attempt_start_ms.load(), s_last_decode_ms.load(), s_last_submit_ms.load());
+    if (!expired) return;
+    // The worker tries the alternate source before publishing terminal failure.
+    s_attempt_failed.store(true);
+    write(1, "RADIO_PROGRESS_TIMEOUT\n", sizeof("RADIO_PROGRESS_TIMEOUT\n") - 1);
 }
 
 void RadioPlayer::Pause()
 {
-    if (!s_session_alive.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lock(s_request_mu);
+    ++s_request_id;
+    if (!s_session_alive.load())
         return;
-    }
-    if (!s_want_play.load(std::memory_order_relaxed)) {
-        return;
-    }
-    s_reported_playing.store(false, std::memory_order_relaxed);
     s_want_play.store(false, std::memory_order_relaxed);
+    s_reported_playing.store(false, std::memory_order_relaxed);
     SetStatus(RadioStatus::Paused);
-    esp_asp_handle_t handle = s_player;
-    if (handle != nullptr) {
-        esp_audio_simple_player_pause(handle);
-    }
+    ClearBars();
 }
 
 void RadioPlayer::Resume()
 {
-    if (!s_session_alive.load(std::memory_order_relaxed)) {
-        Start();
-        return;
-    }
-    if (s_leave.load(std::memory_order_relaxed)) {
-        Start();
-        return;
-    }
-    if (s_want_play.load(std::memory_order_relaxed)) {
-        return;
-    }
-    s_reported_playing.store(false, std::memory_order_relaxed);
-    s_want_play.store(true, std::memory_order_relaxed);
-    SetStatus(RadioStatus::Connecting);
-    esp_asp_handle_t handle = s_player;
-    if (handle != nullptr) {
-        esp_audio_simple_player_resume(handle);
-    }
+    Start();
 }
 
 void RadioPlayer::TogglePlayPause()
 {
-    if (!s_session_alive.load(std::memory_order_relaxed) ||
-        s_leave.load(std::memory_order_relaxed)) {
+    if (!s_session_alive.load() || s_leave.load()) {
         Start();
         return;
     }
-    if (s_want_play.load(std::memory_order_relaxed)) {
+    if (s_want_play.load())
         Pause();
-    } else {
+    else
         Resume();
-    }
 }
 
 void RadioPlayer::SelectStation(int index)
 {
+    std::lock_guard<std::mutex> lock(s_request_mu);
+    ++s_request_id;
     index = ClampStationIndex(index);
-    const int prev = s_station_index.load(std::memory_order_relaxed);
-    if (prev == index) {
-        if (s_session_alive.load(std::memory_order_relaxed) &&
-            !s_want_play.load(std::memory_order_relaxed) &&
-            !s_leave.load(std::memory_order_relaxed)) {
-            Resume();
-        }
-        return;
-    }
-
     s_station_index.store(index, std::memory_order_release);
-    write(1, "RADIO_SWITCH\n", 13);
-    ClearBars();
+    ClearPcm();
+    SaveStationAsync();
     s_reported_playing.store(false, std::memory_order_relaxed);
     s_want_play.store(true, std::memory_order_relaxed);
     s_leave.store(false, std::memory_order_relaxed);
     SetStatus(RadioStatus::Connecting);
-
-    if (s_session_alive.load(std::memory_order_relaxed)) {
-        RequestAspStop();
+    if (s_session_alive.load()) {
+        s_need_reopen.store(true, std::memory_order_relaxed);
+        // The session worker owns stop/destroy; UI callbacks never race its handle.
     } else {
-        Start();
+        EnsureSession();
     }
 }
 
@@ -957,27 +1002,30 @@ const char *RadioPlayer::stream_url() const
 
 void RadioPlayer::CopyBands(uint8_t out[kBandCount]) const
 {
-    if (out == nullptr) {
+    if (out == nullptr)
         return;
-    }
     std::lock_guard<std::mutex> lock(s_bar_mu);
     std::memcpy(out, s_bar_levels, sizeof(s_bar_levels));
 }
 
 int RadioPlayer::volume() const
 {
-    return s_volume.load(std::memory_order_relaxed);
+    return Application::GetInstance().GetAudioService().GetVolume();
 }
 
 void RadioPlayer::AdjustVolume(int delta)
 {
-    int vol = s_volume.load(std::memory_order_relaxed) + delta;
-    if (vol < 0) {
+    int vol = volume() + delta;
+    if (vol < 0)
         vol = 0;
-    }
-    if (vol > 100) {
+    if (vol > 100)
         vol = 100;
-    }
-    s_volume.store(vol, std::memory_order_relaxed);
-    Application::GetInstance().GetAudioService().SetVolume(vol);
+    Application::GetInstance().GetAudioService().SetVolume(vol, false);
 }
+
+#ifdef HI_STABILITY_PROBE
+RadioPlayer::ProbeStats RadioPlayer::GetProbeStats() const {
+    std::lock_guard<std::mutex> lock(s_pcm_mu);
+    return {s_probe_produced.load(),s_probe_submitted.load(),s_probe_rebuffer.load(),s_pcm.count};
+}
+#endif

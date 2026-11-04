@@ -1,3 +1,4 @@
+#include "hi_task_policy.h"
 /*
  * SPDX-FileCopyrightText: 2025 Espressif Systems (Shanghai) CO., LTD
  * SPDX-License-Identifier: LicenseRef-Espressif-Modified-MIT
@@ -158,7 +159,7 @@ static int __thread_create(media_lib_thread_handle_t *handle, const char *name,
     pthread_attr_setschedparam(&attr, &sp);
     pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
 
-    int ret = pthread_create(&t->id, &attr, __thread_trampoline, t);
+    int ret = hi_task_create_legacy(&t->id, &attr, __thread_trampoline, t);
     pthread_attr_destroy(&attr);
     if (ret != 0) {
         ESP_LOGE(TAG, "pthread_create '%s' failed: %d", name ? name : "?", ret);

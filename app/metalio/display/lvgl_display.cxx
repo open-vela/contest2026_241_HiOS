@@ -29,6 +29,7 @@ LvglDisplay::LvglDisplay()
     notification_timer_args.callback = [](void *arg) {
         LvglDisplay *display = static_cast<LvglDisplay *>(arg);
         DisplayLockGuard lock(display);
+        if (!lock) return;
         if (display->notification_label_)
             lv_obj_add_flag(display->notification_label_, LV_OBJ_FLAG_HIDDEN);
         if (display->status_label_)
@@ -74,6 +75,7 @@ LvglDisplay::~LvglDisplay()
 void LvglDisplay::SetupStatusBar(lv_obj_t *parent)
 {
     DisplayLockGuard lock(this);
+    if (!lock) return;
 
     /* Status bar container at top of screen */
     lv_obj_t *status_bar = lv_obj_create(parent);
@@ -159,6 +161,7 @@ void LvglDisplay::SetupStatusBar(lv_obj_t *parent)
 void LvglDisplay::SetStatus(const char *status)
 {
     DisplayLockGuard lock(this);
+    if (!lock) return;
     if (status_label_ == nullptr)
     {
         return;
@@ -179,6 +182,7 @@ void LvglDisplay::ShowNotification(const std::string &notification, int duration
 void LvglDisplay::ShowNotification(const char *notification, int duration_ms)
 {
     DisplayLockGuard lock(this);
+    if (!lock) return;
     if (notification_label_ == nullptr)
     {
         return;
@@ -198,6 +202,7 @@ void LvglDisplay::ShowNotification(const char *notification, int duration_ms)
 void LvglDisplay::SetEmotion(const char *emotion)
 {
     DisplayLockGuard lock(this);
+    if (!lock) return;
     if (emotion_label_ == nullptr)
     {
         return;
@@ -223,6 +228,7 @@ void LvglDisplay::SetEmotion(const char *emotion)
 void LvglDisplay::SetChatMessage(const char *role, const char *content)
 {
     DisplayLockGuard lock(this);
+    if (!lock) return;
     if (display_ == nullptr)
     {
         return;
@@ -279,6 +285,7 @@ void LvglDisplay::SetTheme(Theme *theme)
     if (lvgl_theme && display_)
     {
         DisplayLockGuard lock(this);
+        if (!lock) return;
         /* Update screen background */
         lv_obj_t *scr = lv_display_get_screen_active(display_);
         if (scr)
@@ -333,6 +340,8 @@ void LvglDisplay::UpdateStatusBar(bool update_all)
         }
 
         DisplayLockGuard lock(this);
+
+        if (!lock) return;
         if (battery_label_ != nullptr && battery_icon_ != icon)
         {
             battery_icon_ = icon;
@@ -367,6 +376,7 @@ void LvglDisplay::UpdateStatusBar(bool update_all)
         if (network_label_ != nullptr && net_icon != nullptr && network_icon_ != net_icon)
         {
             DisplayLockGuard lock(this);
+            if (!lock) return;
             network_icon_ = net_icon;
             lv_label_set_text(network_label_, network_icon_);
         }

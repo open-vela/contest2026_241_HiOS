@@ -15,6 +15,7 @@
 #define AUDIO_PROCESSOR_H
 
 #include <cmath>
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <functional>
@@ -40,6 +41,7 @@ public:
 
     virtual size_t GetFeedSize() = 0;
     virtual void EnableDeviceAec(bool enable) = 0;
+    virtual void SetVisualConversation(bool active) { (void)active; }
 };
 
 /*
@@ -50,6 +52,11 @@ public:
 class NoAudioProcessor : public AudioProcessor
 {
 public:
+    void SetVisualConversation(bool active) override {
+        if (visual_ == active) return;
+        visual_ = active;visual_slot_ready_ = false;mic_slot_votes_ = 0;
+        hp_x_ = hp_y_ = 0;
+    }
     void Initialize(AudioCodec* codec, int frame_duration_ms,
                     srmodel_list_t* models_list) override
     {
@@ -90,13 +97,29 @@ public:
             mic_slot_votes_ = 0;
 
             mono.resize(frames);
-            for (size_t i = 0; i < frames; ++i)
-                mono[i] = data[i * 2 + (size_t)mic_slot_];
+            if (visual_) {
+                // Same validated I2S slot relocation rule as HiOpenvelaWakeWord:
+                // mono DMA can move slots at 16-sample boundaries. Never pick
+                // the louder reference/EMI channel for the whole 60 ms packet.
+                for (size_t begin=0;begin<frames;begin+=16) {
+                    const size_t end=std::min(frames,begin+16);
+                    bool overlap=false;
+                    for (size_t i=begin;i<end;++i)
+                        overlap |= data[i*2]!=0 && data[i*2+1]!=0;
+                    for (size_t i=begin;i<end;++i)
+                        mono[i]=(overlap || data[i*2]!=0)?data[i*2]:data[i*2+1];
+                }
+            } else {
+                for (size_t i=0;i<frames;++i) mono[i]=data[i*2+mic_slot_];
+            }
 
             /* Light DC/rumble HPF + mild gain. 3/2 clipped peaks and made
              * cloud STT less accurate; 5/4 is enough for quiet speech. */
-            constexpr int kGainNum = 5;
-            constexpr int kGainDen = 4;
+            constexpr int kGainNum = 2;
+            constexpr int kGainDen = 1;
+            // Visual capture uses unity gain: a camera's electrical noise
+            // floor must not be amplified 2x before lossy Opus encoding.
+            constexpr int visual_gain=32768;
             int32_t prev_x = hp_x_;
             int32_t prev_y = hp_y_;
             for (size_t i = 0; i < frames; ++i)
@@ -106,7 +129,8 @@ public:
                 int32_t y = (prev_y * 15 + (x - prev_x) * 16) / 16;
                 prev_x = x;
                 prev_y = y;
-                int32_t g = (y * kGainNum) / kGainDen;
+                int32_t g = visual_ ? (int32_t)((int64_t)y*visual_gain/32768) :
+                                     (y * kGainNum) / kGainDen;
                 if (g > INT16_MAX)
                     g = INT16_MAX;
                 else if (g < -INT16_MAX)
@@ -138,7 +162,7 @@ public:
             }
             const float rms = std::sqrt((float)sum_sq / (float)n);
             /* Match post-gain levels; was 120 before soft gain. */
-            const bool loud = rms >= 180.0f;
+            const bool loud = rms >= 80.0f;
             if (loud)
             {
                 silence_hang_ = 0;
@@ -173,6 +197,7 @@ public:
         silence_hang_ = 0;
         hp_x_ = 0;
         hp_y_ = 0;
+        visual_slot_ready_=false;visual_slot_votes_=0;
         running_ = true;
     }
     void Stop() override
@@ -208,6 +233,8 @@ private:
     int mic_slot_votes_ = 0;
     int32_t hp_x_ = 0;
     int32_t hp_y_ = 0;
+    bool visual_=false,visual_slot_ready_=false;
+    int visual_slot_=0,visual_slot_votes_=0;
     int frame_duration_ms_ = 60;
     std::function<void(std::vector<int16_t>&&)> on_output_;
     std::function<void(bool)> on_vad_;

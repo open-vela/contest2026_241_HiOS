@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -37,17 +38,24 @@ public:
     bool sendData(const uint8_t *data, size_t length);
     bool sendString(const char *data);
     bool sendString(const std::string &data);
+    /* Worker-only: wait for UART ownership and finish the whole command. */
+    bool sendStringWait(const std::string &data, unsigned timeout_ms = 6000, std::function<bool()> valid = {});
+    // Worker-only: own both writes and the mode ACK as one transaction.
+    bool sendModeWait(int mode, std::function<bool()> valid = {});
 
     void registerCallback(std::function<void(const std::vector<uint8_t> &)> cb);
+    void registerAudioObserver(std::function<void(const std::vector<uint8_t> &)> cb);
 
 private:
     SimpleUart() = default;
     ~SimpleUart();
 
     void rxLoop();
+    void DispatchReceived(const std::vector<uint8_t>& data);
 
     int  fd_ = -1;
-    bool initialized_ = false;
+    std::atomic<bool> initialized_{false};
+    std::mutex init_mutex_;
     std::mutex cb_mutex_;
-    std::function<void(const std::vector<uint8_t> &)> callback_;
+    std::function<void(const std::vector<uint8_t> &)> callback_,audio_observer_;
 };

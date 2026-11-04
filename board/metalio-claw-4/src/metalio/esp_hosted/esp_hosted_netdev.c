@@ -37,6 +37,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #include <arch/board/board.h>
 #include <metalio/metalio.h>
@@ -121,12 +122,18 @@ int esp32p4_sdio_rw_extended(FAR struct sdio_dev_s *dev, bool write,
 
 #define RPC_ID_WIFI_INIT           278u
 #define RPC_ID_WIFI_START          280u
+#define RPC_ID_WIFI_STOP           281u
+#define RPC_ID_RESP_WIFI_START     536u
+#define RPC_ID_RESP_WIFI_STOP      537u
 #define RPC_ID_WIFI_CONNECT        282u
 #define RPC_ID_WIFI_DISCONNECT     283u
 #define RPC_ID_WIFI_SET_CONFIG     284u
 #define RPC_ID_WIFI_SCAN_START     286u
 #define RPC_ID_WIFI_SCAN_GET_APNUM 288u
 #define RPC_ID_WIFI_SCAN_GET_APREC 289u
+#define RPC_ID_WIFI_SCAN_GET_ONE   351u
+#define RPC_ID_WIFI_SET_BAND_MODE  348u
+#define RPC_ID_WIFI_CLEAR_AP_LIST 290u
 #define RPC_ID_WIFI_SET_MODE       260u
 
 #define RPC_ID_EVENT_STA_SCAN_DONE    774u
@@ -137,6 +144,8 @@ int esp32p4_sdio_rw_extended(FAR struct sdio_dev_s *dev, bool write,
 #define RPC_ID_RESP_WIFI_SCAN_START     542u
 #define RPC_ID_RESP_WIFI_SCAN_GET_APNUM 544u
 #define RPC_ID_RESP_WIFI_SCAN_GET_APREC 545u
+#define RPC_ID_RESP_WIFI_SCAN_GET_ONE   607u
+#define RPC_ID_RESP_WIFI_SET_BAND_MODE  604u
 
 #define RPC_ID_REQ_GET_DHCP_DNS         353u
 #define RPC_ID_RESP_GET_DHCP_DNS        609u
@@ -181,6 +190,10 @@ struct metalio_hosted_s
   unsigned int rx_cap;                 /* Allocated size of rx_buf */
   FAR uint8_t *rx_buf;                 /* Dynamically grown RX buffer */
   bool wifi_init;                      /* Req_WifiInit already sent          */
+  atomic_bool wifi_started;
+  atomic_bool radio_resp;
+  int radio_status;
+  atomic_uint radio_response_id;
   bool mac_queried;                    /* STA MAC already fetched from slave  */
   volatile bool get_mac_resp;          /* Resp_GetMacAddress received         */
   uint8_t sta_mac[6];                  /* Slave's real STA MAC               */
@@ -199,7 +212,10 @@ struct metalio_hosted_s
   volatile bool scan_start_resp;
   volatile bool scan_done_event;
   volatile bool scan_apnum_resp;
-  volatile bool scan_aprec_resp;
+  atomic_bool scan_aprec_resp;
+  atomic_bool band_resp;
+  int band_status;
+  int scan_record_status;
   volatile int scan_start_status;      /* esp_err_t echoed by Resp_WifiScanStart */
   volatile uint32_t scan_done_number;
   volatile uint32_t scan_apnum_number;
@@ -212,6 +228,7 @@ struct metalio_hosted_s
  ****************************************************************************/
 
 static FAR struct metalio_hosted_s *g_hosted;
+static atomic_bool g_wifi_allowed = true;
 
 /****************************************************************************
  * Private Functions
@@ -733,28 +750,16 @@ static uint16_t hosted_rpc_wifi_scan_get_apnum(FAR uint8_t *out, uint16_t cap)
   return rpc.len;
 }
 
-/* Compose the protobuf `Rpc` message for Req_WifiScanGetApRecords(289),
- * requesting `number` records.
- */
-
-static uint16_t hosted_rpc_wifi_scan_get_ap_records(FAR uint8_t *out,
-                                                    uint16_t cap,
-                                                    uint32_t number)
+/* Single-record reads stay below the SDIO frame limit without truncating
+ * the scan to the strongest 12 APs. Each read removes one driver record. */
+static uint16_t hosted_rpc_simple(FAR uint8_t *out, uint16_t cap, uint32_t id,
+                                  FAR const struct pb_buf_s *payload)
 {
-  struct pb_buf_s req = {0};
   struct pb_buf_s rpc = {0};
-
-  pb_uint32(&req, 1, number);
-
   pb_enum(&rpc, 1, RPC_MSG_TYPE_REQ);
-  pb_enum(&rpc, 2, RPC_ID_WIFI_SCAN_GET_APREC);
-  pb_bytes(&rpc, RPC_ID_WIFI_SCAN_GET_APREC, req.data, req.len);
-
-  if (rpc.len > cap)
-    {
-      return 0;
-    }
-
+  pb_enum(&rpc, 2, id);
+  pb_bytes(&rpc, id, payload ? payload->data : NULL, payload ? payload->len : 0);
+  if (rpc.len > cap) return 0;
   memcpy(out, rpc.data, rpc.len);
   return rpc.len;
 }
@@ -1132,6 +1137,23 @@ static void hosted_rpc_parse_ap_record(FAR struct metalio_hosted_s *priv,
       priv->scan_aps[idx].ssid[0] = '\0';
     }
 
+  /* Preserve the BSSID and channel returned by the C5.  The network
+   * configuration UI uses these fields to identify the selected AP when
+   * multiple access points advertise the same SSID. */
+  {
+    FAR const uint8_t *bssid = NULL;
+    uint32_t bssid_len = 0;
+    uint32_t channel = 0;
+    memset(priv->scan_aps[idx].bssid, 0, 6);
+    if (pb_field_bytes(p, len, 1, &bssid, &bssid_len) && bssid_len == 6)
+      {
+        memcpy(priv->scan_aps[idx].bssid, bssid, 6);
+      }
+
+    pb_field_varint(p, len, 3, &channel);
+    priv->scan_aps[idx].channel = (uint8_t)channel;
+  }
+
   pb_field_varint(p, len, 5, &rssi);
   pb_field_varint(p, len, 6, &authmode);
 
@@ -1160,6 +1182,27 @@ static void hosted_rpc_resp(FAR struct metalio_hosted_s *priv, uint32_t msg_id,
 
   switch (msg_id)
     {
+    case RPC_ID_RESP_WIFI_START:
+    case RPC_ID_RESP_WIFI_STOP:
+      if (msg_id == priv->radio_response_id) {
+        priv->radio_status = (int)resp;
+        atomic_store(&priv->radio_resp, true);
+      }
+      break;
+
+    case RPC_ID_RESP_WIFI_SET_BAND_MODE:
+      priv->band_status = (int)resp;
+      atomic_store(&priv->band_resp, true);
+      break;
+
+    case RPC_ID_RESP_WIFI_SCAN_GET_ONE:
+      priv->scan_record_status = (int)resp;
+      if (resp == 0 && pb_field_bytes(p, len, 2, &sub, &sub_len))
+        hosted_rpc_parse_ap_record(priv, sub, sub_len);
+      else if (resp == 0) priv->scan_record_status = -EPROTO;
+      atomic_store(&priv->scan_aprec_resp, true);
+      break;
+
     case RPC_ID_RESP_WIFI_SCAN_START:
       priv->scan_start_status = (int)resp;
       priv->scan_start_resp = true;
@@ -1565,7 +1608,9 @@ static FAR netpkt_t *hosted_parse_frame(FAR struct metalio_hosted_s *priv)
       pkt = netpkt_alloc(&priv->dev, NETPKT_RX);
       if (pkt == NULL)
         {
-          return NULL;
+          /* Drop this frame under IOB pressure. Retaining it at the head
+           * blocks smaller DNS/ACK packets and control events behind it. */
+          goto consume;
         }
 
       ret = netpkt_copyin(&priv->dev, pkt,
@@ -1573,7 +1618,8 @@ static FAR netpkt_t *hosted_parse_frame(FAR struct metalio_hosted_s *priv)
       if (ret < 0)
         {
           netpkt_free(&priv->dev, pkt, NETPKT_RX);
-          return NULL;
+          pkt = NULL;
+          goto consume;
         }
 
       priv->rx_pkts++;
@@ -1594,6 +1640,7 @@ static FAR netpkt_t *hosted_parse_frame(FAR struct metalio_hosted_s *priv)
         }
     }
 
+consume:
   memmove(priv->rx_buf, priv->rx_buf + ESP_HOSTED_PAYLOAD_HDR_LEN + len,
           priv->rx_len - (ESP_HOSTED_PAYLOAD_HDR_LEN + len));
   priv->rx_len -= ESP_HOSTED_PAYLOAD_HDR_LEN + len;
@@ -1739,6 +1786,7 @@ static int hosted_ensure_link(FAR struct metalio_hosted_s *priv)
 
   hosted_c5_hw_reset();
   priv->wifi_init = false;
+  priv->wifi_started = false;
   priv->mac_queried = false;
   priv->sta_connected = false;
   esp32p4_sdmmc_slot1_prepare(priv->sdio);
@@ -1784,7 +1832,9 @@ static void hosted_poll_worker(void *arg)
    */
 
   nxmutex_lock(&priv->lock);
-  if (priv->link_up && hosted_rx_avail(priv, &avail, NULL) == OK && avail > 0)
+  if (priv->link_up &&
+      (priv->rx_len >= ESP_HOSTED_PAYLOAD_HDR_LEN ||
+       (hosted_rx_avail(priv, &avail, NULL) == OK && avail > 0)))
     {
       ready = true;
     }
@@ -1833,14 +1883,12 @@ static int hosted_transmit(FAR struct netdev_lowerhalf_s *dev,
 
   if (!priv->link_up)
     {
-      netpkt_free(dev, pkt, NETPKT_TX);
       return -ENETDOWN;
     }
 
   len = netpkt_getdatalen(dev, pkt);
   if (len > ESP_HOSTED_MAX_PAYLOAD)
     {
-      netpkt_free(dev, pkt, NETPKT_TX);
       return -E2BIG;
     }
 
@@ -1855,7 +1903,6 @@ static int hosted_transmit(FAR struct netdev_lowerhalf_s *dev,
   buf = kmm_malloc(ESP_HOSTED_PAYLOAD_HDR_LEN + txlen);
   if (buf == NULL)
     {
-      netpkt_free(dev, pkt, NETPKT_TX);
       return -ENOMEM;
     }
 
@@ -1863,7 +1910,6 @@ static int hosted_transmit(FAR struct netdev_lowerhalf_s *dev,
   if (ret < 0)
     {
       kmm_free(buf);
-      netpkt_free(dev, pkt, NETPKT_TX);
       return ret;
     }
 
@@ -1879,10 +1925,11 @@ static int hosted_transmit(FAR struct netdev_lowerhalf_s *dev,
   ret = hosted_fifo_write(priv, buf, ESP_HOSTED_PAYLOAD_HDR_LEN + txlen);
   nxmutex_unlock(&priv->lock);
 
-  priv->tx_pkts++;
+  if (ret == OK) priv->tx_pkts++;
 
   kmm_free(buf);
-  netpkt_free(dev, pkt, NETPKT_TX);
+  /* On error the upper half retains and reclaims pkt. */
+  if (ret == OK) netpkt_free(dev, pkt, NETPKT_TX);
   return ret;
 }
 
@@ -2106,15 +2153,36 @@ int metalio_esp_hosted_initialize(void)
   return OK;
 }
 
+/* Called with scan_lock held. Match the slave's acknowledgement, not
+ * merely a successful SDIO write. STOP keeps Wi-Fi initialized for START. */
+static int hosted_wifi_radio(FAR struct metalio_hosted_s *priv, bool enabled)
+{
+  struct pb_buf_s rpc = {0};
+  uint32_t id = enabled ? RPC_ID_WIFI_START : RPC_ID_WIFI_STOP;
+  priv->radio_response_id = enabled ? RPC_ID_RESP_WIFI_START : RPC_ID_RESP_WIFI_STOP;
+  atomic_store(&priv->radio_resp, false);
+  pb_enum(&rpc, 1, RPC_MSG_TYPE_REQ);
+  pb_enum(&rpc, 2, id);
+  pb_bytes(&rpc, id, NULL, 0);
+  int ret = hosted_rpc_send(priv, rpc.data, rpc.len);
+  for (int elapsed = 0; ret == OK && !atomic_load(&priv->radio_resp) && elapsed < 5000; elapsed += 10)
+    usleep(10000);
+  if (ret == OK) ret = !atomic_load(&priv->radio_resp) ? -ETIMEDOUT : priv->radio_status == 0 ? OK : -EIO;
+  if (ret == OK) priv->wifi_started = enabled;
+  syslog(LOG_INFO, "esp-hosted: radio enabled=%d acknowledged=%d result=%d\n", enabled, atomic_load(&priv->radio_resp), ret);
+  return ret;
+}
+
 static int hosted_ensure_wifi_started(FAR struct metalio_hosted_s *priv)
 {
   uint8_t rpc[PB_BUF_CAP];
   uint16_t rpc_len;
   int ret;
 
+  if (!atomic_load(&g_wifi_allowed)) return -ENETDOWN;
   if (priv->wifi_init)
     {
-      return OK;
+      return priv->wifi_started ? OK : hosted_wifi_radio(priv, true);
     }
 
   rpc_len = hosted_rpc_wifi_init(rpc, sizeof(rpc));
@@ -2157,6 +2225,7 @@ static int hosted_ensure_wifi_started(FAR struct metalio_hosted_s *priv)
     }
 
   priv->wifi_init = true;
+  priv->wifi_started = true;
   syslog(LOG_INFO, "esp-hosted: wifi init+setmode+start sent OK\n");
 
   /* Fetch the slave's real STA MAC and use it for the host netdev.  The
@@ -2227,10 +2296,18 @@ int metalio_esp_hosted_start_wifi(void)
       return ret;
     }
 
-  return hosted_ensure_wifi_started(priv);
+  nxmutex_lock(&priv->scan_lock);
+  ret = hosted_ensure_wifi_started(priv);
+  nxmutex_unlock(&priv->scan_lock);
+  return ret;
 }
 
-int metalio_esp_hosted_connect(FAR const char *ssid, FAR const char *pass)
+int metalio_esp_hosted_ensure_wifi_ready(void)
+{
+  return metalio_esp_hosted_start_wifi();
+}
+
+static int hosted_connect(FAR const char *ssid, FAR const char *pass)
 {
   FAR struct metalio_hosted_s *priv = g_hosted;
   uint8_t rpc[PB_BUF_CAP];
@@ -2288,6 +2365,41 @@ int metalio_esp_hosted_connect(FAR const char *ssid, FAR const char *pass)
 
   syslog(LOG_INFO, "esp-hosted: init+set-config+connect SSID=%s (ret=%d)\n",
          ssid, ret);
+  return ret;
+}
+
+int metalio_esp_hosted_connect(FAR const char *ssid, FAR const char *pass)
+{
+  FAR struct metalio_hosted_s *priv = g_hosted;
+  if (!priv) return -ENODEV;
+  nxmutex_lock(&priv->scan_lock);
+  int ret = hosted_connect(ssid, pass);
+  nxmutex_unlock(&priv->scan_lock);
+  return ret;
+}
+
+bool metalio_esp_hosted_radio_enabled(void)
+{
+  return g_hosted != NULL && atomic_load(&g_hosted->wifi_started);
+}
+
+int metalio_esp_hosted_set_radio(bool enabled)
+{
+  FAR struct metalio_hosted_s *priv = g_hosted;
+  atomic_store(&g_wifi_allowed, enabled);
+  if (!priv) return -ENODEV;
+  nxmutex_lock(&priv->scan_lock);
+  int ret = OK;
+  if (enabled) ret = hosted_ensure_wifi_started(priv);
+  else if (priv->wifi_init) {
+    ret = hosted_wifi_radio(priv, false);
+    if (ret == OK) {
+      priv->sta_connected = false;
+      priv->conn_ssid[0] = '\0';
+      netdev_lower_carrier_off(&priv->dev);
+    }
+  }
+  nxmutex_unlock(&priv->scan_lock);
   return ret;
 }
 
@@ -2363,23 +2475,41 @@ int metalio_esp_hosted_scan(FAR struct metalio_wifi_ap_s *out, int max_ap)
       goto done;
     }
 
+  // Explicitly permit both C5 bands; do not inherit a retained 5 GHz-only
+  // setting from earlier firmware. Radio access remains under scan_lock.
+  {
+    struct pb_buf_s band = {0};
+    pb_uint32(&band, 1, 3); /* WIFI_BAND_MODE_AUTO */
+    atomic_store(&priv->band_resp, false);
+    rpc_len = hosted_rpc_simple(rpc, sizeof(rpc), RPC_ID_WIFI_SET_BAND_MODE, &band);
+    ret = hosted_rpc_send(priv, rpc, rpc_len);
+    for (timeout = 0; ret == OK && !atomic_load(&priv->band_resp) && timeout < 3000; timeout += 10)
+      usleep(10000);
+    syslog(LOG_INFO, "esp-hosted: scan dual-band ack=%d status=%d\n",
+           atomic_load(&priv->band_resp), atomic_load(&priv->band_resp) ? priv->band_status : -ETIMEDOUT);
+    // Older C5 firmware may not expose this RPC; still collect its scan.
+  }
+
   /* Boot auto-connect often leaves the C5 mid-association (or retrying an
    * unreachable SSID).  MetalioClaw4 uses esp_wifi_scan_start(..., false)
    * (non-blocking) and waits for WIFI_EVENT_SCAN_DONE.  Blocking
    * Req_WifiScanStart on the slave holds the RPC reply for ~9s and frequently
    * times out / returns ESP_ERR_WIFI_STATE (0x3006) while STA is busy.
    *
-   * Always free the radio first, then start a non-blocking scan and wait for
-   * Event_StaScanDone before fetching AP records.
+   * When already associated, scan without disconnecting first (faster and
+   * keeps xiaozhi.me MQTT up).  On ESP_ERR_WIFI_STATE, disconnect and retry.
    */
-  rpc_len = hosted_rpc_wifi_disconnect(rpc, sizeof(rpc));
-  if (rpc_len > 0)
+  if (!priv->sta_connected)
     {
-      (void)hosted_rpc_send(priv, rpc, rpc_len);
-    }
+      rpc_len = hosted_rpc_wifi_disconnect(rpc, sizeof(rpc));
+      if (rpc_len > 0)
+        {
+          (void)hosted_rpc_send(priv, rpc, rpc_len);
+        }
 
-  priv->sta_connected = false;
-  usleep(300 * 1000);
+      priv->sta_connected = false;
+      usleep(300 * 1000);
+    }
 
   for (i = 0; i < 3; i++)
     {
@@ -2525,54 +2655,24 @@ int metalio_esp_hosted_scan(FAR struct metalio_wifi_ap_s *out, int max_ap)
       goto done;
     }
 
-  /* One SDIO serial frame is capped at ESP_HOSTED_MAX_PAYLOAD (1524).  A
-   * full wifi_ap_record protobuf is ~60–100 bytes; asking for 27+ APs makes
-   * Resp_WifiScanGetApRecords exceed the frame limit, so the host drops the
-   * "corrupt" length and the UI times out with "扫描失败".  Cap the fetch.
-   */
-#define HOSTED_SCAN_AP_FETCH_MAX  12u
-  if (number > HOSTED_SCAN_AP_FETCH_MAX)
-    {
-      syslog(LOG_INFO,
-             "esp-hosted: scan: capping GetApRecords %lu -> %u (SDIO frame)\n",
-             (unsigned long)number, HOSTED_SCAN_AP_FETCH_MAX);
-      number = HOSTED_SCAN_AP_FETCH_MAX;
-    }
-
-  if (number > METALIO_WIFI_MAX_AP)
-    {
-      number = METALIO_WIFI_MAX_AP;
-    }
-
-  rpc_len = hosted_rpc_wifi_scan_get_ap_records(rpc, sizeof(rpc), number);
-  if (rpc_len == 0)
-    {
-      ret = -E2BIG;
+  if (number > METALIO_WIFI_MAX_AP) number = METALIO_WIFI_MAX_AP;
+  for (uint32_t record = 0; record < number; ++record) {
+    atomic_store(&priv->scan_aprec_resp, false);
+    rpc_len = hosted_rpc_simple(rpc, sizeof(rpc), RPC_ID_WIFI_SCAN_GET_ONE, NULL);
+    ret = hosted_rpc_send(priv, rpc, rpc_len);
+    if (ret < 0) goto done;
+    for (timeout = 0; !atomic_load(&priv->scan_aprec_resp) && timeout < 3000; timeout += 10)
+      usleep(10000);
+    if (!atomic_load(&priv->scan_aprec_resp) || priv->scan_record_status != 0) {
+      syslog(LOG_WARNING, "esp-hosted: scan record %lu failed status=%d\n",
+             (unsigned long)record, priv->scan_record_status);
+      ret = !atomic_load(&priv->scan_aprec_resp) ? -ETIMEDOUT : -EIO;
       goto done;
     }
-
-  ret = hosted_rpc_send(priv, rpc, rpc_len);
-  if (ret < 0)
-    {
-      goto done;
-    }
-
-  for (timeout = 0; timeout < 10000; timeout += 50)
-    {
-      if (priv->scan_aprec_resp)
-        {
-          break;
-        }
-
-      usleep(50 * 1000);
-    }
-
-  if (!priv->scan_aprec_resp)
-    {
-      syslog(LOG_INFO, "esp-hosted: scan: no Resp_WifiScanGetApRecords (timeout)\n");
-      ret = -ETIMEDOUT;
-      goto done;
-    }
+  }
+  // Release any records beyond our bounded result array on the C5.
+  rpc_len = hosted_rpc_simple(rpc, sizeof(rpc), RPC_ID_WIFI_CLEAR_AP_LIST, NULL);
+  (void)hosted_rpc_send(priv, rpc, rpc_len);
 
   n = (int)priv->scan_ap_count;
   if (n > max_ap)

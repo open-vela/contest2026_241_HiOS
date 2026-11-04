@@ -5,13 +5,13 @@
  * OTA implementation — ported from MetalioClaw4 main/ota.cc.
  *
  * Network access goes through the small BSD-socket Http class declared in
- * ota.h. Flash writes are stubbed via Ota::WriteToFlash (currently a no-op
- * returning true) — wiring it up to the NuttX partition/flash API is a
- * follow-up task. Everything else (URL handling, JSON parsing, activation
- * challenge, version comparison) matches the reference implementation.
+ * ota.h. This NuttX build has no compatible OTA update partition, so an
+ * installation reports failure before downloading/writing an ESP-IDF image.
+ * Version checks and activation use the original service protocol.
  */
 
 #include "ota.h"
+#include "app_dns.h"
 #include "application.h"
 #include "board_shim.h"
 #include "settings.h"
@@ -30,12 +30,14 @@
 #include <thread>
 
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <cerrno>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 
 #include <mbedtls/ssl.h>
@@ -53,13 +55,15 @@
 /* Http                                                                */
 /* ------------------------------------------------------------------ */
 
+struct HttpSocketContext { int fd=-1; int64_t deadline_us=0; };
+
 struct HttpTlsImpl
 {
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
-    int bio_fd = -1;
+    HttpSocketContext bio;
     bool initialized = false;
     bool handshaken = false;
 };
@@ -67,10 +71,22 @@ struct HttpTlsImpl
 namespace
 {
 
+bool UpdateHttpSocketDeadline(int fd,int64_t deadline)
+{
+    if (!deadline) return true;
+    const int64_t remaining=deadline-esp_timer_get_time();
+    if (remaining<=0) {errno=ETIMEDOUT;return false;}
+    timeval wait{};wait.tv_sec=remaining/1000000;wait.tv_usec=remaining%1000000;
+    return setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&wait,sizeof(wait))==0 &&
+        setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&wait,sizeof(wait))==0;
+}
+
 /* mbedTLS BIO callbacks wrapping the existing BSD socket. */
 static int http_tls_send(void *ctx, const unsigned char *buf, size_t len)
 {
-    int fd = *(int *)ctx;
+    auto *socket=static_cast<HttpSocketContext *>(ctx);
+    if (!UpdateHttpSocketDeadline(socket->fd,socket->deadline_us)) return MBEDTLS_ERR_NET_SEND_FAILED;
+    int fd=socket->fd;
     ssize_t n = send(fd, buf, len, 0);
     if (n < 0)
     {
@@ -83,7 +99,9 @@ static int http_tls_send(void *ctx, const unsigned char *buf, size_t len)
 
 static int http_tls_recv(void *ctx, unsigned char *buf, size_t len)
 {
-    int fd = *(int *)ctx;
+    auto *socket=static_cast<HttpSocketContext *>(ctx);
+    if (!UpdateHttpSocketDeadline(socket->fd,socket->deadline_us)) return MBEDTLS_ERR_NET_RECV_FAILED;
+    int fd=socket->fd;
     ssize_t n = recv(fd, buf, len, 0);
     if (n < 0)
     {
@@ -103,6 +121,11 @@ Http::~Http()
     Close();
 }
 
+void Http::SetDeadlineMs(uint32_t milliseconds)
+{
+    deadline_us_=milliseconds ? esp_timer_get_time()+static_cast<int64_t>(milliseconds)*1000 : 0;
+}
+
 void Http::SetHeader(const std::string &name, const std::string &value)
 {
     headers_[name] = value;
@@ -111,6 +134,15 @@ void Http::SetHeader(const std::string &name, const std::string &value)
 void Http::SetContent(std::string content)
 {
     request_body_ = std::move(content);
+    request_file_.clear();
+    request_suffix_.clear();
+}
+
+void Http::SetContentFile(std::string path, std::string prefix, std::string suffix)
+{
+    request_file_ = std::move(path);
+    request_body_ = std::move(prefix);
+    request_suffix_ = std::move(suffix);
 }
 
 bool Http::ParseUrl(const std::string &url)
@@ -161,6 +193,7 @@ bool Http::ParseUrl(const std::string &url)
 
 int Http::NetSend(const char *buf, size_t len)
 {
+    if (!UpdateHttpSocketDeadline(sock_,deadline_us_)) {last_error_=errno;return -1;}
     if (!tls_)
     {
         ssize_t n = send(sock_, buf, len, 0);
@@ -186,12 +219,13 @@ int Http::NetSend(const char *buf, size_t len)
         last_error_ = EAGAIN;
         return -1;
     }
-    last_error_ = EIO;
+    last_error_ = deadline_us_ && esp_timer_get_time()>=deadline_us_ ? ETIMEDOUT : EIO;
     return -1;
 }
 
 int Http::NetRecv(char *buf, size_t len)
 {
+    if (!UpdateHttpSocketDeadline(sock_,deadline_us_)) {last_error_=errno;return -1;}
     if (!tls_)
     {
         ssize_t n = recv(sock_, buf, len, 0);
@@ -219,7 +253,7 @@ int Http::NetRecv(char *buf, size_t len)
         last_error_ = EAGAIN;
         return -1;
     }
-    last_error_ = EIO;
+    last_error_ = deadline_us_ && esp_timer_get_time()>=deadline_us_ ? ETIMEDOUT : EIO;
     return -1;
 }
 
@@ -260,6 +294,25 @@ bool Http::TlsSetup()
     mbedtls_ssl_conf_authmode(&t->conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&t->conf, mbedtls_ctr_drbg_random, &t->ctr_drbg);
 
+    bool browser=false;
+    for(const auto &header:headers_)
+        if(header.first=="User-Agent"&&header.second.find("HiOS-HiApp/")!=std::string::npos)browser=true;
+    if(browser){
+        // The lightweight browser speaks HTTP/1.1. Prefer the MCU's P-256
+        // path rather than advertising every costly software-only group.
+        // AI/OTA/voice HTTP requests retain their existing TLS configuration.
+        static const uint16_t groups[]={MBEDTLS_SSL_IANA_TLS_GROUP_SECP256R1,
+            MBEDTLS_SSL_IANA_TLS_GROUP_SECP384R1,MBEDTLS_SSL_IANA_TLS_GROUP_NONE};
+        mbedtls_ssl_conf_groups(&t->conf,groups);
+#if defined(MBEDTLS_SSL_ALPN)
+        static const char *const protocols[]={"http/1.1",nullptr};
+        // The API records and reads this list; it never writes its entries.
+        if(mbedtls_ssl_conf_alpn_protocols(&t->conf,const_cast<const char**>(protocols))!=0){
+            last_error_=EINVAL;TlsTeardown();return false;
+        }
+#endif
+    }
+
     ret = mbedtls_ssl_setup(&t->ssl, &t->conf);
     if (ret != 0)
     {
@@ -278,15 +331,25 @@ bool Http::TlsSetup()
         return false;
     }
 
-    t->bio_fd = sock_;
-    mbedtls_ssl_set_bio(&t->ssl, &t->bio_fd, http_tls_send, http_tls_recv, nullptr);
+    t->bio.fd = sock_;t->bio.deadline_us=deadline_us_;
+    mbedtls_ssl_set_bio(&t->ssl, &t->bio, http_tls_send, http_tls_recv, nullptr);
 
+    const auto handshake_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while ((ret = mbedtls_ssl_handshake(&t->ssl)) != 0)
     {
+        if (deadline_us_ && esp_timer_get_time()>=deadline_us_) {
+            last_error_=ETIMEDOUT;TlsTeardown();return false;
+        }
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
         {
             ESP_LOGE(TAG, "mbedtls_ssl_handshake failed: -0x%x", (unsigned)-ret);
             last_error_ = EIO;
+            TlsTeardown();
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= handshake_deadline) {
+            last_error_ = ETIMEDOUT;
+            ESP_LOGE(TAG, "TLS handshake timed out");
             TlsTeardown();
             return false;
         }
@@ -320,33 +383,58 @@ void Http::TlsTeardown()
 
 bool Http::SendRequest()
 {
+    struct FileCloser { void operator()(FILE *file) const { if (file) fclose(file); } };
+    std::unique_ptr<FILE, FileCloser> file;
+    size_t file_size = 0;
+    if (!request_file_.empty()) {
+        file.reset(fopen(request_file_.c_str(), "rb"));
+        struct stat st{};
+        if (!file || fstat(fileno(file.get()), &st) < 0 ||
+            !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > 8 * 1024 * 1024) {
+            last_error_ = EINVAL;
+            return false;
+        }
+        file_size = static_cast<size_t>(st.st_size);
+    }
+    const size_t body_size = request_body_.size() + file_size + request_suffix_.size();
     std::string req = method_ + " " + path_ + " HTTP/1.1\r\n";
-    req += "Host: " + host_ + "\r\n";
+    req += "Host: " + host_;
+    if(port_ != (tls_ ? 443 : 80)) req += ":" + std::to_string(port_);
+    req += "\r\n";
     req += "Connection: close\r\n";
-    req += "User-Agent: metalio-claw-4/1.0.0-openvela\r\n";
+    bool has_user_agent=false;
+    for(const auto &header:headers_){std::string name=header.first;for(char&c:name)c=(char)tolower((unsigned char)c);if(name=="user-agent")has_user_agent=true;}
+    if(!has_user_agent)req += "User-Agent: metalio-claw-4/1.0.0-openvela\r\n";
     for (auto &h : headers_)
         req += h.first + ": " + h.second + "\r\n";
-    if (!request_body_.empty())
+    if (body_size != 0)
     {
         char len_buf[32];
-        snprintf(len_buf, sizeof(len_buf), "%zu", request_body_.size());
+        snprintf(len_buf, sizeof(len_buf), "%zu", body_size);
         req += "Content-Length: " + std::string(len_buf) + "\r\n";
     }
     req += "\r\n";
-    if (!request_body_.empty())
-        req += request_body_;
-
-    size_t sent = 0;
-    while (sent < req.size())
-    {
-        int n = NetSend(req.data() + sent, req.size() - sent);
-        if (n <= 0)
-        {
-            return false;
+    auto send_all = [this](const char *data, size_t size) {
+        size_t sent = 0;
+        while (sent < size) {
+            int n = NetSend(data + sent, std::min(size - sent, size_t(4096)));
+            if (n <= 0) return false;
+            sent += static_cast<size_t>(n);
         }
-        sent += (size_t)n;
+        return true;
+    };
+    if (!send_all(req.data(), req.size()) ||
+        !send_all(request_body_.data(), request_body_.size())) return false;
+    if (file) {
+        char buffer[4096];
+        while (file_size != 0) {
+            size_t n = fread(buffer, 1, std::min(file_size, sizeof(buffer)), file.get());
+            if (n == 0) { last_error_ = EIO; return false; }
+            if (!send_all(buffer, n)) return false;
+            file_size -= n;
+        }
     }
-    return true;
+    return send_all(request_suffix_.data(), request_suffix_.size());
 }
 
 bool Http::ReadStatusAndHeaders()
@@ -389,6 +477,9 @@ bool Http::ReadStatusAndHeaders()
     /* Parse headers (case-insensitive Content-Length / Transfer-Encoding). */
     content_length_ = 0;
     chunked_ = false;
+    response_location_.clear();
+    response_type_.clear();
+    response_encoding_.clear();
     size_t pos = head.find("\r\n") + 2;
     while (pos < head.size())
     {
@@ -408,7 +499,10 @@ bool Http::ReadStatusAndHeaders()
             for (auto &c : lname)
                 c = (char)tolower((unsigned char)c);
 
-            if (lname == "content-length")
+            if (lname == "location") response_location_ = value;
+            else if (lname == "content-type") response_type_ = value;
+            else if (lname == "content-encoding") {response_encoding_=value;for(char &c:response_encoding_)c=(char)tolower((unsigned char)c);while(!response_encoding_.empty()&&response_encoding_.back()==' ')response_encoding_.pop_back();}
+            else if (lname == "content-length")
             {
                 content_length_ = (size_t)std::strtoul(value.c_str(), nullptr, 10);
             }
@@ -562,8 +656,12 @@ std::string Http::ReadAll()
     while (true)
     {
         int n = Read(buf, sizeof(buf));
-        if (n <= 0)
+        if (n <= 0) {
+            // A truncated chunked body can return -1 on peer EOF without
+            // a socket errno. Opt-in bounded requests must reject it too.
+            if(n<0 && deadline_us_ && !last_error_) last_error_=EIO;
             break;
+        }
         out.append(buf, n);
     }
     return out;
@@ -584,10 +682,20 @@ bool Http::Open(const std::string &method, const std::string &url)
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
+    std::string connect_host=host_;
+    if (deadline_us_) {
+        uint32_t address=0;char numeric[INET_ADDRSTRLEN]{};
+        if (esp_timer_get_time()>=deadline_us_ ||
+            metalio_voice_resolve_ipv4(host_.c_str(),&address)<0 ||
+            !inet_ntop(AF_INET,&address,numeric,sizeof(numeric))) {
+            last_error_=ETIMEDOUT;return false;
+        }
+        connect_host=numeric;hints.ai_flags=AI_NUMERICHOST;
+    }
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port_);
 
-    if (getaddrinfo(host_.c_str(), port_str, &hints, &res) != 0 || res == nullptr)
+    if (getaddrinfo(connect_host.c_str(), port_str, &hints, &res) != 0 || res == nullptr)
     {
         ESP_LOGE(TAG, "getaddrinfo(%s:%d) failed", host_.c_str(), port_);
         last_error_ = EHOSTUNREACH;
@@ -602,6 +710,15 @@ bool Http::Open(const std::string &method, const std::string &url)
         return false;
     }
 
+    if (metalio_app_bind_active_interface(sock_) < 0)
+    {
+        last_error_ = errno ? errno : ENODEV;
+        close(sock_);
+        sock_ = -1;
+        freeaddrinfo(res);
+        return false;
+    }
+
     /* Bound waits so a dead DNS/route cannot freeze the activation UI forever. */
     {
         struct timeval tv;
@@ -611,7 +728,28 @@ bool Http::Open(const std::string &method, const std::string &url)
         setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
-    if (connect(sock_, res->ai_addr, res->ai_addrlen) < 0)
+    int connected=-1;
+    if (!deadline_us_) connected=connect(sock_,res->ai_addr,res->ai_addrlen);
+    else if (UpdateHttpSocketDeadline(sock_,deadline_us_)) {
+        const int flags=fcntl(sock_,F_GETFL,0);
+        if (flags>=0 && fcntl(sock_,F_SETFL,flags|O_NONBLOCK)==0) {
+            connected=connect(sock_,res->ai_addr,res->ai_addrlen);
+            if (connected<0 && errno==EINPROGRESS) {
+                const int64_t remaining=deadline_us_-esp_timer_get_time();
+                if (remaining>0 && sock_<FD_SETSIZE) {
+                    fd_set writable;FD_ZERO(&writable);FD_SET(sock_,&writable);
+                    timeval wait{};wait.tv_sec=remaining/1000000;wait.tv_usec=remaining%1000000;
+                    int selected=select(sock_+1,nullptr,&writable,nullptr,&wait);
+                    int error=0;socklen_t size=sizeof(error);
+                    if (selected>0 && getsockopt(sock_,SOL_SOCKET,SO_ERROR,&error,&size)==0 && error==0)
+                        connected=0;
+                    else errno=selected==0?ETIMEDOUT:(error?error:errno);
+                } else errno=remaining<=0?ETIMEDOUT:EMFILE;
+            }
+            (void)fcntl(sock_,F_SETFL,flags);
+        }
+    }
+    if (connected < 0)
     {
         ESP_LOGE(TAG, "connect(%s:%d) failed: %s", host_.c_str(), port_, strerror(errno));
         last_error_ = errno;
@@ -655,17 +793,19 @@ void Http::Close()
 }
 
 /* ------------------------------------------------------------------ */
-/* Stub: flash write hook                                              */
+/* Flash update capability                                              */
 /* ------------------------------------------------------------------ */
 
 namespace
 {
 
 /* TODO: wire to NuttX flash partition API (boardctl or /dev/...).
- * For now we just verify the download completes; no flash is written. */
+ * A compatible NuttX partition/update driver is required to enable it. */
 bool ota_write_to_flash(const char * /*data*/, size_t /*len*/, bool /*begin*/)
 {
-    return true;
+    // This NuttX image has no OTA slot/MTD update driver. Never acknowledge
+    // an ESP-IDF image as installed without an actual verified flash write.
+    return false;
 }
 
 } /* namespace */
@@ -685,6 +825,27 @@ std::string Ota::GetCheckVersionUrl()
     if (url.empty())
         url = kDefaultOtaUrl;
     return url;
+}
+
+bool Ota::LoadPersistedProtocolConfig()
+{
+    has_mqtt_config_ = false;
+    has_websocket_config_ = false;
+
+    {
+        Settings mqtt("mqtt", false);
+        const std::string endpoint = mqtt.GetString("endpoint");
+        if (!endpoint.empty())
+            has_mqtt_config_ = true;
+    }
+    if (!has_mqtt_config_)
+    {
+        Settings ws("websocket", false);
+        const std::string url = ws.GetString("url");
+        if (!url.empty())
+            has_websocket_config_ = true;
+    }
+    return has_mqtt_config_ || has_websocket_config_;
 }
 
 std::unique_ptr<Http> Ota::SetupHttp()
@@ -788,13 +949,6 @@ esp_err_t Ota::CheckVersion()
         ESP_LOGE(TAG, "xiaozhi.me activation code: %s challenge=%d",
                  has_activation_code_ ? activation_code_.c_str() : "(none)",
                  has_activation_challenge_ ? 1 : 0);
-        /* Push into Application immediately so chat/home can show the
-         * 6-digit code while Activate() is still polling. */
-        if (has_activation_code_)
-        {
-            Application::GetInstance().ShowActivationCode(
-                activation_code_, activation_message_);
-        }
     }
     else
     {
@@ -867,8 +1021,8 @@ esp_err_t Ota::CheckVersion()
             tv.tv_sec = (time_t)(ts / 1000);
             tv.tv_usec = (suseconds_t)((long long)ts % 1000) * 1000;
             /* Do not block the OTA worker if RTC set stalls. */
-            (void)settimeofday(&tv, NULL);
-            has_server_time_ = true;
+            has_server_time_ = settimeofday(&tv, NULL) == 0;
+            if (has_server_time_) metalio_board_clock_synced();
             ESP_LOGE(TAG, "OTA server_time applied");
             write(1, "TIME_OTA\n", 9);
         }
@@ -895,6 +1049,14 @@ esp_err_t Ota::CheckVersion()
             ESP_LOGE(TAG, "OTA firmware section ver=%s", firmware_version_.c_str());
         }
     }
+
+    /* Publish bind state only after mqtt/websocket are parsed — calling
+     * ShowActivationCode before mqtt made bound devices look unactivated. */
+    if (has_mqtt_config_ || has_websocket_config_)
+        Application::GetInstance().ClearPendingActivation();
+    else if (has_activation_code_)
+        Application::GetInstance().ShowActivationCode(
+            activation_code_, activation_message_);
 
     cJSON_Delete(root);
     ESP_LOGE(TAG, "CheckVersion done mqtt=%d ws=%d",
@@ -933,7 +1095,11 @@ bool Ota::Upgrade(const std::string &firmware_url)
         return false;
     }
 
-    ota_write_to_flash(nullptr, 0, true /*begin*/);
+    if (!ota_write_to_flash(nullptr, 0, true /*begin*/)) {
+        ESP_LOGE(TAG, "OTA installation unavailable: no compatible update partition");
+        http->Close();
+        return false;
+    }
 
     char buffer[512];
     size_t total_read = 0, recent_read = 0;
@@ -972,7 +1138,7 @@ bool Ota::Upgrade(const std::string &firmware_url)
     }
     http->Close();
 
-    ESP_LOGI(TAG, "Firmware upgrade successful (flash write is stubbed)");
+    ESP_LOGI(TAG, "Firmware upgrade successful");
     return true;
 }
 

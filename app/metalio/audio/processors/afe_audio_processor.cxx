@@ -78,13 +78,13 @@ void AfeAudioProcessor::Initialize(AudioCodec *codec, int frame_duration_ms,
 
     if (task_ == 0)
     {
-        xTaskCreate(
+        xTaskCreatePinnedToCore(
             [](void *arg) {
                 auto *self = static_cast<AfeAudioProcessor *>(arg);
                 self->AudioProcessorTask();
                 vTaskDelete(nullptr);
             },
-            "audio_communication", 4096, this, 3, &task_);
+            "audio_communication", 4096, this, 3, &task_, 0);
     }
 
     write(1, "AFE_PROC_OK\n", 12);

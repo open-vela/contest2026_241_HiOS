@@ -7,15 +7,7 @@
  *
  * Adaptations for NuttX/openvela:
  *   - esp_log.h               -> esp_log_shim.h
- *   - lv_eaf.h / lv_eaf_*     -> EAF decoder not available on NuttX.
- *                                When the active format is EAF, a centred
- *                                label showing the emotion category name
- *                                is used as a placeholder. The SJPG path
- *                                is unchanged (lv_image_create / set_src).
- *                                Control flow is preserved so a real EAF
- *                                decoder can be dropped in by replacing
- *                                CreateEmotionWidget() / SetEmotionSrc()
- *                                / pause_emotion_widget().
+ *   - lv_eaf.h / lv_eaf_*     -> portable EAF player with NuttX allocation.
  *   - HomeScreen::Create()    -> HomeScreen::CreateStatic()
  *   - application.h / SdCardManager.hpp / screen_util.h / i18n.h
  *                              already ported.
@@ -26,6 +18,12 @@
  */
 
 #include "digital_people_screen.h"
+#include "lv_eaf.h"
+#include "src/misc/cache/instance/lv_image_cache.h"
+#include "xiaobai_resources.h"
+#include <mutex>
+#include <atomic>
+#include "standby_screen/standby_screen.h"
 #include "digital_people_prefs.h"
 #include "digital_people_settings_screen.h"
 #include "i18n.h"
@@ -37,12 +35,15 @@
 
 #include "application.h"
 #include "device_state.h"
+#include "settings.h"
 #include "SdCardManager.hpp"
 #include "home_screen/home_screen.h"
+#include "camera_screen/camera_screen.h"
 #include "screen_util.h"
 
 LV_FONT_DECLARE(font_puhui_30_4);
 LV_FONT_DECLARE(font_puhui_20_4);
+LV_FONT_DECLARE(font_chat_cjk_30);
 
 namespace {
 
@@ -52,13 +53,13 @@ constexpr int32_t  kPanelSize    = 720;
 constexpr uint32_t kColorBg      = 0x000000;          // 纯黑背景
 
 // 表情资源目录：完整路径 = kEmotionDir + 大类名 + DigitalPeoplePrefs::GetEmotionExt()
-//   例: "S:/sdcard/system/emotion/loving.sjpg"
+//   例: "S:/sdcard/System/emotion/loving.sjpg"
 // 大类名来自 LVAdapterDisplay::SetEmotion 里的 GetEmoteCategory()，
 // 取值范围被收敛到 6 个：crying / happy / loving / neutral / surprised /
-// thinking。所有资源都放在 SD 卡的 system/emotion/ 目录下。
+// thinking。所有资源都放在 SD 卡的 System/emotion/ 目录下。
 // 格式（.eaf / .sjpg）与 EAF 帧间隔由 NVS（DigitalPeoplePrefs）决定。
-constexpr const char* kEmotionDir = "S:/sdcard/system/emotion/";
-constexpr const char* kEmotionPosixDir = "/sdcard/system/emotion/";
+constexpr const char* kEmotionDir = "S:/sdcard/System/emotion/";
+constexpr const char* kEmotionPosixDir = "/sdcard/System/emotion/";
 constexpr const char* kDefaultEmotion = "neutral";
 constexpr uint32_t kLongPressSettingsMs = 5000;
 constexpr int32_t kLongPressMoveSlopPx = 24;
@@ -76,6 +77,18 @@ constexpr size_t kRequiredEmotionCount =
 // 必须保证在调用之间一直有效，所以放在 namespace 静态。
 constexpr size_t kEmotionPathBufSize = 64;
 char s_current_emotion[24] = "neutral";
+std::mutex s_emotion_mutex;
+char s_requested_emotion[24]="neutral";
+unsigned s_requested_revision=0,s_applied_revision=0;
+lv_timer_t*s_emotion_ui_timer=nullptr;
+uint32_t s_speech_started_ms=0;
+DeviceState s_expression_state=kDeviceStateUnknown;
+unsigned SnapshotEmotion(char*out){std::lock_guard<std::mutex>l(s_emotion_mutex);strcpy(out,s_requested_emotion);return s_requested_revision;}
+void Motion(void*obj,int32_t y){lv_obj_set_style_translate_y((lv_obj_t*)obj,y,0);}
+void StartMotion(lv_obj_t*widget,const char*category){lv_anim_delete(widget,Motion);lv_obj_set_style_translate_y(widget,0,0);
+ int amplitude=!strcmp(category,"laughing")?6:!strcmp(category,"surprised")?5:3;int duration=!strcmp(category,"laughing")?550:!strcmp(category,"thinking")?1800:1300;
+ lv_anim_t a;lv_anim_init(&a);lv_anim_set_var(&a,widget);lv_anim_set_exec_cb(&a,Motion);lv_anim_set_values(&a,-amplitude,amplitude);lv_anim_set_duration(&a,duration);lv_anim_set_reverse_duration(&a,duration);lv_anim_set_repeat_count(&a,LV_ANIM_REPEAT_INFINITE);lv_anim_set_path_cb(&a,lv_anim_path_ease_in_out);lv_anim_start(&a);
+}
 char s_emotion_path_buf[kEmotionPathBufSize];
 
 const char* EmotionCategoryName(const char* category) {
@@ -83,54 +96,38 @@ const char* EmotionCategoryName(const char* category) {
                                                         : kDefaultEmotion;
 }
 
+const char* PngPose(const char*category){
+ if(!strcmp(category,"thinking"))return "sleepy";if(!strcmp(category,"crying"))return "sad";
+ if(!strcmp(category,"laughing")||!strcmp(category,"surprised")||!strcmp(category,"angry"))return category;return "happy";
+}
 const char* BuildEmotionPath(const char* category) {
-    std::snprintf(s_emotion_path_buf, sizeof(s_emotion_path_buf), "%s%s%s",
-                  kEmotionDir, EmotionCategoryName(category),
-                  DigitalPeoplePrefs::GetEmotionExt());
+    Settings prefs("ui");
+    if(prefs.GetBool("dp_custom",false))
+        std::snprintf(s_emotion_path_buf,sizeof(s_emotion_path_buf),"%s%s%s",kEmotionDir,EmotionCategoryName(category),DigitalPeoplePrefs::GetEmotionExt());
+    else std::snprintf(s_emotion_path_buf,sizeof(s_emotion_path_buf),"%sxiaobai_%s.png",kEmotionDir,PngPose(EmotionCategoryName(category)));
     return s_emotion_path_buf;
 }
-
-bool EmotionUsesEaf() { return DigitalPeoplePrefs::UsesEaf(); }
+bool EmotionUsesEaf(){Settings prefs("ui");return prefs.GetBool("dp_custom",false)&&DigitalPeoplePrefs::UsesEaf();}
 
 // ---------------------------------------------------------------------------
-// Emotion widget construction / source switching.
-//
-// EAF is NOT available on NuttX. When the active format is EAF we fall back
-// to a centred label showing the emotion category name as a placeholder so
-// the rest of the screen flow (resource checks, bubbles, activation gate,
-// long-press settings) remains exercisable. Replace these two functions
-// with a real EAF decoder integration when one becomes available.
+// Emotion animation uses the same EAF widget API as upstream.
 // ---------------------------------------------------------------------------
-void SetEmotionSrc(lv_obj_t* widget, const char* category) {
-    if (widget == nullptr) {
-        return;
-    }
-    const char* path = BuildEmotionPath(category);
+void SetEmotionSrc(lv_obj_t *widget, const char *category) {
+    if (!widget) return;
+    const char *path = BuildEmotionPath(category);
     if (EmotionUsesEaf()) {
-        // TODO: EAF decoder not available on NuttX. Show the emotion
-        // category name as a placeholder so the screen is still usable.
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "[%s]",
-                      EmotionCategoryName(category));
-        lv_label_set_text(widget, buf);
-        (void)path;
+        lv_eaf_set_src(widget, path);
+        lv_eaf_set_frame_delay(widget, DigitalPeoplePrefs::GetFrameDelayMs());
+        if(lv_eaf_get_total_frames(widget)<=1)lv_eaf_pause(widget);
     } else {
+        // These packaged PNGs are immutable. Keep their decoded cache during
+        // speech instead of decoding the same face from SD on every change.
         lv_image_set_src(widget, path);
     }
+    StartMotion(widget,category);
 }
-
-lv_obj_t* CreateEmotionWidget(lv_obj_t* parent) {
-    if (EmotionUsesEaf()) {
-        // TODO: EAF decoder not available on NuttX. Use a centred label
-        // showing the emotion name as a placeholder. A real EAF widget
-        // can be dropped in here without touching the rest of the screen.
-        lv_obj_t* label = lv_label_create(parent);
-        lv_obj_set_style_text_color(label, lv_color_white(), LV_PART_MAIN);
-        lv_obj_set_style_text_font(label, &font_puhui_30_4, LV_PART_MAIN);
-        lv_obj_center(label);
-        return label;
-    }
-    return lv_image_create(parent);
+lv_obj_t *CreateEmotionWidget(lv_obj_t *parent) {
+    return EmotionUsesEaf() ? lv_eaf_create(parent) : lv_image_create(parent);
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +156,7 @@ constexpr int32_t  kBubblePadY       = 14;
 constexpr int32_t  kBubbleBorder     = 2;
 constexpr int32_t  kSideMargin       = 16;
 constexpr int32_t  kSysBubbleTop     = 24;            // 顶部安全间距
-constexpr int32_t  kUserBubbleBottom = 24;
+constexpr int32_t  kUserBubbleBottom = 112;
 constexpr int32_t  kSysBubbleMaxW    = kPanelSize - kSideMargin * 2;       // 688
 constexpr int32_t  kUserBubbleMaxW   = kPanelSize - kSideMargin * 2;       // 688
 
@@ -177,15 +174,17 @@ struct UiState {
     lv_obj_t* system_label  = nullptr;
     lv_obj_t* user_bubble   = nullptr;
     lv_obj_t* user_label    = nullptr;
+    lv_obj_t* look_and_see_btn = nullptr;
+    lv_obj_t* voice_btn = nullptr;
+    lv_timer_t* wake_arm_timer = nullptr;
+    bool assets_ready=false;
 };
 
 UiState s_ui;
 
 void pause_emotion_widget() {
-    // TODO: EAF pause not available on NuttX; no-op for now.
-    // Only .eaf has a frame timer; .sjpg/.jpg/.png have no animation to pause.
-    // When a real EAF decoder is wired up, call its pause API here, gated by
-    // EmotionUsesEaf() and s_ui.eaf != nullptr.
+    if (EmotionUsesEaf() && s_ui.eaf) lv_eaf_pause(s_ui.eaf);
+    if(s_ui.eaf)lv_anim_delete(s_ui.eaf,Motion);
 }
 
 lv_timer_t* s_activation_guard_timer = nullptr;
@@ -201,7 +200,7 @@ struct ActivationBlockedDialogUi {
 ActivationBlockedDialogUi s_activation_dlg;
 bool s_activation_blocked = false;
 bool s_activation_dialog_shows_code = false;
-bool s_voice_ui_held = false;
+std::atomic<bool> s_voice_ui_held{false};
 
 void cancel_long_press_timer() {
     if (s_long_press_timer != nullptr) {
@@ -234,13 +233,17 @@ void open_digital_people_settings() {
 
     lv_obj_t* old_scr = lv_screen_active();
     lv_obj_t* settings = DigitalPeopleSettingsScreen::CreateStatic();
-    lv_screen_load(settings);
+    screen_load_safe(settings);
     if (old_scr != nullptr && old_scr != settings) {
         lv_obj_delete_async(old_scr);
     }
 }
 
 void OnLongPressPressed(lv_event_t* e) {
+    if (lv_event_get_target(e) == s_ui.look_and_see_btn) {
+        lv_event_stop_bubbling(e);
+        return;
+    }
     if (s_activation_blocked || s_ui.screen == nullptr) {
         return;
     }
@@ -261,6 +264,10 @@ void OnLongPressPressed(lv_event_t* e) {
 }
 
 void OnLongPressPressing(lv_event_t* e) {
+    if (lv_event_get_target(e) == s_ui.look_and_see_btn) {
+        lv_event_stop_bubbling(e);
+        return;
+    }
     if (!s_long_press_armed) {
         return;
     }
@@ -278,14 +285,43 @@ void OnLongPressPressing(lv_event_t* e) {
     }
 }
 
-void OnLongPressReleased(lv_event_t* /*e*/) { cancel_long_press_timer(); }
+void OnLongPressReleased(lv_event_t* e) {
+    if (lv_event_get_target(e) == s_ui.look_and_see_btn) {
+        lv_event_stop_bubbling(e);
+        return;
+    }
+    cancel_long_press_timer();
+}
+
+void OnLookAndSeeButtonClicked(lv_event_t* e) {
+    lv_event_stop_bubbling(e);
+    if (s_activation_blocked) return;
+    if (!CameraScreen::OpenLookAndSee(true)) {
+        ESP_LOGW(TAG, "could not open look-and-see camera from digital people");
+    }
+}
+
+void OnLookAndSeeButtonPress(lv_event_t* e) {
+    lv_event_stop_bubbling(e);
+}
 
 void schedule_voice_ui_start() {
     if (s_voice_ui_held) {
         return;
     }
     s_voice_ui_held = true;
-    Application::GetInstance().SetVoiceUiDesired(true);
+    Application::GetInstance().RequestVoiceUiDesired(true);
+    if(s_ui.wake_arm_timer)lv_timer_delete(s_ui.wake_arm_timer);
+    s_ui.wake_arm_timer=lv_timer_create([](lv_timer_t*){
+        s_ui.wake_arm_timer=nullptr;
+        if(s_voice_ui_held&&DigitalPeopleScreen::IsActive()) {
+            // Reassert after the previous page's asynchronous UNLOAD, which
+            // may otherwise win the first voice-UI request during navigation.
+            Application::GetInstance().RequestVoiceUiDesired(true);
+            Application::GetInstance().ArmAssistantWakeWord();
+        }
+    },120,nullptr);
+    if(s_ui.wake_arm_timer)lv_timer_set_repeat_count(s_ui.wake_arm_timer,1);
 }
 
 void schedule_voice_ui_stop() {
@@ -293,20 +329,23 @@ void schedule_voice_ui_stop() {
         return;
     }
     s_voice_ui_held = false;
-    Application::GetInstance().SetVoiceUiDesired(false);
+    if (!CameraScreen::IsLookAndSeeMode())
+        Application::GetInstance().RequestVoiceUiDesired(false);
 }
 
 void digital_people_page_leave() {
+    if(s_ui.wake_arm_timer){lv_timer_delete(s_ui.wake_arm_timer);s_ui.wake_arm_timer=nullptr;}
     pause_emotion_widget();
     schedule_voice_ui_stop();
 }
 
-const lv_font_t* bubble_font() { return &font_puhui_30_4; }
+const lv_font_t* bubble_font() { return &font_chat_cjk_30; }
 
 bool EmotionFileExists(const char* name) {
     char path[96];
-    std::snprintf(path, sizeof(path), "%s%s%s", kEmotionPosixDir, name,
-                  DigitalPeoplePrefs::GetEmotionExt());
+    Settings prefs("ui");
+    if(prefs.GetBool("dp_custom",false))std::snprintf(path,sizeof(path),"%s%s%s",kEmotionPosixDir,name,DigitalPeoplePrefs::GetEmotionExt());
+    else std::snprintf(path, sizeof(path), "%sxiaobai_%s.png",kEmotionPosixDir,PngPose(name));
     struct stat st;
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
@@ -336,10 +375,10 @@ bool CheckEmotionResourcesReady() {
 const char* MissingResourceHintText() {
     if (!SdCardManager::GetInstance().IsMounted()) {
         return I18n::T(
-            "未检测到 SD 卡\n\n请将数字人资源包放入 SD 卡\nsystem/emotion/ 目录");
+            "未检测到 SD 卡\n\n请将小白助手资源包放入 SD 卡\nSystem/emotion/ 目录");
     }
     return I18n::T(
-        "数字人资源缺失\n\n请将资源包复制到 SD 卡\nsystem/emotion/ 目录\n\n"
+        "小白助手资源缺失\n\n请将资源包复制到 SD 卡\nSystem/emotion/ 目录\n\n"
         "需包含 6 个表情资源文件");
 }
 
@@ -488,7 +527,7 @@ void open_activation_blocked_dialog() {
     lv_obj_t* desc = lv_label_create(card);
     lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(desc, kCardW - 56);
-    lv_label_set_text(desc, I18n::T("请先完成设备激活后再使用数字人。"));
+    lv_label_set_text(desc, I18n::T("请先完成设备激活后再使用小白助手。"));
     lv_obj_set_style_text_color(desc, lv_color_hex(0x9AA3B2), LV_PART_MAIN);
     lv_obj_set_style_text_font(desc, &font_puhui_20_4, LV_PART_MAIN);
     lv_obj_set_style_text_align(desc, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
@@ -562,6 +601,7 @@ void sync_activation_block_state() {
     }
     s_activation_blocked = should_block;
     if (should_block) {
+        schedule_voice_ui_stop();
         log_activation_blocked();
         open_activation_blocked_dialog();
     } else {
@@ -597,6 +637,7 @@ void OnScreenUnloaded(lv_event_t* e) {
         lv_timer_delete(s_activation_guard_timer);
         s_activation_guard_timer = nullptr;
     }
+    if(s_emotion_ui_timer){lv_timer_delete(s_emotion_ui_timer);s_emotion_ui_timer=nullptr;}
     s_activation_dlg = ActivationBlockedDialogUi{};
     s_activation_blocked = false;
     s_activation_dialog_shows_code = false;
@@ -609,6 +650,11 @@ void OnScreenUnloaded(lv_event_t* e) {
 // ---- Screen base class interface ----
 
 lv_obj_t* DigitalPeopleScreen::CreateStatic() {
+    XiaobaiResources::EnsureAsync();
+    if(s_emotion_ui_timer){lv_timer_delete(s_emotion_ui_timer);s_emotion_ui_timer=nullptr;}
+    s_applied_revision=SnapshotEmotion(s_current_emotion);
+    s_expression_state=kDeviceStateUnknown;
+    s_speech_started_ms=0;
     if (s_ui.screen != nullptr) {
         ESP_LOGW(TAG, "Create while previous screen still active, resetting refs");
         digital_people_page_leave();
@@ -640,6 +686,7 @@ lv_obj_t* DigitalPeopleScreen::CreateStatic() {
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
 
 
+    s_ui.assets_ready=XiaobaiResources::Status()==2;
     const bool resources_ready = CheckEmotionResourcesReady();
     if (!resources_ready) {
         ESP_LOGW(TAG, "emotion resources not ready (mounted=%d)",
@@ -649,8 +696,7 @@ lv_obj_t* DigitalPeopleScreen::CreateStatic() {
     } else {
         s_ui.eaf = CreateEmotionWidget(scr);
         SetEmotionSrc(s_ui.eaf, s_current_emotion);
-        // lv_image_set_inner_align is image-specific; skip it for the EAF
-        // label placeholder so we don't corrupt the label widget state.
+        // The EAF widget manages the image size for each animation frame.
         if (!EmotionUsesEaf()) {
             lv_image_set_inner_align(s_ui.eaf, LV_IMAGE_ALIGN_CENTER);
         }
@@ -671,6 +717,40 @@ lv_obj_t* DigitalPeopleScreen::CreateStatic() {
         s_ui.user_label  = usr.label;
     }
 
+    lv_obj_t* look_btn = lv_button_create(scr);
+    s_ui.look_and_see_btn = look_btn;
+    lv_obj_set_size(look_btn, 184, 68);
+    lv_obj_align(look_btn, LV_ALIGN_BOTTOM_MID, 116, -48);
+    lv_obj_set_style_radius(look_btn, 34, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(look_btn, lv_color_hex(0x1E3A2F), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(look_btn, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(look_btn, lv_color_hex(0x34D399), LV_PART_MAIN);
+    lv_obj_set_style_border_width(look_btn, 2, LV_PART_MAIN);
+    lv_obj_add_event_cb(look_btn, OnLookAndSeeButtonClicked, LV_EVENT_SHORT_CLICKED,
+                        nullptr);
+    lv_obj_add_event_cb(look_btn, OnLookAndSeeButtonPress, LV_EVENT_PRESSED,
+                        nullptr);
+    lv_obj_add_event_cb(look_btn, OnLookAndSeeButtonPress, LV_EVENT_PRESSING,
+                        nullptr);
+    lv_obj_add_event_cb(look_btn, OnLookAndSeeButtonPress, LV_EVENT_RELEASED,
+                        nullptr);
+    lv_obj_add_event_cb(look_btn, OnLookAndSeeButtonPress, LV_EVENT_PRESS_LOST,
+                        nullptr);
+    lv_obj_t* look_lbl = lv_label_create(look_btn);
+    lv_label_set_text(look_lbl, I18n::T("Hi 视界"));
+    lv_obj_set_style_text_color(look_lbl, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(look_lbl, bubble_font(), LV_PART_MAIN);
+    lv_obj_center(look_lbl);
+    screen_make_input_passive(look_lbl);
+
+    auto*voice=lv_button_create(scr);s_ui.voice_btn=voice;
+    lv_obj_set_size(voice,224,68);lv_obj_align(voice,LV_ALIGN_BOTTOM_MID,-112,-48);
+    lv_obj_set_style_radius(voice,34,0);lv_obj_set_style_bg_color(voice,lv_color_hex(0x24334B),0);
+    lv_obj_set_style_border_color(voice,lv_color_hex(0x83B8ED),0);lv_obj_set_style_border_width(voice,1,0);
+    lv_obj_add_event_cb(voice,[](lv_event_t*){if(s_activation_blocked)return;Application::GetInstance().ArmAssistantWakeWord();Application::GetInstance().RequestWakeSession();},LV_EVENT_CLICKED,nullptr);
+    auto*voice_label=lv_label_create(voice);lv_label_set_text(voice_label,"待唤醒 · 点按对话");
+    lv_obj_set_style_text_font(voice_label,&font_puhui_20_4,0);lv_obj_set_style_text_color(voice_label,lv_color_white(),0);lv_obj_center(voice_label);screen_make_input_passive(voice_label);
+
     screen_attach_swipe_back(scr, OnSwipeBack);
     lv_obj_add_event_cb(scr, OnLongPressPressed, LV_EVENT_PRESSED, nullptr);
     lv_obj_add_event_cb(scr, OnLongPressPressing, LV_EVENT_PRESSING, nullptr);
@@ -688,9 +768,39 @@ lv_obj_t* DigitalPeopleScreen::CreateStatic() {
     lv_obj_add_event_cb(scr, [](lv_event_t* e) {
         if (lv_event_get_code(e) == LV_EVENT_SCREEN_LOADED) {
             sync_activation_block_state();
+            if(!s_activation_blocked)schedule_voice_ui_start();
         }
     }, LV_EVENT_SCREEN_LOADED, nullptr);
 
+    s_emotion_ui_timer=lv_timer_create([](lv_timer_t*t){
+        if(lv_timer_get_user_data(t)!=s_ui.screen||lv_screen_active()!=s_ui.screen)return;
+        if(s_ui.voice_btn){auto state=Application::GetInstance().GetDeviceState();const char*text=state==kDeviceStateConnecting?"连接中…":state==kDeviceStateListening?"聆听中…":state==kDeviceStateSpeaking?"正在回答…":"待唤醒 · 点按对话";auto*label=lv_obj_get_child(s_ui.voice_btn,0);if(strcmp(lv_label_get_text(label),text))lv_label_set_text(label,text);}
+        if(!s_ui.eaf){
+            if(XiaobaiResources::Status()==2&&CheckEmotionResourcesReady()){
+                if(s_ui.hint_label){lv_obj_delete(s_ui.hint_label);s_ui.hint_label=nullptr;}
+                s_ui.eaf=CreateEmotionWidget(s_ui.screen);SetEmotionSrc(s_ui.eaf,s_current_emotion);lv_obj_center(s_ui.eaf);screen_make_input_passive(s_ui.eaf);lv_obj_move_background(s_ui.eaf);
+            }else if(s_ui.hint_label){const char*text=XiaobaiResources::Status()==1?"正在准备小白表情资源…":MissingResourceHintText();if(strcmp(text,lv_label_get_text(s_ui.hint_label)))lv_label_set_text(s_ui.hint_label,text);}
+        }
+        if(s_ui.eaf&&!s_ui.assets_ready&&XiaobaiResources::Status()==2){SetEmotionSrc(s_ui.eaf,s_current_emotion);s_ui.assets_ready=true;}
+        char requested[24];unsigned revision=SnapshotEmotion(requested);
+        const auto state=Application::GetInstance().GetDeviceState();
+        if(state!=s_expression_state) {
+            s_expression_state=state;
+            if(state==kDeviceStateSpeaking)s_speech_started_ms=lv_tick_get();
+        }
+        const char *face=requested;
+        if(state==kDeviceStateSpeaking) {
+            // Respect the cloud's emotion. A neutral/happy answer gets a
+            // gentle happy/laughing cadence until the actual TTS tail drains.
+            if(!strcmp(requested,"neutral")||!strcmp(requested,"happy")||!strcmp(requested,"loving"))
+                face=((lv_tick_get()-s_speech_started_ms)/1200)%2?"laughing":"happy";
+        } else if(state==kDeviceStateConnecting) face="thinking";
+        else if(state==kDeviceStateIdle||state==kDeviceStateListening) face="neutral";
+        if(s_ui.eaf&&strcmp(s_current_emotion,face)) {
+            strcpy(s_current_emotion,face);SetEmotionSrc(s_ui.eaf,s_current_emotion);
+        }
+        s_applied_revision=revision;
+    },150,scr);
     return scr;
 }
 
@@ -702,6 +812,7 @@ lv_obj_t* DigitalPeopleScreen::Create() {
 bool DigitalPeopleScreen::IsActive() {
     return s_ui.screen != nullptr;
 }
+bool DigitalPeopleScreen::IsForeground(){return s_voice_ui_held.load(std::memory_order_acquire);}
 
 void DigitalPeopleScreen::ShowUserMessage(const char* text) {
     if (!IsActive() || text == nullptr || text[0] == '\0') return;
@@ -747,19 +858,10 @@ void DigitalPeopleScreen::LifecycleCallback(screen_lifecycle_event_t event) {
 }
 
 void DigitalPeopleScreen::SetEmotion(const char* category) {
-    if (category == nullptr || category[0] == '\0') {
-        category = kDefaultEmotion;
-    }
-    // 同步更新静态缓存：屏幕不在前台时也能记住请求，下次 Create()
-    // 走 BuildEmotionPath(s_current_emotion) 时就会用上。
-    std::strncpy(s_current_emotion, category, sizeof(s_current_emotion) - 1);
-    s_current_emotion[sizeof(s_current_emotion) - 1] = '\0';
-
-    ESP_LOGI(TAG, "SetEmotion -> %s", s_current_emotion);
-
-    // 在前台才真的替换表情源；调用方必须已经持有 LVGL 主锁
-    // （和 ShowUserMessage / ShowSystemMessage 一致的约定）。
-    if (DigitalPeopleScreen::IsActive() && s_ui.eaf != nullptr) {
-        SetEmotionSrc(s_ui.eaf, s_current_emotion);
-    }
+    if(!category||!*category)category=kDefaultEmotion;
+    static const char*allowed[]={"neutral","happy","loving","thinking","crying","surprised","laughing","angry"};
+    bool valid=false;for(const char*name:allowed)if(!strcmp(category,name))valid=true;if(!valid)category=kDefaultEmotion;
+    std::lock_guard<std::mutex>lock(s_emotion_mutex);if(!strcmp(s_requested_emotion,category))return;
+    strncpy(s_requested_emotion,category,sizeof(s_requested_emotion)-1);s_requested_emotion[sizeof(s_requested_emotion)-1]=0;++s_requested_revision;
+    // The producer never touches LVGL. The owning UI timer applies changes.
 }

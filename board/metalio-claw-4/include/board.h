@@ -100,7 +100,7 @@
 
 #define BOARD_TCA9555_ADDR            0x20
 #define BOARD_IOEXP_GPS_POWER         0  /* P0.0 high-enable */
-#define BOARD_IOEXP_PA_SWITCH         1  /* P0.1 */
+#define BOARD_IOEXP_PA_SWITCH         1  /* P0.1: 0=NT26 voice, 1=local audio */
 #define BOARD_IOEXP_CAM_PWDN          2  /* P0.2 low-enable */
 #define BOARD_IOEXP_SD_POWER          3  /* P0.3 low-enable */
 #define BOARD_IOEXP_PWR_KEY_PULSE     4  /* P0.4 */

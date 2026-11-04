@@ -1,0 +1,10 @@
+BigBang interaction reference:
+SmartisanTech/packages_apps_BigBang, branch smartisan-m-onestep_bigboom
+https://github.com/SmartisanTech/packages_apps_BigBang
+Reference files: BoomWordsLayout.java, SwipeSelectView.java, BoomActivity.java.
+The reference project is licensed under Apache License 2.0.
+The HiOS implementation is native LVGL code, not the Android Java application.
+The original remote segmentation service is not used by HiOS.
+No additional dictionary is installed. Per the user's updated instruction,
+HiOS reuses its existing input-method phrases, groups Latin words/numbers,
+and provides UTF8-safe individual-character splitting and swipe selection.

@@ -6,6 +6,7 @@
  */
 
 #include <string.h>
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_gmf_pool.h"
 #include "esp_gmf_audio_dec.h"

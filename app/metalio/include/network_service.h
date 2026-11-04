@@ -46,7 +46,13 @@ public:
     /* Stop the active transport. */
     void Stop();
 
-    /* True when at least one transport reports an IP address. */
+    /* Live link + enabled interface + DHCP address, independent of which
+     * NetworkService instance brought the link up. Never probes the network
+     * synchronously from the UI thread. */
+    static Transport AvailableTransport();
+    static bool Available() { return AvailableTransport() != Transport::None; }
+
+    /* True when either WiFi or cellular is usable. */
     bool Online() const;
 
     Transport transport() const { return transport_; }

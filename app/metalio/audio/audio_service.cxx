@@ -1,3 +1,4 @@
+#include "hi_task_cpp.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -19,10 +20,15 @@
 #include "audio_service.h"
 #include "metalio_audio_codec.h"
 #include "energy_wake_word.h"
+#include "wake_words/hi_openvela_command.h"
+#if defined(CONFIG_METALIO_ESP_SR)
+#include "wake_words/hi_openvela_wake_word.h"
+#endif
 #include "esp_log_shim.h"
 #include "esp_err_shim.h"
 #include "board_shim.h"
 #include "display.h"
+#include <metalio/metalio.h>
 
 #ifdef CONFIG_METALIO_USE_AFE_WAKE_WORD
 #include "afe_wake_word.h"
@@ -38,13 +44,57 @@
 #endif
 
 #include <cstring>
+#include <algorithm>
 #include <cmath>
 #include <unistd.h>
+#include <pthread.h>
+#include <sched.h>
+#include <nuttx/config.h>
 #include <thread>
 #include <chrono>
-#include <pthread.h>
 
 #define TAG "AudioService"
+
+namespace {
+// The first greeting competes with initial LVGL/font/TLS work. Boost only
+// these bounded audio jobs, then restore their original scheduling settings.
+class WakeGreetingPriority {
+public:
+    WakeGreetingPriority()
+    {
+        valid_ = pthread_getschedparam(pthread_self(), &policy_, &original_) == 0;
+    }
+    ~WakeGreetingPriority() { Update(false, 0); }
+    void Update(bool greeting, int priority)
+    {
+        if (!valid_ || (greeting == boosted_ && (!greeting || applied_ == std::max(priority,original_.sched_priority))))
+            return;
+        if (greeting)
+        {
+            sched_param target = original_;
+            if (target.sched_priority < priority)
+                target.sched_priority = priority;
+            if (pthread_setschedparam(pthread_self(), SCHED_RR, &target) == 0){boosted_ = true;applied_=target.sched_priority;}
+        }
+        else if (pthread_setschedparam(pthread_self(), policy_, &original_) == 0)
+            boosted_ = false;
+    }
+private:
+    int policy_ = 0;
+    sched_param original_{};
+    bool valid_ = false;
+    bool boosted_ = false;
+    int applied_=0;
+};
+
+uint64_t AudioNowMs()
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+}  // namespace
 
 /* ------------------------------------------------------------------ */
 /* Construction / destruction                                         */
@@ -138,11 +188,30 @@ void AudioService::Initialize(AudioCodec* codec)
                 callbacks_.on_vad_change(speaking);
         });
 
-    /* Prefer AfeWakeWord when models are present; EnergyWakeWord as fallback. */
-    wake_word_ = std::make_unique<EnergyWakeWord>();
+#if defined(CONFIG_METALIO_ESP_SR)
+    wake_word_ = std::make_unique<HiOpenvelaWakeWord>();
+    using_esp_wake_word_ = true;
+#else
+    wake_word_ = std::make_unique<StubWakeWord>();
+#endif
     wake_word_->OnWakeWordDetected(
         [this](const std::string& wake_word)
         {
+            if (wake_word != HI_OPENVELA_PHRASE ||
+                !(events_.load() & AS_EVENT_WAKE_WORD_RUNNING))
+                return;
+            if (ShouldSuppressWakeWord())
+            {
+                // The model stops after a hit. A suppressed result must not
+                // leave the enabled detector permanently disarmed.
+                wake_word_->Start();
+                return;
+            }
+            // MultiNet has already stopped itself for this accepted hit.
+            // Consume the service flag as well: if the UI/call/preference
+            // changes before the app handles the event, Idle must be able
+            // to re-arm instead of seeing a permanently false "running".
+            events_.fetch_and(~AS_EVENT_WAKE_WORD_RUNNING);
             if (callbacks_.on_wake_word_detected)
                 callbacks_.on_wake_word_detected(wake_word);
         });
@@ -180,15 +249,14 @@ void AudioService::Start()
 
     write(1, "AS2\n", 4);
     /* Launch worker threads */
-    audio_input_thread_ = std::thread([this]() { AudioInputTask(); });
+    audio_input_thread_ = HiTask::LegacyThread([this]() { AudioInputTask(); });
     write(1, "AS3\n", 4);
-    audio_output_thread_ = std::thread([this]() { AudioOutputTask(); });
+    audio_output_thread_ = HiTask::LegacyThread([this]() { AudioOutputTask(); });
     write(1, "AS4\n", 4);
-    opus_codec_thread_   = std::thread([this]() { OpusCodecTask(); });
+    opus_codec_thread_   = HiTask::LegacyThread([this]() { OpusCodecTask(); });
     write(1, "AS5\n", 4);
 
-    /* Do not ESP_LOGI / spawn WakeNet here — that path blue-screened boot.
-     * EnergyWakeWord stays default; see SetModelsList / EnsureWakeWordReady. */
+    /* Model initialization starts asynchronously when detection is enabled. */
     write(1, "AS6\n", 4);
     /* Defer power-mgmt timer — LPWORK callbacks racing boot has wedged CDC. */
     write(1, "AS7\n", 4);
@@ -214,8 +282,8 @@ void AudioService::Stop()
         audio_decode_queue_.clear();
         audio_playback_queue_.clear();
         audio_testing_queue_.clear();
+        audio_queue_cv_.notify_all();
     }
-    audio_queue_cv_.notify_all();
 
     /* Join threads */
     if (audio_input_thread_.joinable())
@@ -311,12 +379,16 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data,
 
 void AudioService::AudioInputTask()
 {
+    WakeGreetingPriority visual_priority;
     events_.fetch_or(AS_EVENT_INPUT_TASK_RUNNING);
     ESP_LOGI(TAG, "Audio input task started");
 
     while (true)
     {
         uint32_t bits = events_.load();
+        const bool visual=visual_conversation_.load(std::memory_order_relaxed);
+        visual_priority.Update(visual && (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING),
+                               CONFIG_METALIO_APP_PRIORITY+18);
         /* Check if any of the "feed" modes are active */
         uint32_t feed_bits = bits & (AS_EVENT_AUDIO_TESTING_RUNNING |
                                      AS_EVENT_WAKE_WORD_RUNNING |
@@ -325,6 +397,14 @@ void AudioService::AudioInputTask()
         if (service_stopped_)
             break;
 
+        // A file recorder owns each microphone sample. Wake/barge-in polling
+        // must not consume alternating frames from the same RX DMA stream.
+        if(exclusive_capture_){capture_ack_=capture_request_.load();capture_yielded_=true;usleep(10000);continue;}
+        capture_yielded_=false;
+
+        // Preserve the RX driver/DMA while local music owns the speaker.
+        // Feeding a recognizer with the speaker echo only wastes CPU here.
+        if(HasLocalPlaybackSession()){usleep(20000);continue;}
         if (feed_bits == 0)
         {
             /* Speaking+interrupt: VP/WW are off so feed_bits==0. Must still
@@ -380,6 +460,13 @@ void AudioService::AudioInputTask()
          * continuous dialogue keeps sending Opus to the server. */
         if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING)
         {
+            // Downlink owns this audio session while its PCM is queued or
+            // draining. Do not read RX only to discard it afterwards: those
+            // unnecessary shared-I2S reads chopped the first spoken reply.
+            if (ShouldSuppressUplink() ||
+                (IsDownlinkPlaybackProtected() && HasPendingPlayback())) {
+                usleep(10000);continue;
+            }
             std::vector<int16_t> data;
             int samples = (int)audio_processor_->GetFeedSize();
             if (samples > 0)
@@ -392,6 +479,7 @@ void AudioService::AudioInputTask()
                     barge_loud_frames_ = 0;
                     /* Feed interleaved mic+ref into the processor. AFE needs
                      * stereo; NoAudioProcessor de-interleaves to mono itself. */
+                    audio_processor_->SetVisualConversation(visual);
                     audio_processor_->Feed(std::move(data));
                     continue;
                 }
@@ -416,6 +504,13 @@ void AudioService::AudioInputTask()
                 std::vector<int16_t> data;
                 if (ReadAudioData(data, 16000, samples))
                 {
+                    if (ShouldSuppressWakeWord())
+                    {
+                        // Never join syllables from before and after playback.
+                        std::lock_guard<std::mutex> lock(wake_word_mutex_);
+                        if (wake_word_initialized_ && wake_word_) wake_word_->Reset();
+                        continue;
+                    }
                     /* Copy detector under lock, invoke callback unlocked so
                      * OnWakeWordDetected can EnableWakeWord without deadlock. */
                     WakeWord *ww = nullptr;
@@ -445,7 +540,7 @@ void AudioService::AudioInputTask()
 
 void AudioService::MaybeDetectBargeIn()
 {
-    if (!device_aec_enabled_ || !callbacks_.on_barge_in)
+    if (!IsBargeInEnabled() || !callbacks_.on_barge_in)
         return;
     if (!tts_uplink_gate_.load(std::memory_order_relaxed))
         return;
@@ -453,7 +548,7 @@ void AudioService::MaybeDetectBargeIn()
      * HasPendingPlayback() missed many soft interrupts. */
 
     const auto now = std::chrono::steady_clock::now();
-    if (now < barge_armed_after_ || now < barge_cooldown_until_)
+    if (now < barge_cooldown_until_)
         return;
     /* Slower peeks while TTS plays — reduces shared-I2S chop. */
     if (now - barge_last_poll_ < std::chrono::milliseconds(220))
@@ -486,6 +581,13 @@ void AudioService::MaybeDetectBargeIn()
     }
     const float rms = std::sqrt((float)(sum_sq / (double)frames));
 
+    // Learn initial playback bleed before arming; an uncalibrated fixed
+    // floor otherwise treats the first loud speaker syllable as user speech.
+    if (now < barge_armed_after_) {
+        barge_echo_floor_ = std::max(barge_echo_floor_, rms);
+        barge_loud_frames_ = 0;
+        return;
+    }
     /* Learn TTS bleed floor; barge on near-field speech over speaker. */
     if (rms < barge_echo_floor_ * 1.5f)
         barge_echo_floor_ = barge_echo_floor_ * 0.9f + rms * 0.1f;
@@ -495,13 +597,14 @@ void AudioService::MaybeDetectBargeIn()
     else
         barge_loud_frames_ = 0;
 
-    /* One sustained loud peek (~220ms) is enough to interrupt. */
-    if (barge_loud_frames_ >= 1)
+    /* Require two separated loud peeks; a single click is not speech. */
+    if (barge_loud_frames_ >= 2)
     {
         barge_loud_frames_ = 0;
         barge_cooldown_until_ = now + std::chrono::milliseconds(800);
         write(1, "BARGE\n", 6);
-        callbacks_.on_barge_in();
+        if (IsBargeInEnabled() && tts_uplink_gate_.load(std::memory_order_acquire))
+            callbacks_.on_barge_in();
     }
 }
 
@@ -511,6 +614,8 @@ void AudioService::MaybeDetectBargeIn()
 
 void AudioService::AudioOutputTask()
 {
+    WakeGreetingPriority greeting_priority;
+
     events_.fetch_or(AS_EVENT_OUTPUT_TASK_RUNNING);
     ESP_LOGI(TAG, "Audio output task started");
 
@@ -525,13 +630,63 @@ void AudioService::AudioOutputTask()
     while (true)
     {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        greeting_priority.Update(wake_greeting_active_||local_session_||!audio_playback_queue_.empty(), CONFIG_METALIO_APP_PRIORITY + (wake_greeting_active_?20:local_session_?15:10));
         if (service_stopped_)
             break;
 
+        if (exclusive_capture_.load() || (local_session_&&local_complete_write_)) notification_pcm_.clear();
+        if (audio_playback_queue_.empty() && !notification_pcm_.empty() && !wake_greeting_active_) {
+            auto notification=std::make_unique<AudioTask>();notification->type=kAudioTaskTypeDecodeToPlaybackQueue;
+            notification->pcm.resize(std::min((size_t)960,notification_pcm_.size()),0);
+            audio_playback_queue_.push_back(std::move(notification));
+        }
         if (!audio_playback_queue_.empty())
         {
+            if(local_pause_ms_ && audio_playback_queue_.front()->local_session==local_session_){audio_queue_cv_.wait_for(lock,std::chrono::milliseconds(10));continue;}
+            bool prime_voice_output=false;
+            if(local_session_&&audio_playback_queue_.front()->local_session==local_session_&&local_buffering_){
+                size_t samples=0;for(const auto &q:audio_playback_queue_)if(q->local_session==local_session_)samples+=q->pcm.size();
+                if(!local_finished_&&samples<local_prebuffer_){audio_queue_cv_.wait_for(lock,std::chrono::milliseconds(10));continue;}
+                local_buffering_=false;
+            }
+            if (wake_greeting_active_ && !wake_greeting_started_ &&
+                !audio_playback_queue_.front()->local_session)
+            {
+                // Start the deadline at the first decoded PCM, not at the
+                // first compressed packet before cold decoder initialization.
+                if (wake_greeting_first_packet_==std::chrono::steady_clock::time_point{})
+                    wake_greeting_first_packet_=std::chrono::steady_clock::now();
+                size_t buffered_samples = 0;
+                for (const auto &queued : audio_playback_queue_)
+                    buffered_samples += queued->pcm.size();
+                const int rate = codec_->output_sample_rate();
+                const auto elapsed = std::chrono::steady_clock::now() -
+                                     wake_greeting_first_packet_;
+                // Five 60 ms frames absorb initial decode/network jitter.
+                // Short greetings have a bounded wait, even after tts/stop.
+                if (rate > 0 && buffered_samples * 1000 / rate < 300 &&
+                    elapsed < std::chrono::milliseconds(300))
+                {
+                    audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(10));
+                    continue;
+                }
+                wake_greeting_started_ = true;
+                prime_voice_output=true;
+            }
             auto task = std::move(audio_playback_queue_.front());
             audio_playback_queue_.pop_front();
+            if(!notification_pcm_.empty() && !wake_greeting_active_) {
+                for(size_t i=0;i<task->pcm.size();++i){if(notification_pcm_.empty())break;
+                    int v=task->pcm[i]/2+notification_pcm_.front();notification_pcm_.pop_front();
+                    task->pcm[i]=(int16_t)std::max(-32768,std::min(32767,v));
+                }
+            }
+            output_in_progress_ = true;output_local_session_=task->local_session;
+            if(task->local_session==local_session_ && task->local_session && !local_clock_start_ms_)local_clock_start_ms_=AudioNowMs();
+            // Retry short writes for local media without changing the
+            // separate complete_write ownership/notification policy.
+            const bool complete_write=(task->local_session && task->local_session==local_session_) ||
+                (!task->local_session && wake_greeting_active_);
             audio_queue_cv_.notify_all();
             lock.unlock();
 
@@ -549,9 +704,35 @@ void AudioService::AudioOutputTask()
 
             if (!task->pcm.empty())
                 s_hold_sample = task->pcm.back();
-            codec_->OutputData(task->pcm);
+            bool written=true;
+            if(prime_voice_output) {
+                // A private voice lead-in lets the PA/DMA settle without
+                // consuming the first real syllables. The microphone is gated
+                // above; this is never mixed into recordings or local music.
+                std::fill(s_bridge.begin(),s_bridge.end(),0);
+                for(int frame=0;frame<3 && written;++frame)
+                    written=codec_->OutputDataChecked(s_bridge.data(),s_bridge.size());
+            }
+            if(complete_write)written=codec_->OutputDataChecked(task->pcm.data(),task->pcm.size()) && written;
+            else codec_->OutputData(task->pcm);
             last_output_time_ = std::chrono::steady_clock::now();
             debug_statistics_.playback_count++;
+            lock.lock();
+            if(written && task->local_session && task->local_session==local_session_)local_clock_samples_+=task->pcm.size();
+            if(complete_write && !written && task->local_session && task->local_session==local_session_)local_write_failed_=true;
+            if(task->local_session)local_output_tail_until_ms_=AudioNowMs()+500;
+            output_in_progress_ = false;output_local_session_=0;
+            if(local_session_&&audio_playback_queue_.empty()&&!local_finished_)local_buffering_=true;
+            if (wake_greeting_active_)
+            {
+                // The synchronous writer can leave eight 60 ms DMA buffers
+                // queued. Keep capture gated until the last real PCM drains.
+                const auto dma_tail = std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(500);
+                if (dma_tail > wake_greeting_drain_until_)
+                    wake_greeting_drain_until_ = dma_tail;
+            }
+            audio_queue_cv_.notify_all();
             continue;
         }
 
@@ -566,7 +747,8 @@ void AudioService::AudioOutputTask()
          * long hiss after TTS_STOP. */
         const bool speaking_tx =
             tts_uplink_gate_.load(std::memory_order_relaxed);
-        if (speaking_tx && codec_ && codec_->output_enabled() &&
+        if (speaking_tx && (!wake_greeting_active_ || wake_greeting_started_) &&
+            !local_session_ && codec_ && codec_->output_enabled() &&
             idle_ms >= 20 && idle_ms < 180)
         {
             int16_t hold = s_hold_sample;
@@ -582,19 +764,9 @@ void AudioService::AudioOutputTask()
             continue;
         }
 
-        /* Never TX_OFF while Speaking — idle≥80 with gate still on was
-         * killing mid-utterance playback (silent feedback + stutter).
-         * After gate clears, wait briefly so the last PCM can drain. */
-        const bool protect =
-            protect_downlink_playback_.load(std::memory_order_relaxed);
-        if (codec_ && codec_->output_enabled() && !protect && !speaking_tx &&
-            idle_ms >= 120)
-        {
-            lock.unlock();
-            codec_->EnableOutput(false);
-            continue;
-        }
-
+        /* Never TX_OFF. EnableOutput(false) used to drop output_enabled and
+         * the idle driver path then stopped the shared I2S (mic died after
+         * TTS). AutoStop mutes uplink in software; DMA stays armed. */
         audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(20));
     }
 
@@ -608,6 +780,7 @@ void AudioService::AudioOutputTask()
 
 void AudioService::OpusCodecTask()
 {
+    WakeGreetingPriority greeting_priority;
     events_.fetch_or(AS_EVENT_CODEC_TASK_RUNNING);
     ESP_LOGI(TAG, "Opus codec task started");
 
@@ -626,6 +799,9 @@ void AudioService::OpusCodecTask()
         if (service_stopped_)
             break;
 
+        greeting_priority.Update(wake_greeting_active_ || visual_conversation_.load(),
+                                 CONFIG_METALIO_APP_PRIORITY + (wake_greeting_active_ ? 15 : 10));
+
         /* Decode — match Claw4: unlock while Decode/resample so AudioOutputTask
          * can keep feeding I2S (holding the lock here caused TX underrun 杂音). */
         if (!audio_decode_queue_.empty() &&
@@ -633,6 +809,7 @@ void AudioService::OpusCodecTask()
         {
             auto packet = std::move(audio_decode_queue_.front());
             audio_decode_queue_.pop_front();
+            decode_in_progress_ = true;
             audio_queue_cv_.notify_all();
             lock.unlock();
 
@@ -660,7 +837,7 @@ void AudioService::OpusCodecTask()
                 }
 
                 lock.lock();
-                audio_playback_queue_.push_back(std::move(task));
+                if(!local_session_&&!exclusive_capture_)audio_playback_queue_.push_back(std::move(task));
                 audio_queue_cv_.notify_all();
             }
             else
@@ -668,6 +845,8 @@ void AudioService::OpusCodecTask()
                 ESP_LOGE(TAG, "Failed to decode audio");
                 lock.lock();
             }
+            decode_in_progress_ = false;
+            audio_queue_cv_.notify_all();
             debug_statistics_.decode_count++;
         }
 
@@ -768,6 +947,7 @@ bool AudioService::PushPacketToDecodeQueue(
     std::unique_ptr<AudioStreamPacket> packet, bool wait)
 {
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    if(local_session_||exclusive_capture_)return false; // recorder/media owns the route
     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE)
     {
         if (wait)
@@ -782,6 +962,15 @@ bool AudioService::PushPacketToDecodeQueue(
         {
             return false;
         }
+    }
+    if (wake_greeting_active_)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        // Control JSON and UDP audio travel independently. A late final
+        // packet must extend the drain grace rather than lose its tail.
+        // Packet gaps during streaming must not look like an idle speaker.
+        wake_greeting_drain_until_ = std::max(wake_greeting_drain_until_,
+                                             now + std::chrono::milliseconds(300));
     }
     audio_decode_queue_.push_back(std::move(packet));
     audio_queue_cv_.notify_all();
@@ -829,6 +1018,18 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket()
     return nullptr;
 }
 
+bool AudioService::PrepareWakeWordDetection()
+{
+    std::lock_guard<std::mutex> lock(wake_word_mutex_);
+    if (wake_word_initialized_)
+        return true;
+    if (!wake_word_ || !wake_word_->Initialize(codec_, models_list_))
+        return false;
+    wake_word_initialized_ = true;
+    write(1, "WAKE_PREPARED\n", 14);
+    return true;
+}
+
 void AudioService::EnableWakeWordDetection(bool enable)
 {
     if (!wake_word_)
@@ -853,7 +1054,14 @@ void AudioService::EnableWakeWordDetection(bool enable)
             return;
         }
         if (running && wake_word_initialized_)
+        {
+            // Start is idempotent for the installed Hi openvela engine.
+            // Reconcile the actual model state with the service bit after
+            // a consumed/discarded callback, without resetting live context
+            // or recreating the model/microphone graph.
+            wake_word_->Start();
             return;
+        }
 
         ESP_LOGE(TAG, "Enabling wake word detection (initialized=%d)",
                  wake_word_initialized_ ? 1 : 0);
@@ -877,7 +1085,9 @@ void AudioService::EnableWakeWordDetection(bool enable)
          * Application schedules Esp after chat paint settles. */
         wake_word_->Start();
         events_.fetch_or(AS_EVENT_WAKE_WORD_RUNNING);
-        audio_input_need_warmup_ = true;
+        // The model owns its pre-roll. Discarding a capture frame here
+        // removed the first syllable when speech began just after re-arm.
+        audio_input_need_warmup_ = false;
     }
     else
     {
@@ -973,6 +1183,8 @@ void AudioService::EnableVoiceProcessing(bool enable)
         /* Discard one mic frame only on first processor bring-up. Re-arming
          * Listening after TTS used to drop ~60ms and cut 句首. */
         audio_input_need_warmup_ = first_processor_init;
+        if (codec_)
+            codec_->EnableInput(true);
         audio_processor_->Start();
         events_.fetch_or(AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     }
@@ -1027,17 +1239,12 @@ void AudioService::SetCallbacks(AudioServiceCallbacks& callbacks)
 void AudioService::SetModelsList(srmodel_list_t* models_list)
 {
     models_list_ = models_list;
-    /* Keep EnergyWakeWord only. Never kick Esp/WakeNet from boot/models
-     * load — that raced DISP start (WW_ESP_TRY during DISP1) and left
-     * chat/standby solid blue. Application upgrades after chat settles. */
-    write(1, "WW_ENERGY\n", 10);
+    // Model creation is deferred to the dedicated recognition worker.
 }
 
 void AudioService::EnsureWakeWordReady()
 {
-    /* Never create EspWakeWord/WakeNet on this port — EW_CR1 during chat
-     * (first wake especially) solid-blues LVGL. EnergyWakeWord stays. */
-    write(1, "WW_SKIP_ESP\n", 12);
+    // EnableWakeWordDetection starts the worker without blocking LVGL.
 }
 
 bool AudioService::IsAfeWakeWord()
@@ -1064,6 +1271,8 @@ bool AudioService::IsWakeWordUpgradeAllowed() const
 
 void AudioService::PlaySound(const std::string_view& ogg)
 {
+    {std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+     if(exclusive_capture_||(local_session_&&local_complete_write_))return;}
     if (!codec_->output_enabled())
     {
         if (audio_power_timer_)
@@ -1182,29 +1391,286 @@ void AudioService::OutputPcm(const int16_t* data, size_t samples)
     debug_statistics_.playback_count++;
 }
 
+void AudioService::PlayLocalPcm(const int16_t* data, size_t samples)
+{
+    {std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+     if(exclusive_capture_||(local_session_&&local_complete_write_))return;}
+    if (codec_ == nullptr || data == nullptr || samples == 0)
+        return;
+
+    const uint32_t pcm_ms =
+        static_cast<uint32_t>((samples * 1000u) / 16000u) + 1200u;
+    MuteWakeWordForMs(pcm_ms < 2000u ? 2000u : pcm_ms);
+
+    /* Open TX before the chime. A 静音 ioctl latches the BT speaker, so
+     * unmute once here (this runs off the LVGL thread) and never again
+     * while muted() stays false. Do not AUDIOIOC_STOP — that races LCDC. */
+    if (!codec_->output_enabled())
+        codec_->EnableOutput(true);
+    if (codec_->muted())
+        codec_->SetMute(false);
+    ArmDownlinkPlaybackProtect();
+    const uint64_t hold_until = AudioNowMs() + 12000u;
+    uint64_t prev_hold = hold_tx_until_ms_.load(std::memory_order_relaxed);
+    while (hold_until > prev_hold &&
+           !hold_tx_until_ms_.compare_exchange_weak(
+               prev_hold, hold_until, std::memory_order_relaxed)) {
+    }
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        if(exclusive_capture_||(local_session_&&local_complete_write_))return;
+        audio_decode_queue_.clear();
+        audio_playback_queue_.clear();
+        audio_testing_queue_.clear();
+        audio_queue_cv_.notify_all();
+    }
+
+    constexpr size_t kFrame =
+        static_cast<size_t>(16000 * OPUS_FRAME_DURATION_MS / 1000);
+    size_t off = 0;
+    while (off < samples) {
+        std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        audio_queue_cv_.wait(lock, [this] {
+            return exclusive_capture_.load() || (local_session_&&local_complete_write_) || service_stopped_.load() ||
+                   audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE;
+        });
+        if (exclusive_capture_||(local_session_&&local_complete_write_)||service_stopped_.load())
+            break;
+        const size_t n = std::min(kFrame, samples - off);
+        auto task = std::make_unique<AudioTask>();
+        task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+        task->pcm.assign(data + off, data + off + n);
+        task->timestamp = 0;
+        audio_playback_queue_.push_back(std::move(task));
+        off += n;
+        audio_queue_cv_.notify_all();
+    }
+
+    /* A hard underrun when the chime queue drains stops the shared I2S
+     * and blues the panel. Pad a short silence tail so DMA winds down. */
+    {
+        std::vector<int16_t> tail(kFrame, 0);
+        for (int i = 0; i < 4; ++i) {
+            std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+            audio_queue_cv_.wait(lock, [this] {
+                return exclusive_capture_.load() || (local_session_&&local_complete_write_) || service_stopped_.load() ||
+                       audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE;
+            });
+            if (exclusive_capture_||(local_session_&&local_complete_write_)||service_stopped_.load())
+                break;
+            auto task = std::make_unique<AudioTask>();
+            task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+            task->pcm = tail;
+            task->timestamp = 0;
+            audio_playback_queue_.push_back(std::move(task));
+            audio_queue_cv_.notify_all();
+        }
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        int spins = 0;
+        while (!service_stopped_.load() && !audio_playback_queue_.empty() &&
+               spins < 45) {
+            audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(20));
+            ++spins;
+        }
+    }
+    /* Last frame is still in the codec DMA; hold TX a bit longer. */
+    usleep(180 * 1000);
+    MuteWakeWordForMs(900);
+    ClearDownlinkPlaybackProtect();
+}
+
+void AudioService::EnqueuePlaybackPcm(const int16_t* data, size_t samples)
+{
+    (void)TryEnqueuePlaybackPcm(data, samples);
+}
+
+bool AudioService::TryEnqueuePlaybackPcm(const int16_t* data, size_t samples)
+{
+    if (codec_ == nullptr || data == nullptr || samples == 0)
+        return false;
+
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    if(exclusive_capture_||(local_session_&&local_complete_write_))return false;
+    if (audio_playback_queue_.size() >= MAX_PLAYBACK_TASKS_IN_QUEUE)
+        return false;
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->pcm.assign(data, data + samples);
+    task->timestamp = 0;
+    audio_playback_queue_.push_back(std::move(task));
+    lock.unlock();
+
+    ArmDownlinkPlaybackProtect();
+    const uint64_t hold_until = AudioNowMs() + 3000u;
+    uint64_t prev_hold = hold_tx_until_ms_.load(std::memory_order_relaxed);
+    while (hold_until > prev_hold &&
+           !hold_tx_until_ms_.compare_exchange_weak(
+               prev_hold, hold_until, std::memory_order_relaxed)) {
+    }
+
+    lock.lock();
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
+uint32_t AudioService::BeginLocalPlayback(size_t prebuffer_samples,bool complete_write)
+{
+    // Preserve the established media ABI; only recorder playback opts in to
+    // the already-held capture lease through the explicit overload below.
+    return BeginLocalPlayback(prebuffer_samples,complete_write,false);
+}
+
+uint32_t AudioService::BeginLocalPlayback(size_t prebuffer_samples,bool complete_write,bool capture_owner)
+{return BeginLocalPlayback(prebuffer_samples,complete_write,capture_owner,false);}
+
+uint32_t AudioService::BeginLocalPlayback(size_t prebuffer_samples,bool complete_write,bool capture_owner,bool require_idle)
+{
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    if(require_idle&&(service_stopped_||local_session_||exclusive_capture_||output_in_progress_||!audio_playback_queue_.empty()||!audio_decode_queue_.empty()))return 0;
+    // Recorder ownership also covers its file playback. A late media worker
+    // cannot replace that session or change its PCM queue after a stop request.
+    // Complete writes describe delivery, not ownership. An alarm also uses
+    // complete writes, so it must not replace a recorder's live PCM session.
+    // Only the recorder that already holds the capture lease opts in.
+    if(exclusive_capture_&&(!capture_owner||!complete_write))return 0;
+    if(capture_owner&&!exclusive_capture_)return 0;
+    if(++local_session_counter_==0)++local_session_counter_;
+    local_session_=local_session_counter_;local_prebuffer_=std::min<size_t>(prebuffer_samples,960*10);
+    local_clock_samples_=0;local_clock_start_ms_=0;local_pause_ms_=0;
+    local_buffering_=true;local_finished_=false;
+    local_complete_write_=complete_write;local_write_failed_=false;
+    wake_greeting_active_=false;wake_greeting_started_=false;wake_greeting_ended_=false;
+    wake_greeting_first_packet_={};wake_greeting_drain_until_={};
+    if(complete_write){notification_pcm_.clear();++notification_epoch_;}
+    audio_playback_queue_.clear();audio_decode_queue_.clear();
+    audio_queue_cv_.notify_all();return local_session_;
+}
+
+bool AudioService::BeginExclusiveCapture()
+{
+    if(service_stopped_||exclusive_capture_.exchange(true))return false;
+    const uint32_t request=capture_request_.fetch_add(1)+1;
+    for(int waited=0;waited<300&&!service_stopped_;++waited){
+        if(capture_yielded_&&capture_ack_.load()==request)return true;
+        usleep(10000);
+    }
+    exclusive_capture_=false;return false;
+}
+void AudioService::EndExclusiveCapture(){exclusive_capture_=false;}
+bool AudioService::LocalPlaybackSettled() const {
+    std::lock_guard<std::mutex>lock(audio_queue_mutex_);
+    return !local_session_&&!output_local_session_&&AudioNowMs()>=local_output_tail_until_ms_;
+}
+bool AudioService::VoicePlaybackSettled() const {
+    std::lock_guard<std::mutex>lock(audio_queue_mutex_);
+    return !local_session_ && !output_in_progress_ && !decode_in_progress_ &&
+        audio_playback_queue_.empty() && audio_decode_queue_.empty() &&
+        std::chrono::steady_clock::now()-last_output_time_>=std::chrono::milliseconds(500);
+}
+
+bool AudioService::TryEnqueueLocalPcm(uint32_t session,const int16_t *data,size_t samples)
+{
+    if(!codec_||!data||!samples||!session)return false;
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    if(session!=local_session_||audio_playback_queue_.size()>=MAX_PLAYBACK_TASKS_IN_QUEUE)return false;
+    auto task=std::make_unique<AudioTask>();task->type=kAudioTaskTypeDecodeToPlaybackQueue;
+    task->pcm.assign(data,data+samples);task->timestamp=0;task->local_session=session;
+    // This NuttX condvar implementation drains wait_count during broadcast.
+    // Keep its associated mutex held: a higher priority consumer could
+    // otherwise re-enter wait before broadcast finishes and keep it spinning.
+    audio_playback_queue_.push_back(std::move(task));audio_queue_cv_.notify_all();return true;
+}
+
+void AudioService::FlushLocalPlayback(uint32_t session)
+{
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);if(!session||session!=local_session_)return;
+    for(auto i=audio_playback_queue_.begin();i!=audio_playback_queue_.end();)
+        if((*i)->local_session==session)i=audio_playback_queue_.erase(i);else ++i;
+    local_buffering_=true;local_finished_=false;audio_queue_cv_.notify_all();
+}
+void AudioService::FinishLocalPlayback(uint32_t session)
+{std::lock_guard<std::mutex> lock(audio_queue_mutex_);if(session&&session==local_session_)local_finished_=true;audio_queue_cv_.notify_all();}
+bool AudioService::LocalPlaybackDrained(uint32_t session) const
+{
+    if(!session)return true;
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);if(output_local_session_==session)return false;
+    for(const auto &q:audio_playback_queue_)if(q->local_session==session)return false;return true;
+}
+bool AudioService::LocalPlaybackWriteFailed(uint32_t session) const
+{
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return !session || session!=local_session_ || local_write_failed_;
+}
+void AudioService::EndLocalPlayback(uint32_t session)
+{
+    if(!session)return;
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    for(auto i=audio_playback_queue_.begin();i!=audio_playback_queue_.end();)
+        if((*i)->local_session==session)i=audio_playback_queue_.erase(i);else ++i;
+    if(session==local_session_){local_session_=0;local_buffering_=false;local_finished_=false;}
+    audio_queue_cv_.notify_all();
+}
+bool AudioService::HasLocalPlaybackSession() const
+{std::lock_guard<std::mutex> lock(audio_queue_mutex_);return local_session_!=0;}
+
+uint32_t AudioService::LocalPlaybackTimeMs(uint32_t session) const
+{
+ std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+ if(!session||session!=local_session_||!local_clock_start_ms_)return 0;
+ const int64_t now=local_pause_ms_?local_pause_ms_:AudioNowMs();
+ return (uint32_t)std::min<int64_t>(local_clock_samples_/16,std::max<int64_t>(0,now-local_clock_start_ms_));
+}
+void AudioService::PauseLocalPlayback(uint32_t session,bool pause)
+{
+ std::lock_guard<std::mutex> lock(audio_queue_mutex_);if(!session||session!=local_session_)return;
+ if(pause&&!local_pause_ms_)local_pause_ms_=AudioNowMs();
+ else if(!pause&&local_pause_ms_){if(local_clock_start_ms_)local_clock_start_ms_+=AudioNowMs()-local_pause_ms_;local_pause_ms_=0;}
+ audio_queue_cv_.notify_all();
+}
+
+void AudioService::ClearWakeWordMute()
+{
+    wake_mute_until_ms_.store(0, std::memory_order_relaxed);
+}
+
 bool AudioService::IsIdle()
 {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    return audio_encode_queue_.empty() &&
-           audio_decode_queue_.empty() &&
+    return !decode_in_progress_ && !output_in_progress_ &&
+           audio_encode_queue_.empty() && audio_decode_queue_.empty() &&
            audio_playback_queue_.empty() &&
            audio_testing_queue_.empty();
 }
 
 void AudioService::ResetDecoder()
 {
-    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    // Decode runs outside the queue lock. Reset must wait for that worker
+    // before touching the same Opus state or its replacement instance.
+    audio_queue_cv_.wait(lock, [this] { return !decode_in_progress_; });
     if (opus_decoder_)
         opus_decoder_->ResetState();
     audio_decode_queue_.clear();
-    audio_playback_queue_.clear();
+    for(auto i=audio_playback_queue_.begin();i!=audio_playback_queue_.end();)
+        if(!local_session_||(*i)->local_session!=local_session_)i=audio_playback_queue_.erase(i);else ++i;
     audio_testing_queue_.clear();
+    wake_greeting_active_ = false;
+    wake_greeting_started_ = false;
+    wake_greeting_ended_ = false;
+    wake_greeting_first_packet_ = {};
+    wake_greeting_drain_until_ = {};
     audio_queue_cv_.notify_all();
 }
 
 void AudioService::ResetDecoderStateOnly()
 {
-    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    // Decode runs outside the queue lock. Reset must wait for that worker
+    // before touching the same Opus state or its replacement instance.
+    audio_queue_cv_.wait(lock, [this] { return !decode_in_progress_; });
     if (opus_decoder_)
         opus_decoder_->ResetState();
 }
@@ -1212,7 +1678,32 @@ void AudioService::ResetDecoderStateOnly()
 bool AudioService::HasPendingPlayback() const
 {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    return !audio_decode_queue_.empty() || !audio_playback_queue_.empty();
+    return decode_in_progress_ || output_in_progress_ ||
+           !audio_decode_queue_.empty() || !audio_playback_queue_.empty() ||
+           (wake_greeting_active_ &&
+            std::chrono::steady_clock::now() < wake_greeting_drain_until_);
+}
+
+void AudioService::BeginWakeGreetingPlayback()
+{
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    wake_greeting_active_ = true;
+    wake_greeting_started_ = false;
+    wake_greeting_ended_ = false;
+    wake_greeting_first_packet_ = {};
+    wake_greeting_drain_until_ = {};
+}
+
+void AudioService::NotifyTtsStreamEnded()
+{
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    if (wake_greeting_active_)
+    {
+        wake_greeting_ended_ = true;
+        wake_greeting_drain_until_ = std::max(wake_greeting_drain_until_,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(300));
+        audio_queue_cv_.notify_all();
+    }
 }
 
 void AudioService::DiscardUplinkAudio()
@@ -1226,14 +1717,36 @@ void AudioService::DiscardUplinkAudio()
 
 bool AudioService::ShouldSuppressUplink() const
 {
-    /* Always mute uplink while TTS is gated or PCM is queued. Opening the
-     * mic during TTS (even with "device AEC") leaked speaker into STT on
-     * this port → 自问自答 / chopped feedback. Interrupt uses local barge. */
-    if (tts_uplink_gate_.load(std::memory_order_relaxed))
+    /* AutoStop: mute the mic path only while TTS is gated. A leftover
+     * playback buffer must not keep the next utterance from being sent
+     * after the gate drops (that stuck the header on「聆听中」). */
+    return tts_uplink_gate_.load(std::memory_order_relaxed);
+}
+
+bool AudioService::ShouldSuppressWakeWord() const
+{
+    if (metalio_nt26_get_call_state() != METALIO_CALL_IDLE)
         return true;
-    if (HasPendingPlayback())
+    if (protect_downlink_playback_.load(std::memory_order_relaxed))
         return true;
-    return false;
+    return AudioNowMs() <
+           wake_mute_until_ms_.load(std::memory_order_relaxed);
+}
+
+void AudioService::MuteWakeWordForMs(uint32_t ms)
+{
+    if (ms == 0)
+        return;
+    const uint64_t now=AudioNowMs();
+    const bool already_muted=protect_downlink_playback_.load()||now<wake_mute_until_ms_.load();
+    const uint64_t until = now + static_cast<uint64_t>(ms);
+    uint64_t prev = wake_mute_until_ms_.load(std::memory_order_relaxed);
+    while (until > prev &&
+           !wake_mute_until_ms_.compare_exchange_weak(
+               prev, until, std::memory_order_relaxed)) {
+    }
+    if(!already_muted){std::lock_guard<std::mutex> lock(wake_word_mutex_);
+    if (wake_word_)wake_word_->Reset();}
 }
 
 void AudioService::SetTtsUplinkGate(bool gated)
@@ -1254,11 +1767,12 @@ void AudioService::SetTtsUplinkGate(bool gated)
 
 void AudioService::ArmDownlinkPlaybackProtect()
 {
-    protect_downlink_playback_.store(true, std::memory_order_release);
+    const bool already_protected =
+        protect_downlink_playback_.exchange(true, std::memory_order_acq_rel);
     /* Do NOT EnableOutput here — priming TX with silence while the mic is
      * live couples into the uplink (xiaozhi.me hears 电流杂音). Output opens
      * lazily on the first real PCM in AudioOutputTask. */
-    write(1, "DL_ARM\n", 7);
+    if (!already_protected) write(1, "DL_ARM\n", 7);
 }
 
 void AudioService::ClearDownlinkPlaybackProtect()
@@ -1276,8 +1790,13 @@ void AudioService::ClearDownlinkPlaybackProtect()
 
 void AudioService::SetVolume(int volume)
 {
+    SetVolume(volume, true);
+}
+
+void AudioService::SetVolume(int volume, bool persist)
+{
     if (codec_)
-        codec_->SetOutputVolume(volume);
+        codec_->SetOutputVolume(volume, persist);
 }
 
 int AudioService::GetVolume() const
@@ -1328,23 +1847,15 @@ bool AudioService::IsPttPressed() const
 
 void AudioService::CheckAndUpdateAudioPowerState()
 {
-    auto now = std::chrono::steady_clock::now();
-    auto input_elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - last_input_time_).count();
-    auto output_elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - last_output_time_).count();
-
-    if (input_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->input_enabled())
-        codec_->EnableInput(false);
-
-    if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled())
-        codec_->EnableOutput(false);
-
-    if (!codec_->input_enabled() && !codec_->output_enabled())
-    {
-        if (audio_power_timer_)
-            esp_timer_stop(audio_power_timer_);
-    }
+    /* Shared I2S0: do not EnableInput/EnableOutput(false). That flag used
+     * to pair with AUDIOIOC_STOP and the driver stops the other direction
+     * when a queue drains. Wake, listen, and TTS leave both DMA channels
+     * armed; AutoStop only gates the uplink. */
+    if (audio_power_timer_)
+        esp_timer_stop(audio_power_timer_);
 }
+
+uint32_t AudioService::BeginNotification(){std::lock_guard<std::mutex>l(audio_queue_mutex_);notification_pcm_.clear();return ++notification_epoch_;}
+bool AudioService::EnqueueNotification(uint32_t id,const int16_t*data,size_t count){std::lock_guard<std::mutex>l(audio_queue_mutex_);if(!id||id!=notification_epoch_||exclusive_capture_||(local_session_&&local_complete_write_)||count>16000||notification_pcm_.size()+count>16000)return false;notification_pcm_.insert(notification_pcm_.end(),data,data+count);audio_queue_cv_.notify_all();return true;}
+void AudioService::EndNotification(uint32_t id){std::lock_guard<std::mutex>l(audio_queue_mutex_);if(id==notification_epoch_){++notification_epoch_;notification_pcm_.clear();}}
+bool AudioService::NotificationDrained(uint32_t id)const{std::lock_guard<std::mutex>l(audio_queue_mutex_);return id!=notification_epoch_||(notification_pcm_.empty()&&!output_in_progress_);}

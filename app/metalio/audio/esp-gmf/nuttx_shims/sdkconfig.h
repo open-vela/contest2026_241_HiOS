@@ -41,12 +41,16 @@
  *   TS  (container)  -> esp_ts_dec_register()   (MPEG-TS demux)
  *   AAC (codec)      -> esp_aac_dec_register()  (TS audio payload)
  *
- * NOTE: MP3 is intentionally left off — libesp_audio_codec.a's MP3 decoder
- * references esp_chip_info(), which openvela does not provide.  Add it back
- * together with an esp_chip_info stub if an MP3 radio stream is needed.
+ * MP3 uses esp_chip_info_stub.c on NuttX.
  * ---------------------------------------------------------------------------
  */
 #define CONFIG_AUDIO_DECODER_AAC_SUPPORT 1
+#define CONFIG_AUDIO_DECODER_MP3_SUPPORT 1
 #define CONFIG_AUDIO_SIMPLE_DEC_TS_SUPPORT 1
+#define CONFIG_AUDIO_SIMPLE_DEC_WAV_SUPPORT 1
+#define CONFIG_AUDIO_DECODER_PCM_SUPPORT 1
+
+/* Local SD music and incoming ringtones need a file reader in each pool. */
+#define CONFIG_ESP_AUDIO_SIMPLE_PLAYER_FILE_EN 1
 
 #endif /* __SDKCONFIG_SHIM_H */

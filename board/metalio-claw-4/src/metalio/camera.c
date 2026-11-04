@@ -22,6 +22,8 @@
 
 #include <nuttx/config.h>
 #include <nuttx/arch.h>
+#include <nuttx/signal.h>
+#include <time.h>
 #include <nuttx/i2c/i2c_master.h>
 #include <nuttx/mutex.h>
 #include <nuttx/kmalloc.h>
@@ -135,6 +137,11 @@ struct metalio_camera_s
   bool available;               /* Sensor detected during init probe */
   bool powered;                 /* PWDN released */
   bool xclk_on;                 /* XCLK running */
+  bool exposure_valid;          /* Warm-start seed only; auto AE/AGC stays on */
+  bool streaming;
+  bool registered;              /* V4L2 node exists; never re-probe a live sensor */
+  uint8_t exposure[3];
+  uint8_t gain[2];
 
 #ifdef CONFIG_ESPRESSIF_MIPI_CSI
   imgdata_capture_t capture_cb; /* complete_capture() from V4L2 upper-half */
@@ -359,6 +366,22 @@ static void ov2710_data_frame_done(FAR void *buf, size_t len, FAR void *arg);
  * Private Functions
  ****************************************************************************/
 
+/* Camera initialization runs in task context. Preserve electrical settling
+ * time without busy-waiting through display refresh and audio deadlines. */
+static void camera_settle_ms(unsigned int ms)
+{
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  int64_t until = (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000 + ms * 1000;
+  for (;;)
+    {
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      int64_t left = until - ((int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000);
+      if (left <= 0) break;
+      nxsig_usleep((useconds_t)left);
+    }
+}
+
 static int ov2710_sccb_read(FAR struct i2c_master_s *i2c, uint16_t reg,
                             FAR uint8_t *buf, uint8_t len)
 {
@@ -422,43 +445,17 @@ static int ov2710_set_reg_bits(FAR struct i2c_master_s *i2c, uint16_t reg,
   return ov2710_sccb_write(i2c, reg, reg_data);
 }
 
-/* OV2710 0x503D bit7 enables the factory color-bar test pattern.  A plain
- * write of 0x00 is ignored on some modules while streaming; use group hold
- * plus read-modify-write, pausing stream briefly when necessary. */
+/* Match the sensor driver's read/modify/write of the test-pattern bit.
+ * This is called with streaming stopped; no group launch is necessary. */
 
 static int ov2710_disable_test_pattern(FAR struct metalio_camera_s *priv)
 {
   FAR struct i2c_master_s *i2c = priv->i2c;
-  uint8_t s3008 = 0;
   uint8_t tp    = 0;
-  bool resume_stream = false;
-  int ret = OK;
-
-  ov2710_sccb_read(i2c, 0x3008, &s3008, 1);
-  if (s3008 == 0x02)
-    {
-      resume_stream = true;
-      ret = ov2710_sccb_write(i2c, 0x3008, 0x42);
-      up_mdelay(10);
-    }
-
-  ret |= ov2710_sccb_write(i2c, 0x3212, 0x00);
-  ret |= ov2710_set_reg_bits(i2c, 0x503d, 7, 1, 0);
-  ret |= ov2710_sccb_write(i2c, 0x3212, 0x10);
-  ret |= ov2710_sccb_write(i2c, 0x3212, 0xa0);
-  ret |= ov2710_set_reg_bits(i2c, 0x503d, 7, 1, 0);
-  up_mdelay(5);
-
-  if (resume_stream)
-    {
-      ret |= ov2710_sccb_write(i2c, 0x4201, 0x00);
-      ret |= ov2710_sccb_write(i2c, 0x4202, 0x00);
-      ret |= ov2710_sccb_write(i2c, 0x3008, 0x02);
-      up_mdelay(5);
-    }
-
-  ov2710_sccb_read(i2c, 0x503d, &tp, 1);
-  syslog(LOG_INFO, "CAMDBG: disable_test_pattern 503d=%02x ret=%d\n", tp, ret);
+  int ret = ov2710_set_reg_bits(i2c, 0x503d, 7, 1, 0);
+  if (ret < 0) return ret;
+  ret = ov2710_sccb_read(i2c, 0x503d, &tp, 1);
+  if (ret < 0) return ret;
 
   if (tp & 0x80)
     {
@@ -477,7 +474,7 @@ static int ov2710_write_array(FAR struct i2c_master_s *i2c,
     {
       if (regs->reg == OV2710_REG_DELAY)
         {
-          up_mdelay(regs->val);
+          camera_settle_ms(regs->val);
         }
       else
         {
@@ -502,19 +499,114 @@ static int ov2710_set_stream(FAR struct metalio_camera_s *priv, bool enable)
 
   if (enable)
     {
-      ret = ov2710_sccb_write(priv->i2c, 0x4201, 0x00);
-      ret |= ov2710_sccb_write(priv->i2c, 0x4202, 0x00);
-      ret |= ov2710_disable_test_pattern(priv);
-      ret |= ov2710_sccb_write(priv->i2c, 0x3008, 0x02);
-      up_mdelay(20);
-      ret |= ov2710_disable_test_pattern(priv);
+      /* The reset default is only two exposure lines, visibly dark while
+       * auto exposure converges. Seed from the last real session (or a
+       * bounded 512-line cold value), then leave automatic AE/AGC enabled.
+       * Dimensions, PLL, frame interval and image quality are unchanged. */
+      uint8_t control = 0;
+      if (ov2710_sccb_read(priv->i2c, 0x3503, &control, 1) == OK &&
+          (control & 3) == 0)
+        {
+          const uint8_t cold[3] = {0x00, 0x20, 0x00};
+          const uint8_t *expo = priv->exposure_valid ? priv->exposure : cold;
+          /* AEC is idle with the sensor stopped. Keep its enable bits
+           * untouched even if any seed transaction fails. */
+          for (unsigned int i = 0; i < 3; ++i)
+            ov2710_sccb_write(priv->i2c, 0x3500 + i, expo[i]);
+          if (priv->exposure_valid)
+            for (unsigned int i = 0; i < 2; ++i)
+              ov2710_sccb_write(priv->i2c, 0x350a + i, priv->gain[i]);
+        }
+      /* Match the HiOS OV2710 start sequence: clear the factory pattern
+       * while the sensor is stopped, then start streaming once.  Rewriting
+       * 0x503d after 0x3008=0x02 pauses and restarts the sensor immediately
+       * after CSI STREAMON, which can leave the receiver waiting for a new
+       * frame boundary indefinitely. */
+      ret = ov2710_disable_test_pattern(priv);
+      if (ret == OK)
+        {
+          ret = ov2710_sccb_write(priv->i2c, 0x4201, 0x00);
+        }
+
+      if (ret == OK)
+        {
+          ret = ov2710_sccb_write(priv->i2c, 0x4202, 0x00);
+        }
+
+      if (ret == OK)
+        {
+          ret = ov2710_sccb_write(priv->i2c, 0x3008, 0x02);
+        }
+
+      if (ret == OK)
+        {
+          camera_settle_ms(30);
+        }
+
+      if (ret == OK)
+        {
+          uint8_t power = 0, output = 0, mipi = 0, pll = 0;
+          int verify = ov2710_sccb_read(priv->i2c, 0x3008, &power, 1);
+          verify |= ov2710_sccb_read(priv->i2c, 0x4202, &output, 1);
+          verify |= ov2710_sccb_read(priv->i2c, 0x4800, &mipi, 1);
+          verify |= ov2710_sccb_read(priv->i2c, 0x300f, &pll, 1);
+          syslog(LOG_INFO, "CAM: stream registers power=%02x output=%02x mipi=%02x pll=%02x read=%d\n",
+                 power, output, mipi, pll, verify);
+          uint8_t phy = 0, divider = 0, multiplier = 0, source = 0;
+          verify |= ov2710_sccb_read(priv->i2c, 0x300e, &phy, 1);
+          verify |= ov2710_sccb_read(priv->i2c, 0x3010, &divider, 1);
+          verify |= ov2710_sccb_read(priv->i2c, 0x3011, &multiplier, 1);
+          verify |= ov2710_sccb_read(priv->i2c, 0x3103, &source, 1);
+          syslog(LOG_INFO, "CAM: PHY=%02x divider=%02x multiplier=%02x source=%02x read=%d\n",
+                 phy, divider, multiplier, source, verify);
+          if (verify < 0) ret = verify;
+          else if ((power & 0x40) || output != 0) ret = -EIO;
+        }
+      priv->streaming = ret == OK;
+      syslog(LOG_INFO, "CAM: sensor stream on ret=%d\n", ret);
     }
   else
     {
+      if (priv->powered && priv->xclk_on && priv->streaming)
+        {
+          uint8_t expo[3] = {0}, gain[2] = {0}, check[2] = {0};
+          int sampled = OK;
+          /* OV2710 SCCB uses individually addressed 8-bit registers, as
+           * do its chip-ID and upstream exposure/gain reads. A burst read
+           * can repeat one byte: seeding that as exposure/gain makes the
+           * next preview start very dark or clipped white. */
+          for (unsigned int i = 0; i < 3 && sampled == OK; ++i)
+            sampled = ov2710_sccb_read(priv->i2c, 0x3500 + i, &expo[i], 1);
+          for (unsigned int i = 0; i < 2 && sampled == OK; ++i)
+            sampled = ov2710_sccb_read(priv->i2c, 0x350a + i, &gain[i], 1);
+          for (unsigned int i = 0; i < 2 && sampled == OK; ++i)
+            sampled = ov2710_sccb_read(priv->i2c, 0x3500 + i, &check[i], 1);
+          priv->exposure_valid = false;
+          if (sampled == OK && memcmp(check, expo, sizeof(check)) == 0 &&
+              (expo[0] & 0xf0) == 0 && (gain[0] & 0xfe) == 0 &&
+              (expo[0] || expo[1] || (expo[2] & 0xf0)))
+            {
+              memcpy(priv->exposure, expo, sizeof(expo));
+              memcpy(priv->gain, gain, sizeof(gain));
+              priv->exposure_valid = true;
+            }
+        }
+      priv->streaming = false;
       ret = ov2710_sccb_write(priv->i2c, 0x3008, 0x42);
-      ret |= ov2710_sccb_write(priv->i2c, 0x4201, 0x00);
-      ret |= ov2710_sccb_write(priv->i2c, 0x4202, 0x0f);
-      ret |= ov2710_disable_test_pattern(priv);
+      if (ret == OK)
+        {
+          ret = ov2710_sccb_write(priv->i2c, 0x4201, 0x00);
+        }
+
+      if (ret == OK)
+        {
+          ret = ov2710_sccb_write(priv->i2c, 0x4202, 0x0f);
+        }
+
+      if (ret == OK)
+        {
+          ret = ov2710_disable_test_pattern(priv);
+        }
     }
 
   return ret;
@@ -556,16 +648,22 @@ static void metalio_clk_reg_write(uintptr_t addr, uint32_t val)
 static void metalio_camera_xclk_start(void)
 {
   uint32_t v;
+  uint32_t gpio_sel;
+  uintptr_t gpio_sel_addr;
 
   /* Power up SPLL.  NuttX's clock init only enables CPLL (CPU); SPLL, the
    * 480 MHz root behind CLKOUT_SIG_SPLL, is left powered down and there is no
    * clk_ll_spll_enable() in the HAL (ESP-IDF brings it up via pmu_init()).
    * Tie it high here so the CLKOUT divider below produces a real 24 MHz XCLK. */
 
-  v = metalio_clk_reg_read(PMU_IMM_HP_CK_POWER_REG);
-  v |= PMU_TIE_HIGH_XPD_SPLL | PMU_TIE_HIGH_XPD_SPLL_I2C |
-       PMU_TIE_HIGH_GLOBAL_SPLL_ICG;
-  metalio_clk_reg_write(PMU_IMM_HP_CK_POWER_REG, v);
+  /* These PMU fields are write-trigger bits, not persistent R/W state.
+   * Match the ESP32-P4 HAL's PLL bring-up ordering: assert the PLL and I2C
+   * power controls first, then enable the global clock gate separately. */
+  metalio_clk_reg_write(PMU_IMM_HP_CK_POWER_REG,
+                        PMU_TIE_HIGH_XPD_SPLL |
+                        PMU_TIE_HIGH_XPD_SPLL_I2C);
+  metalio_clk_reg_write(PMU_IMM_HP_CK_POWER_REG,
+                        PMU_TIE_HIGH_GLOBAL_SPLL_ICG);
 
   /* Select the GPIO function on the pad (IO_MUX) and enable the output
    * driver BEFORE routing the CLKOUT signal through the GPIO matrix.  Without
@@ -590,15 +688,18 @@ static void metalio_camera_xclk_start(void)
   /* Readback for bring-up: confirm SPLL power + CLKOUT sel/div/en + the GPIO
    * matrix out_sel for BOARD_CAM_XCLK_GPIO all took effect. */
 
-  syslog(LOG_INFO,
-         "XCLK: pmu=%08" PRIx32 " dbg0=%08" PRIx32 " dbg1=%08" PRIx32
-         " gpio%u_sel=%08" PRIx32 "\n",
+  gpio_sel_addr = GPIO_BASE + GPIO_FUNC_OUT_SEL_CFG_OFF +
+                  (BOARD_CAM_XCLK_GPIO * 4);
+  gpio_sel = metalio_clk_reg_read(gpio_sel_addr);
+  syslog(LOG_INFO, "XCLK clock regs: pmu=%08" PRIx32 " dbg0=%08" PRIx32
+         " dbg1=%08" PRIx32 "\n",
          metalio_clk_reg_read(PMU_IMM_HP_CK_POWER_REG),
          metalio_clk_reg_read(HP_SYS_CLKRST_DBG_CLK_CTRL0),
-         metalio_clk_reg_read(HP_SYS_CLKRST_DBG_CLK_CTRL1),
-         (unsigned int)BOARD_CAM_XCLK_GPIO,
-         metalio_clk_reg_read(GPIO_BASE + GPIO_FUNC_OUT_SEL_CFG_OFF +
-                              (BOARD_CAM_XCLK_GPIO * 4)));
+         metalio_clk_reg_read(HP_SYS_CLKRST_DBG_CLK_CTRL1));
+  syslog(LOG_INFO, "XCLK GPIO%u output-select @%08" PRIxPTR " = %08" PRIx32
+         " (expected signal %u)\n",
+         (unsigned int)BOARD_CAM_XCLK_GPIO, gpio_sel_addr, gpio_sel,
+         (unsigned int)DBG_CH0_CLK_IDX);
 }
 
 static void metalio_camera_xclk_stop(void)
@@ -628,14 +729,14 @@ static int camera_power_on(FAR struct metalio_camera_s *priv)
           return ret;
         }
 
-      up_mdelay(CAM_POWER_SETTLE_MS);
+      camera_settle_ms(CAM_POWER_SETTLE_MS);
       priv->powered = true;
     }
 
   if (!priv->xclk_on)
     {
       metalio_camera_xclk_start();
-      up_mdelay(CAM_XCLK_SETTLE_MS);
+      camera_settle_ms(CAM_XCLK_SETTLE_MS);
       priv->xclk_on = true;
     }
 
@@ -698,8 +799,6 @@ static int ov2710_init(FAR struct imgsensor_s *sensor)
             }
         }
     }
-
-  syslog(LOG_INFO, "CAMDBG: sensor_init=%d\n", ret);
 
   nxmutex_unlock(&priv->lock);
   return ret;
@@ -764,28 +863,6 @@ static int ov2710_start_capture(FAR struct imgsensor_s *sensor,
   nxmutex_lock(&priv->lock);
   ret = ov2710_set_stream(priv, true);
   nxmutex_unlock(&priv->lock);
-
-  syslog(LOG_INFO, "CAMDBG: sensor_start_capture set_stream=%d\n", ret);
-
-  /* Read back the OV2710 streaming / MIPI / test-pattern state to confirm the
-   * SCCB writes above actually took effect on the sensor. */
-
-  {
-    uint8_t s3008 = 0, s4800 = 0, s503d = 0;
-
-    ov2710_sccb_read(priv->i2c, 0x3008, &s3008, 1);
-    ov2710_sccb_read(priv->i2c, 0x4800, &s4800, 1);
-    ov2710_sccb_read(priv->i2c, 0x503d, &s503d, 1);
-    syslog(LOG_INFO, "CAMDBG: s3008=%02x s4800=%02x s503d=%02x\n",
-           s3008, s4800, s503d);
-  }
-
-  /* Bring-up diagnostic: wait for the sensor/CSI/DMA pipeline to settle, then
-   * dump the bridge and DW-GDMA status to localise a "no frame" condition. */
-
-  up_mdelay(500);
-  esp_mipi_csi_dump_status();
-
   return ret;
 }
 
@@ -827,24 +904,12 @@ static const struct imgsensor_ops_s g_ov2710_sensor_ops =
 
 static int ov2710_data_init(FAR struct imgdata_s *data)
 {
-  struct esp_mipi_csi_bus_config_s bus =
-    {
-#ifdef CONFIG_ESPRESSIF_MIPI_CSI_LANES
-      .num_data_lanes     = CONFIG_ESPRESSIF_MIPI_CSI_LANES,
-#else
-      .num_data_lanes     = 1,
-#endif
-#ifdef CONFIG_ESPRESSIF_MIPI_CSI_LANE_BITRATE_MBPS
-      .lane_bit_rate_mbps = CONFIG_ESPRESSIF_MIPI_CSI_LANE_BITRATE_MBPS,
-#else
-      .lane_bit_rate_mbps = 800,
-#endif
-    };
-  int ret;
-
-  ret = esp_mipi_csi_initialize(&bus);
-  syslog(LOG_INFO, "CAMDBG: data_init(esp_mipi_csi_initialize)=%d\n", ret);
-  return ret;
+  /* V4L2 registers this lower-half before board display bring-up.  Defer CSI
+   * host/PHY clock and reset setup until STREAMON so the later DSI panel
+   * initialization cannot overwrite the camera PHY state.  The reference
+   * HiOS path also creates the video pipeline only after the display is up. */
+  (void)data;
+  return OK;
 }
 
 static int ov2710_data_uninit(FAR struct imgdata_s *data)
@@ -859,12 +924,7 @@ static int ov2710_data_set_buf(FAR struct imgdata_s *data,
                                FAR imgdata_format_t *datafmts,
                                uint8_t *addr, uint32_t size)
 {
-  int ret;
-
-  ret = esp_mipi_csi_enqueue_buffer(addr, size);
-  syslog(LOG_INFO, "CAMDBG: data_set_buf(addr=%p size=%" PRIu32 ")=%d\n",
-         addr, size, ret);
-  return ret;
+  return esp_mipi_csi_enqueue_buffer(addr, size);
 }
 
 static int ov2710_data_validate_frame_setting(FAR struct imgdata_s *data,
@@ -893,6 +953,19 @@ static int ov2710_data_start_capture(FAR struct imgdata_s *data,
                                      FAR void *arg)
 {
   FAR struct metalio_camera_s *priv = CAMERA_FROM_DATA(data);
+  struct esp_mipi_csi_bus_config_s bus =
+    {
+#ifdef CONFIG_ESPRESSIF_MIPI_CSI_LANES
+      .num_data_lanes     = CONFIG_ESPRESSIF_MIPI_CSI_LANES,
+#else
+      .num_data_lanes     = 1,
+#endif
+#ifdef CONFIG_ESPRESSIF_MIPI_CSI_LANE_BITRATE_MBPS
+      .lane_bit_rate_mbps = CONFIG_ESPRESSIF_MIPI_CSI_LANE_BITRATE_MBPS,
+#else
+      .lane_bit_rate_mbps = 800,
+#endif
+    };
   struct esp_mipi_csi_frame_config_s fcfg;
   int ret;
 
@@ -901,6 +974,12 @@ static int ov2710_data_start_capture(FAR struct imgdata_s *data,
   priv->frame_bytes = (size_t)datafmts[0].width *
                       datafmts[0].height * 10 / 8;
 
+  ret = esp_mipi_csi_initialize(&bus);
+  if (ret != OK)
+    {
+      return ret;
+    }
+
   fcfg.h_res       = datafmts[0].width;
   fcfg.v_res       = datafmts[0].height;
   fcfg.in_bpp      = 10;
@@ -908,7 +987,6 @@ static int ov2710_data_start_capture(FAR struct imgdata_s *data,
   fcfg.byte_swap_en = false;
 
   ret = esp_mipi_csi_configure(&fcfg);
-  syslog(LOG_INFO, "CAMDBG: data_start_capture configure=%d\n", ret);
   if (ret != OK)
     {
       return ret;
@@ -917,7 +995,8 @@ static int ov2710_data_start_capture(FAR struct imgdata_s *data,
   esp_mipi_csi_register_frame_done_cb(ov2710_data_frame_done, priv);
 
   ret = esp_mipi_csi_start();
-  syslog(LOG_INFO, "CAMDBG: data_start_capture start=%d\n", ret);
+  syslog(LOG_INFO, "CAM: csi start ret=%d bytes=%u\n", ret,
+         (unsigned)priv->frame_bytes);
   if (ret != OK)
     {
       esp_mipi_csi_register_frame_done_cb(NULL, NULL);
@@ -960,8 +1039,12 @@ static void ov2710_data_frame_done(FAR void *buf, size_t len, FAR void *arg)
 
   if (priv->capture_cb != NULL)
     {
-      priv->capture_cb(0, (uint32_t)priv->frame_bytes, NULL,
-                       priv->capture_arg);
+      static unsigned reported;
+      if (reported++ < 3)
+        syslog(LOG_INFO, "CAM_FRAME received=%u expected=%u\n",
+               (unsigned)len, (unsigned)priv->frame_bytes);
+      priv->capture_cb(len == priv->frame_bytes ? 0 : -EIO,
+                       (uint32_t)len, NULL, priv->capture_arg);
     }
 }
 
@@ -1018,9 +1101,22 @@ int metalio_camera_initialize(FAR struct i2c_master_s *i2c)
   uint8_t pid_l = 0;
   int ret;
 
+  nxmutex_lock(&priv->lock);
+  if (priv->registered)
+    {
+      nxmutex_unlock(&priv->lock);
+      return OK;
+    }
+
   if (i2c == NULL)
     {
-      return -EINVAL;
+      i2c = priv->i2c;
+    }
+
+  if (i2c == NULL)
+    {
+      nxmutex_unlock(&priv->lock);
+      return -ENODEV;
     }
 
   priv->i2c = i2c;
@@ -1029,7 +1125,6 @@ int metalio_camera_initialize(FAR struct i2c_master_s *i2c)
    * This both validates the hardware and caches availability for the V4L2
    * registration below. */
 
-  nxmutex_lock(&priv->lock);
   ret = camera_power_on(priv);
   if (ret == OK)
     {
@@ -1050,7 +1145,6 @@ int metalio_camera_initialize(FAR struct i2c_master_s *i2c)
     }
 
   camera_power_off(priv);
-  nxmutex_unlock(&priv->lock);
 
   if (ret == OK && pid_h == OV2710_PID_H && pid_l == OV2710_PID_L)
     {
@@ -1060,6 +1154,10 @@ int metalio_camera_initialize(FAR struct i2c_master_s *i2c)
   else
     {
       priv->available = false;
+      if (ret == OK)
+        {
+          ret = -ENODEV;
+        }
       syslog(LOG_WARNING, "OV2710 not available (ret=%d pid=%02x%02x)\n",
              ret, pid_h, pid_l);
     }
@@ -1087,10 +1185,20 @@ int metalio_camera_initialize(FAR struct i2c_master_s *i2c)
         }
       else
         {
+          priv->registered = true;
           syslog(LOG_INFO, "OV2710 registered at /dev/video0\n");
         }
     }
 #endif
 
+  nxmutex_unlock(&priv->lock);
   return ret;
+}
+
+/* A transient boot-time SCCB failure must not leave /dev/video0 missing for
+ * the entire boot. Reuse the original I2C bus and the camera's own lock;
+ * do not reset the shared bus, IO expander, display or audio hardware. */
+int metalio_camera_ensure_ready(void)
+{
+  return metalio_camera_initialize(NULL);
 }

@@ -47,6 +47,8 @@ struct cJSON;
 #define MAIN_EVENT_XIAOZHI_JSON (1 << 9)
 #define MAIN_EVENT_TTS_PROMOTE (1 << 10)
 #define MAIN_EVENT_BARGE_IN (1 << 11)
+#define MAIN_EVENT_LISTEN_VP (1 << 12)
+#define MAIN_EVENT_WAKE_PREFERENCE (1 << 13)
 
 enum AecMode
 {
@@ -87,6 +89,15 @@ public:
     void StopListening();
     /* LVGL-safe: posts MAIN_EVENT_WAKE_WORD_DETECTED (same path as "Hi openvela"). */
     void RequestWakeSession();
+    void BeginTypedChat();
+    bool RequestTypedChatMessage(const std::string &text);
+    bool IsTypedChatMode() const;
+    /* Re-arm the shared spoken detector, respecting saved preference/owners. */
+    void ArmAssistantWakeWord(bool explicit_mode1_restore = false);
+    /* Close floating-AI dialogue without tearing down other audio apps. */
+    void EndFloatAiSession();
+    /* Resets desktop float listen-idle timeout (LVGL / append path). */
+    void NotifyFloatAiDialogActivity();
     void Reboot();
     /* After UI STA+DHCP succeeds: restart MQTT/WebSocket so xiaozhi.me
      * binds to the new IP/DNS without a full chip reboot. */
@@ -100,13 +111,18 @@ public:
     void PlaySound(const std::string_view &sound);
     AudioService &GetAudioService() { return *audio_service_; }
 
-    /* Voice UI session control — wake word is enabled only inside a chat /
-     * digital-human session to save memory and CPU on the desktop. */
+    /* Dialogue session control; independent from the global spoken detector. */
     void SetVoiceUiDesired(bool desired);
     /* LVGL-thread safe: posts MAIN_EVENT_VOICE_UI (no heap / no mutex). */
     void RequestVoiceUiDesired(bool desired);
+    // Spoken wake preference is independent of a manually opened dialogue.
+    void RequestSpokenWakeEnabled(bool enabled);
+    bool IsSpokenWakeEnabled() const { return spoken_wake_enabled_.load(); }
+    bool CanArmSpokenWake() const;
     bool IsVoiceUiActive() const { return voice_ui_active_; }
     bool IsVoiceUiDesired() const { return voice_ui_desired_; }
+    uint32_t VoiceUiEpoch() const { return voice_ui_epoch_; }
+    uint32_t ProtocolGeneration() const { return protocol_generation_.load(); }
 
     bool HasPendingActivation() const
     {
@@ -149,6 +165,8 @@ private:
     std::mutex mutex_;
     std::deque<std::function<void()>> main_tasks_;
     std::unique_ptr<Protocol> protocol_;
+    std::atomic<uint32_t> protocol_generation_{0};
+    std::atomic<bool> voice_network_preparing_{false};
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
     esp_timer_handle_t voice_ui_release_timer_ = nullptr;
@@ -175,6 +193,7 @@ private:
     volatile uint32_t voice_ui_epoch_ = 0;
     /* -1 = none, 0 = stop, 1 = start. Written from LVGL, consumed on app thread. */
     std::atomic<int8_t> voice_ui_request_{-1};
+    std::atomic<bool> spoken_wake_enabled_{true};
     /* UDP TTS arrived while still Listening (JSON tts/start delayed). */
     std::atomic<bool> pending_tts_promote_{false};
     /* tts/stop seen but PCM still draining — finish on clock tick. */
@@ -196,9 +215,14 @@ private:
     void ScheduleEspWakeWordPreload();
     void CancelEspWakeWordPreload();
     bool TryEnableWakeWordForVoiceUi();
+    void RearmGlobalWakeWord();
+    void SendPendingTypedChat();
     void EnterListeningAfterWake();
     void HandleIncomingXiaozhiJson(class Display *display, const cJSON *root);
     void FinishTtsStop();
+    /* Float overlay: start the mic a frame after the bubble paints.
+     * Same-tick EnableVP left STT dead on「聆听中」and solid-blued home. */
+    void ScheduleDeferredListenVp();
     void EnsureWakeOpenWorker();
     bool QueueWakeOpenAudioChannel();
     bool EnqueueXiaozhiJson(const cJSON *root);
@@ -207,10 +231,15 @@ private:
     bool has_server_time_ = false;
     bool aborted_ = false;
     int clock_ticks_ = 0;
+    /* Written from the LVGL append path and the app clock tick. */
+    std::atomic<int> float_listen_idle_sec_{0};
+    bool ota_check_silent_ = false;
     TaskHandle_t check_new_version_task_handle_ = 0;
     TaskHandle_t main_event_loop_task_handle_ = 0;
 
     void OnWakeWordDetected();
+    void ResumePendingBootWake();
+    std::atomic<bool> pending_boot_wake_{false};
     void CheckNewVersion(Ota &ota);
     void InitializeXiaozhiProtocol(Ota &ota);
     void OtaBootWorker(Ota *ota);
@@ -223,6 +252,11 @@ private:
     void ArmXiaozhiBindSyncTimer();
 
     esp_timer_handle_t xiaozhi_bind_sync_timer_ = nullptr;
+    esp_timer_handle_t listen_vp_timer_ = nullptr;
+    /* Timer armed EnableVP; consumed once on MAIN_EVENT_LISTEN_VP. */
+    std::atomic<bool> listen_vp_deferred_arm_{false};
+    /* Idle while the float card is still deleting — skip wake arm. */
+    bool skip_idle_wake_arm_ = false;
 };
 
 /* Helper that temporarily lowers the current task's priority (used by the

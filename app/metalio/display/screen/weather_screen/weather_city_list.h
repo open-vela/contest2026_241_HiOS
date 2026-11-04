@@ -13,6 +13,8 @@ namespace weather_cities {
 struct DistrictEntry {
     const char* name;  // 区县名，例如 "海淀"
     const char* id;    // district_id，例如 "110108"
+    float longitude;
+    float latitude;
 };
 
 struct CityEntry {

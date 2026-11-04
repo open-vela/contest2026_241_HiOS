@@ -35,6 +35,7 @@ public:
     // Legacy static entry point — matches the original MetalioClaw4
     // signature used by HomeScreen / metalio_main.
     static lv_obj_t *CreateStatic();
+    static void RequestAutoScanOnNextLoad();
 
     // Lifecycle hook (LOAD / UNLOAD). On LOAD the original starts the
     // local STA stack and refreshes the saved-SIM / saved-network lists;

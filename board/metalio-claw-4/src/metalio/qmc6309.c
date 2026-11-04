@@ -26,8 +26,13 @@
 #define QMC6309_REG_CR2      0x0b
 #define QMC6309_CHIP_ID      0x90
 
-/* OSR1:1 + RNG0:1 => 0xC0 | 0x10 = 0xD0 base for CR1 */
-#define QMC6309_CR1_BASE     0xd0
+/* QMC6309 datasheet: CR1[6:5]=3, [4:3]=0 -> OSR2=8, OSR1=8.
+ * CR2[1:0]=0 enables set/reset offset cancellation. The old 0x03
+ * disabled it and retained magnetic bridge bias across measurements.
+ * Normal 100 Hz supplies fresh, filtered data without the continuous
+ * mode's unnecessarily high conversion rate on the shared I2C bus. */
+#define QMC6309_CR1_BASE     0x60
+#define QMC6309_CR2_NORMAL   0x30
 #define QMC6309_MODE_SUSPEND 0x00
 #define QMC6309_MODE_NORMAL  0x01
 #define QMC6309_MODE_CONTIN  0x03
@@ -90,13 +95,14 @@ static int qmc_read_regs(uint8_t reg, FAR uint8_t *buf, int len)
   return I2C_TRANSFER(g_i2c, msgs, 2);
 }
 
-static void qmc_set_mode(uint8_t mode)
+static int qmc_set_mode(uint8_t mode)
 {
   uint8_t cr1 = (uint8_t)(QMC6309_CR1_BASE | (mode & 0x03));
 
-  (void)qmc_write_reg(QMC6309_REG_CR1, cr1);
-  (void)qmc_write_reg(QMC6309_REG_CR2, 0x03);
+  int ret = qmc_write_reg(QMC6309_REG_CR2, QMC6309_CR2_NORMAL);
+  if (ret >= 0) ret = qmc_write_reg(QMC6309_REG_CR1, cr1);
   up_mdelay(20);
+  return ret;
 }
 
 int metalio_qmc6309_initialize(FAR struct i2c_master_s *i2c)
@@ -129,11 +135,15 @@ int metalio_qmc6309_initialize(FAR struct i2c_master_s *i2c)
   (void)qmc_write_reg(QMC6309_REG_CR2, 0x00);
   up_mdelay(25);
 
-  qmc_set_mode(QMC6309_MODE_SUSPEND);
-  qmc_set_mode(QMC6309_MODE_NORMAL);
-  qmc_set_mode(QMC6309_MODE_SUSPEND);
-  qmc_set_mode(QMC6309_MODE_CONTIN);
+  ret = qmc_set_mode(QMC6309_MODE_SUSPEND);
+  if (ret >= 0) ret = qmc_set_mode(QMC6309_MODE_NORMAL);
+  if (ret < 0) return ret;
   up_mdelay(50);
+  uint8_t cr1 = 0, cr2 = 0;
+  if (qmc_read_reg(QMC6309_REG_CR1, &cr1) < 0 ||
+      qmc_read_reg(QMC6309_REG_CR2, &cr2) < 0 ||
+      cr1 != (QMC6309_CR1_BASE | QMC6309_MODE_NORMAL) ||
+      cr2 != QMC6309_CR2_NORMAL) return -EIO;
 
   g_chip_id = chip_id;
   g_chip_id_valid = true;

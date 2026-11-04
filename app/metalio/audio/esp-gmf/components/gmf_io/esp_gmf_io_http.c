@@ -237,14 +237,14 @@ static esp_gmf_err_t _http_prev_close(esp_gmf_io_handle_t self)
             }
         } while (0);
     }
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 3)
+#if defined(__NuttX__) || ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 3)
     if (http->client) {
         int fd = esp_http_client_get_socket(http->client);
-        if (fd) {
+        if (fd >= 0) {
             shutdown(fd, SHUT_RDWR);
         }
     }
-#endif  /* ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 3) */
+#endif  /* NuttX sockets support shutdown independently of the IDF shim version. */
     return ESP_GMF_ERR_OK;
 }
 

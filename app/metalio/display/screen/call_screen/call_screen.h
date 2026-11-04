@@ -7,10 +7,8 @@
  *
  * 720x720 fullscreen phone dialer. The original drives a Neoway NT26
  * 4G modem over AT commands (AT+CPIN? / ATD<number> / ATH) and toggles
- * IOExpander::PA_SWITCH to route audio to the 4G call path. openvela
- * has no SimpleUart helper and no IOExpander driver yet, so the call
- * control plane is stubbed behind a small state-machine interface
- * (CallScreen::CallDriver) that the UI drives.
+ * IOExpander::PA_SWITCH to route audio to the 4G call path. The NuttX
+ * port uses the board NT26 driver through a serialized worker queue.
  *
  * The UI is preserved verbatim:
  *   - 88px header with [back] button + "电话" title
@@ -25,10 +23,8 @@
  *   kIdle      -> user types digits, backspace available
  *   kCalling   -> action button turns red; back button issues ATH on exit
  *
- * The stubbed CallDriver immediately reports kDialOk / kHangupDone so
- * the UI transitions are exercised end-to-end. Replace the driver with
- * a real VoIP/WebRTC implementation when available — no UI changes
- * needed.
+ * Dial and hangup results reflect the modem response; epochs reject
+ * late responses after leaving or recreating the screen.
  */
 
 #pragma once
@@ -51,39 +47,37 @@ public:
     // original MetalioClaw4 signature (e.g. home_screen).
     static lv_obj_t *CreateStatic();
 
-    // openvela: the original toggled IOExpander::PA_SWITCH between WIFI
-    // and 4G audio paths. openvela has no IOExpander yet, so this is a
-    // no-op log hook. Replace with a real audio-route call when the
-    // board driver is available.
+    // Route the shared amplifier between local media and cellular audio.
     static void LifecycleCallback(screen_lifecycle_event_t event);
 
     // -----------------------------------------------------------------
     // CallDriver — pluggable call-control interface.
     //
-    // The original dispatched AT commands on a FreeRTOS task and used
-    // lv_async_call() to hop back to the LVGL thread. openvela keeps the
-    // same async-result plumbing (see CallResult below) but the default
-    // driver below is an inline no-op that immediately posts
-    // kDialOk / kHangupDone so the UI is testable without any modem.
-    //
-    // To wire up a real VoIP/WebRTC stack:
-    //   1. Subclass CallDriver and override Dial() / Hangup().
-    //   2. Inside them, post a CallResult back via lv_async_call() —
-    //      the screen's DispatchResult() handler will update the UI
-    //      provided the call epoch still matches.
-    //   3. Install the driver via SetCallDriver() before Create().
+    // The default driver runs board AT commands on a worker and posts
+    // results through lv_async_call. SetCallDriver permits a replacement.
     // -----------------------------------------------------------------
     enum class Outcome : uint8_t {
         kDialOk,         // ATD-equivalent succeeded, call is up
+        kInternalSim,    // internal data-only SIM cannot make calls
         kSimNotReady,    // modem / VoIP stack not ready
         kDialFailed,     // dial command came back with an error
         kHangupDone,     // hangup finished (success or failure)
         kNo4G,           // no cellular / VoIP transport available
+        kIncoming,
+        kConnected,
+        kDialing,
+        kEnded,
+        kPollFailed,
     };
 
     enum class JobKind : uint8_t {
         kDial,
         kHangup,
+        kAnswer,
+        kPoll,
+        kOpenSession,
+        kCloseSession,
+        kMute, kSpeaker, kDtmf, kVolume, kReadVolume,
     };
 
     // Async result posted by a CallDriver implementation back to the UI
@@ -93,6 +87,8 @@ public:
         JobKind kind;
         Outcome outcome;
         uint32_t epoch;
+        int status = 0;
+        int value = 0;
     };
 
     class CallDriver
@@ -101,6 +97,7 @@ public:
         virtual ~CallDriver() = default;
         virtual esp_err_t Dial(const std::string &number, uint32_t epoch) = 0;
         virtual esp_err_t Hangup(uint32_t epoch) = 0;
+        virtual esp_err_t Answer(uint32_t) { return ESP_FAIL; }
     };
 
     // Install a custom call driver. Pass nullptr to revert to the default
@@ -117,4 +114,12 @@ public:
     // in-flight async results become stale. The screen does this itself
     // on every state transition and on swipe-back.
     static void BumpCallEpoch();
+    static void InitGlobal();
+    static void PrepareSystemPowerOff();
+
+    // Open the dialer if needed and start a call. Safe to call from the
+    // LVGL thread only. A second request for the same number while that
+    // call is already starting is ignored. Returns false when another
+    // call is already active or the screen cannot be opened.
+    static bool DialVoice(const char *number);
 };

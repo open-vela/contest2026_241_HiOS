@@ -1,3 +1,5 @@
+#include "hi_task_policy.h"
+#include "display_text.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -25,6 +27,7 @@
 #include "home_screen/home_screen.h"
 #include "SdCardManager.hpp"
 #include "usb_virtual_disk.h"
+#include "hi_music_screen/hi_music_screen.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -35,6 +38,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
+#include <pthread.h>
+#include <cstdlib>
+#include <algorithm>
+#include <string>
+#include <vector>
 
 LV_FONT_DECLARE(font_puhui_30_4);
 LV_FONT_DECLARE(font_puhui_20_4);
@@ -73,6 +82,10 @@ lv_obj_t *s_usb_btn         = nullptr;
 lv_obj_t *s_usb_btn_lbl     = nullptr;
 lv_obj_t *s_usb_hint_lbl    = nullptr;
 lv_obj_t *s_screen          = nullptr;
+uint32_t s_screen_generation = 0;
+bool s_delete_busy = false;
+bool s_browse_busy = false;
+uint32_t s_browse_request = 0;
 
 // Full-screen preview overlay (image / text)
 lv_obj_t *s_preview_overlay      = nullptr;
@@ -147,9 +160,10 @@ bool IsTextFile(const char *name)
     return ExtEqualsIgnoreCase(name, "txt");
 }
 
+bool IsAudioFile(const char *name){return ExtEqualsIgnoreCase(name,"mp3")||ExtEqualsIgnoreCase(name,"wav");}
 bool IsPreviewableFile(const char *name)
 {
-    return IsImageFile(name) || IsTextFile(name);
+    return IsImageFile(name) || IsTextFile(name) || IsAudioFile(name);
 }
 
 bool IsPreviewOpen()
@@ -263,6 +277,7 @@ void OnUsbVirtualDiskClicked(lv_event_t * /*e*/)
     if (!vd.IsSupported() || vd.IsBusy()) {
         return;
     }
+    ClosePreview();
     vd.Toggle();
 }
 
@@ -323,16 +338,39 @@ void OnDeleteFile(lv_event_t *e)
         return;
     }
 
-    ESP_LOGI(TAG_SD, "Deleting file: %s", entry->path);
-    if (unlink(entry->path) != 0) {
-        ESP_LOGE(TAG_SD, "Failed to delete: %s", entry->path);
-        return;
-    }
+    if (s_delete_busy) return;
+    struct DeleteJob { char path[kMaxPathLen]; uint32_t generation; };
+    auto *job = static_cast<DeleteJob *>(std::calloc(1, sizeof(DeleteJob)));
+    if (!job) return;
+    strlcpy(job->path, entry->path, sizeof(job->path));
+    job->generation = s_screen_generation;
+    s_delete_busy = true;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8192);
+    pthread_t thread;
+    int ret = hi_task_create_legacy(&thread, &attr, [](void *arg) -> void * {
+        auto *job = static_cast<DeleteJob *>(arg);
+        // Remount and FAT writes can wait for SDMMC. Keep them off LVGL.
+        int result = metalio_sdcard_ensure_rw();
+        if (result == 0 && unlink(job->path) != 0) result = -errno;
+        ESP_LOGI(TAG_SD, "Delete file result=%d", result);
+        lv_lock();
+        s_delete_busy = false;
+        if (s_screen && job->generation == s_screen_generation) {
+            UpdateStatusUI();
+            RebuildFileList(s_screen);
+            if (result < 0 && s_status_lbl)
+                lv_label_set_text(s_status_lbl, I18n::T("删除失败，请稍后重试"));
+        }
+        lv_unlock();
+        std::free(job);
+        return nullptr;
+    }, job);
+    pthread_attr_destroy(&attr);
+    if (ret == 0) pthread_detach(thread);
+    else { s_delete_busy = false; std::free(job); }
 
-    UpdateStatusUI();
-    if (s_screen != nullptr) {
-        RebuildFileList(s_screen);
-    }
 }
 
 void ClosePreview()
@@ -478,7 +516,9 @@ void OnPreviewFile(lv_event_t *e)
     if (entry == nullptr) {
         return;
     }
-    if (IsImageFile(entry->name)) {
+    if(IsAudioFile(entry->name)){
+        HiMusicScreen::OpenFile(entry->path);
+    } else if (IsImageFile(entry->name)) {
         SetPreviewTitle(entry->name);
         OpenImagePreview(entry->path);
     } else if (IsTextFile(entry->name)) {
@@ -501,12 +541,6 @@ void OnEnterDirectory(lv_event_t *e)
         return;
     }
 
-    struct stat st;
-    if (stat(entry->path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        ESP_LOGW(TAG_SD, "Not a directory: %s", entry->path);
-        return;
-    }
-
     ESP_LOGI(TAG_SD, "Enter directory: %s", entry->path);
     strlcpy(s_cwd, entry->path, sizeof(s_cwd));
     UpdatePathLabel();
@@ -524,18 +558,9 @@ void ClearFileList()
     lv_obj_clean(s_file_list);
 }
 
-// Build a single file row. Stat is done inside this function so the caller
-// doesn't need a large stack buffer.
-void BuildFileRow(const char *name, const char *path)
+// Directory metadata is captured on the storage worker, never under LVGL.
+void BuildFileRow(const char *name, const char *path, bool is_dir, uint64_t size)
 {
-    struct stat st;
-    bool is_dir = false;
-    uint64_t size = 0;
-    if (stat(path, &st) == 0) {
-        is_dir = S_ISDIR(st.st_mode);
-        size = st.st_size;
-    }
-
     // Row container
     lv_obj_t *row = lv_obj_create(s_file_list);
     lv_obj_remove_style_all(row);
@@ -563,7 +588,7 @@ void BuildFileRow(const char *name, const char *path)
 
     // File/dir name
     lv_obj_t *name_lbl = lv_label_create(info_col);
-    lv_label_set_text(name_lbl, name);
+    lv_label_set_text(name_lbl, DisplayUtf8(name?name:"").c_str());
     lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(name_lbl, 450);
     lv_obj_set_style_text_color(name_lbl, lv_color_hex(kColorTextPrimary), LV_PART_MAIN);
@@ -665,99 +690,92 @@ bool JoinPath(char *out, size_t out_size, const char *dir, const char *name)
     return true;
 }
 
-void AppendDirEntries(DIR *dir, bool want_dirs)
-{
-    char name_buf[kMaxNameLen];
-    char path_buf[kMaxPathLen];
-    struct dirent *entry;
-
-    while ((entry = readdir(dir)) != nullptr) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-
-        strlcpy(name_buf, entry->d_name, sizeof(name_buf));
-        if (!JoinPath(path_buf, sizeof(path_buf), s_cwd, name_buf)) {
-            ESP_LOGW(TAG_SD, "Skip path too long under '%s': %s", s_cwd, name_buf);
-            continue;
-        }
-
-        struct stat st;
-        bool is_dir = false;
-        if (stat(path_buf, &st) == 0) {
-            is_dir = S_ISDIR(st.st_mode);
-        }
-        if (is_dir != want_dirs) {
-            continue;
-        }
-        BuildFileRow(name_buf, path_buf);
-    }
-}
+struct BrowseEntry { std::string name, path; bool directory; uint64_t size; };
+struct BrowseJob {
+    uint32_t generation, request;
+    std::string cwd;
+    std::vector<BrowseEntry> entries;
+    int error=0;
+    bool exported=false, root_fallback=false;
+    unsigned long long total_mb=0, free_mb=0;bool free_known=false;
+};
 
 void RebuildFileList(lv_obj_t *parent)
 {
     (void)parent;
+    ++s_browse_request;
+    if (!s_screen || s_browse_busy) return;
+    if (!s_cwd[0]) ResetCwdToRoot();
+    s_browse_busy=true;
     ClearFileList();
-
-    auto &vd = UsbVirtualDisk::GetInstance();
-    if (vd.IsSdExportedToHost()) {
-        if (s_no_files_lbl != nullptr) {
-            lv_label_set_text(s_no_files_lbl, I18n::T("SD 正被电脑占用，停用或弹出后可浏览"));
-            lv_obj_remove_flag(s_no_files_lbl, LV_OBJ_FLAG_HIDDEN);
+    if(s_no_files_lbl){lv_label_set_text(s_no_files_lbl,I18n::T("正在读取 SD 卡…"));lv_obj_remove_flag(s_no_files_lbl,LV_OBJ_FLAG_HIDDEN);}
+    auto *job=new BrowseJob{s_screen_generation,s_browse_request,s_cwd};
+    pthread_t thread;pthread_attr_t attr;pthread_attr_init(&attr);pthread_attr_setstacksize(&attr,16384);
+    int ret=hi_task_create_legacy(&thread,&attr,[](void *arg)->void*{
+        auto *j=static_cast<BrowseJob*>(arg);
+        j->exported=UsbVirtualDisk::GetInstance().IsSdExportedToHost();
+        if(j->exported)j->error=-EBUSY;
+        else {
+            j->error=metalio_sdcard_mount_ro();
+            if(j->error==0){
+                DIR *dir=opendir(j->cwd.c_str());
+                if(!dir && j->cwd!="/sdcard"){
+                    j->cwd="/sdcard";j->root_fallback=true;dir=opendir(j->cwd.c_str());
+                }
+                if(!dir)j->error=-errno;
+                else {
+                    errno=0;
+                    while(auto *entry=readdir(dir)){
+                        if(!strcmp(entry->d_name,".")||!strcmp(entry->d_name,".."))continue;
+                        std::string full=j->cwd+"/"+entry->d_name;
+                        if(full.size()>=kMaxPathLen)continue;
+                        struct stat st{};
+                        if(stat(full.c_str(),&st)==0)j->entries.push_back({entry->d_name,full,S_ISDIR(st.st_mode),(uint64_t)st.st_size});
+                        errno=0;
+                    }
+                    if(errno)j->error=-errno;
+                    closedir(dir);
+                    std::sort(j->entries.begin(),j->entries.end(),[](const BrowseEntry&a,const BrowseEntry&b){
+                        if(a.directory!=b.directory)return a.directory>b.directory;
+                        return strcasecmp(a.name.c_str(),b.name.c_str())<0;
+                    });
+                }
+                uint64_t total=0,available=UINT64_MAX;
+                if(metalio_sdcard_capacity(&total,&available)==0){j->total_mb=total/(1024*1024);j->free_known=available!=UINT64_MAX;if(j->free_known)j->free_mb=available/(1024*1024);}
+            }
         }
-        return;
-    }
-
-    if (!SdCardManager::GetInstance().IsMounted()) {
-        if (s_no_files_lbl != nullptr) {
-            lv_label_set_text(s_no_files_lbl, I18n::T("请插入 SD 卡"));
-            lv_obj_remove_flag(s_no_files_lbl, LV_OBJ_FLAG_HIDDEN);
+        // No SD operations while holding the display lock. A stale navigation
+        // result is discarded and the newest folder request is serviced next.
+        lv_lock();
+        bool valid=s_screen && j->generation==s_screen_generation && j->request==s_browse_request;
+        if(valid){
+            if(j->root_fallback){strlcpy(s_cwd,j->cwd.c_str(),sizeof(s_cwd));UpdatePathLabel();}
+            if(s_status_dot)lv_obj_set_style_bg_color(s_status_dot,lv_color_hex(j->error?0xFF0000:0x00CC00),LV_PART_MAIN);
+            if(s_status_lbl)lv_label_set_text(s_status_lbl,I18n::T(j->exported?"SD 正被电脑占用，停用或弹出后可浏览":j->error?"SD 卡读取失败，请重试":"SD 卡已插入"));
+            if(s_capacity_lbl && j->error==0){char text[96];
+                if(j->free_known)snprintf(text,sizeof(text),"剩余约 %llu MB / 总容量 %llu MB",j->free_mb,j->total_mb);
+                else snprintf(text,sizeof(text),"总容量 %llu MB",j->total_mb);
+                lv_label_set_text(s_capacity_lbl,text);}
+            ClearFileList();
+            if(s_no_files_lbl){lv_label_set_text(s_no_files_lbl,I18n::T(j->exported?"SD 正被电脑占用，停用或弹出后可浏览":j->error?"SD 卡读取失败，请退出后重试":"此文件夹为空"));lv_obj_remove_flag(s_no_files_lbl,LV_OBJ_FLAG_HIDDEN);}
         }
-        return;
-    }
-
-    if (s_cwd[0] == '\0') {
-        ResetCwdToRoot();
-    }
-
-    DIR *dir = opendir(s_cwd);
-    if (dir == nullptr) {
-        ESP_LOGW(TAG_SD, "Failed to open cwd '%s', reset to root", s_cwd);
-        ResetCwdToRoot();
-        UpdatePathLabel();
-        dir = opendir(s_cwd);
-    }
-    if (dir == nullptr) {
-        ESP_LOGE(TAG_SD, "Failed to open directory: %s", s_cwd);
-        if (s_no_files_lbl != nullptr) {
-            lv_label_set_text(s_no_files_lbl,
-                              IsAtRoot() ? I18n::T("SD 卡内没有文件")
-                                         : I18n::T("此文件夹为空"));
-            lv_obj_remove_flag(s_no_files_lbl, LV_OBJ_FLAG_HIDDEN);
+        lv_unlock();
+        // Publish small batches so a large Music/Camera folder cannot stall
+        // touch handling, gestures or the global incoming-call surface.
+        for(size_t at=0;valid&&at<j->entries.size();){
+            lv_lock();valid=s_screen&&j->generation==s_screen_generation&&j->request==s_browse_request;
+            if(valid){size_t end=std::min(at+12,j->entries.size());for(;at<end;++at){const auto&e=j->entries[at];BuildFileRow(e.name.c_str(),e.path.c_str(),e.directory,e.size);}
+                if(s_no_files_lbl)lv_obj_add_flag(s_no_files_lbl,LV_OBJ_FLAG_HIDDEN);}
+            lv_unlock();usleep(2000);
         }
-        return;
-    }
-
-    // 先列目录、再列文件，方便浏览
-    AppendDirEntries(dir, true);
-    rewinddir(dir);
-    AppendDirEntries(dir, false);
-    closedir(dir);
-
-    const bool has_files =
-        (s_file_list != nullptr) && (lv_obj_get_child_count(s_file_list) > 0);
-    if (!has_files) {
-        if (s_no_files_lbl != nullptr) {
-            lv_label_set_text(s_no_files_lbl,
-                              IsAtRoot() ? I18n::T("SD 卡内没有文件")
-                                         : I18n::T("此文件夹为空"));
-            lv_obj_remove_flag(s_no_files_lbl, LV_OBJ_FLAG_HIDDEN);
-        }
-    } else {
-        if (s_no_files_lbl != nullptr) {
-            lv_obj_add_flag(s_no_files_lbl, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
+        ESP_LOGI(TAG_SD,"browse result=%d files=%u",j->error,(unsigned)j->entries.size());
+        lv_lock();s_browse_busy=false;
+        if(s_screen&&(j->generation!=s_screen_generation||j->request!=s_browse_request))RebuildFileList(s_screen);
+        lv_unlock();delete j;return nullptr;
+    },job);
+    pthread_attr_destroy(&attr);
+    if(ret==0)pthread_detach(thread);
+    else {s_browse_busy=false;delete job;if(s_no_files_lbl)lv_label_set_text(s_no_files_lbl,I18n::T("系统忙，请退出后重试"));}
 }
 
 // ----- header builder -----
@@ -792,7 +810,7 @@ void BuildHeader(lv_obj_t *parent)
     lv_obj_add_event_cb(back_btn, back_fn, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t *title = lv_label_create(header);
-    lv_label_set_text(title, I18n::T("SD 卡"));
+    lv_label_set_text(title, I18n::T("文件管理"));
     lv_obj_set_style_text_color(title, lv_color_hex(kColorTextPrimary), LV_PART_MAIN);
     lv_obj_set_style_text_font(title, &font_puhui_30_4, LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_LEFT_MID, kHeaderSidePad + kBackBtnSize + kHeaderSidePad, 0);
@@ -903,7 +921,6 @@ void BuildPreviewOverlay(lv_obj_t *parent)
     lv_obj_remove_flag(s_preview_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_preview_overlay, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(s_preview_overlay, LV_OBJ_FLAG_HIDDEN);
-    screen_swipe_back_ignore(s_preview_overlay, true);
 
     lv_obj_t *header = lv_obj_create(s_preview_overlay);
     screen_strip_obj_chrome(header);
@@ -961,7 +978,6 @@ void BuildPreviewOverlay(lv_obj_t *parent)
     lv_obj_set_scrollbar_mode(s_preview_text_scroll, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_add_flag(s_preview_text_scroll, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_preview_text_scroll, LV_OBJ_FLAG_HIDDEN);
-    screen_swipe_back_ignore(s_preview_text_scroll, true);
 
     s_preview_text_lbl = lv_label_create(s_preview_text_scroll);
     lv_obj_set_width(s_preview_text_lbl, kPanelSize - 2 * kPad);
@@ -974,65 +990,9 @@ void BuildPreviewOverlay(lv_obj_t *parent)
 
 void UpdateStatusUI()
 {
-    auto &sd = SdCardManager::GetInstance();
-    auto &vd = UsbVirtualDisk::GetInstance();
-    /* Lazy RO mount: board bring-up only probes Slot0 so boot cannot hang
-     * on FAT writes. Mount when the SD UI needs the volume. */
-    if (!sd.IsMounted() && !vd.IsSdExportedToHost()) {
-        (void)sd.Mount();
-    }
-    const bool usable = sd.IsMounted() && !vd.IsSdExportedToHost();
-    if (usable || vd.IsGadgetActive()) {
-        if (s_status_dot != nullptr) {
-            lv_obj_set_style_bg_color(s_status_dot, lv_color_hex(0x00CC00), LV_PART_MAIN);
-        }
-        if (s_status_lbl != nullptr) {
-            lv_label_set_text(s_status_lbl, I18n::T("SD 卡已插入"));
-        }
-
-        if (s_capacity_lbl != nullptr) {
-            if (!usable) {
-                lv_label_set_text(s_capacity_lbl,
-                                  I18n::T("SD 正被电脑占用，停用或弹出后可浏览"));
-            } else {
-                struct statfs st;
-                if (statfs(SdCardManager::kMountPoint, &st) == 0 &&
-                    st.f_blocks > 0) {
-                    const unsigned long long total_mb =
-                        ((unsigned long long)st.f_blocks * st.f_bsize) /
-                        (1024ull * 1024ull);
-                    const unsigned long long free_mb =
-                        ((unsigned long long)st.f_bfree * st.f_bsize) /
-                        (1024ull * 1024ull);
-                    char free_s[32];
-                    char total_s[32];
-                    char buf[96];
-                    snprintf(free_s, sizeof(free_s), "%llu MB", free_mb);
-                    snprintf(total_s, sizeof(total_s), "%llu MB", total_mb);
-                    snprintf(buf, sizeof(buf), I18n::T("剩余 %s / 总容量 %s"),
-                             free_s, total_s);
-                    lv_label_set_text(s_capacity_lbl, buf);
-                } else {
-                    lv_label_set_text(s_capacity_lbl,
-                                      I18n::T("SD 卡已插入"));
-                }
-            }
-        }
-    } else {
-        if (s_status_dot != nullptr) {
-            lv_obj_set_style_bg_color(s_status_dot, lv_color_hex(0xFF0000), LV_PART_MAIN);
-        }
-        if (s_status_lbl != nullptr) {
-            lv_label_set_text(s_status_lbl, I18n::T("未检测到 SD 卡"));
-        }
-        if (s_capacity_lbl != nullptr) {
-            lv_label_set_text(s_capacity_lbl, I18n::T("请插入 SD 卡"));
-        }
-        if (s_no_files_lbl != nullptr) {
-            lv_label_set_text(s_no_files_lbl, I18n::T("请插入 SD 卡"));
-            lv_obj_remove_flag(s_no_files_lbl, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
+    // The following RebuildFileList request performs mount, capacity and
+    // directory I/O on its worker. Never wait for a card under the UI lock.
+    if(s_status_lbl)lv_label_set_text(s_status_lbl,I18n::T("正在读取 SD 卡…"));
 }
 
 }  // namespace
@@ -1044,6 +1004,7 @@ lv_obj_t *SdCardScreen::CreateStatic()
 {
     lv_obj_t *scr = lv_obj_create(nullptr);
     s_screen = scr;
+    ++s_screen_generation;
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(scr, lv_color_hex(kColorBg), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
@@ -1062,15 +1023,15 @@ lv_obj_t *SdCardScreen::CreateStatic()
     vd.SetUiNotify(OnUsbVirtualDiskNotify);
     RefreshUsbUi();
 
-    // SD 卡的挂载已经在板级 init 里完成。这里只做一次状态读取并刷新 UI；
-    // 如果开机时 mount 失败（卡没插），就只显示状态文字、不去重试，等
-    // 用户回到首页 / 后续手动 reboot 时再处理。
+    // Mount and enumerate asynchronously; reopening retries a failed mount.
     UpdateStatusUI();
     UpdatePathLabel();
     RebuildFileList(scr);
 
     // Right-swipe：子目录上一级，根目录回首页
     screen_attach_swipe_back(scr, OnSwipeBack);
+
+    // The shared pointer observer preserves normal left-side taps.
 
     return scr;
 }
@@ -1085,7 +1046,7 @@ void SdCardScreen::LifecycleCallback(screen_lifecycle_event_t event)
 {
     if (event == SCREEN_LIFECYCLE_LOAD) {
         ESP_LOGI(TAG_SD, "load: sd_card_screen (mounted=%d gadget=%d cwd=%s)",
-                 SdCardManager::GetInstance().IsMounted() ? 1 : 0,
+                 0,
                  UsbVirtualDisk::GetInstance().IsGadgetActive() ? 1 : 0, s_cwd);
         RefreshUsbUi();
         UpdateStatusUI();
@@ -1099,6 +1060,7 @@ void SdCardScreen::LifecycleCallback(screen_lifecycle_event_t event)
         UsbVirtualDisk::GetInstance().SetUiNotify(nullptr);
         ClosePreview();
         s_screen = nullptr;
+        ++s_screen_generation;
         s_usb_btn = nullptr;
         s_usb_btn_lbl = nullptr;
         s_usb_hint_lbl = nullptr;

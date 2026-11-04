@@ -18,6 +18,12 @@
  *   s.SetString("locale", "en-US");
  *   auto v = s.GetString("locale", "zh-CN");
  */
+/* Call once on the interface thread. Flash erase from that thread blanks the panel. */
+void SettingsBindUiThread();
+bool SettingsOnUiThread();
+/* Read the settings journal before the interface thread starts. */
+void SettingsPrimeFlash();
+
 class Settings
 {
 public:
@@ -27,9 +33,11 @@ public:
     std::string GetString(const std::string &key,
                           const std::string &default_value = "");
     void SetString(const std::string &key, const std::string &value);
+    bool SetStringSaved(const std::string &key,const std::string &value);
 
     int32_t GetInt(const std::string &key, int32_t default_value = 0);
     void SetInt(const std::string &key, int32_t value);
+    bool SetInts(const char *const *keys, const int32_t *values, size_t count);
 
     bool GetBool(const std::string &key, bool default_value = false);
     void SetBool(const std::string &key, bool value);

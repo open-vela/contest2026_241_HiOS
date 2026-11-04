@@ -398,6 +398,10 @@ void board_event_cb(lv_event_t *e)
         if (__builtin_abs(dx) < th && __builtin_abs(dy) < th)
             return;
 
+        /* Left-edge press is swipe-back, not a tile move. */
+        if (s_press_pt.x <= 48)
+            return;
+
         if (__builtin_abs(dx) > __builtin_abs(dy))
         {
             if (dx > 0)
@@ -500,8 +504,6 @@ void build_board(lv_obj_t *parent)
     lv_obj_set_style_border_width(s_board, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(s_board, 0, LV_PART_MAIN);
     lv_obj_add_flag(s_board, LV_OBJ_FLAG_CLICKABLE);
-    /* Board owns swipe-to-move; keep screen edge swipe-back separate. */
-    screen_swipe_back_ignore(s_board, true);
     lv_obj_add_event_cb(s_board, board_event_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(s_board, board_event_cb, LV_EVENT_RELEASED, NULL);
 
@@ -563,6 +565,16 @@ void build_overlay(lv_obj_t *parent)
 void AttachNavBack(lv_obj_t *scr)
 {
     screen_attach_swipe_back(scr, OnGoHome);
+
+    lv_obj_t *edge = lv_obj_create(scr);
+    lv_obj_remove_style_all(edge);
+    lv_obj_add_flag(edge, LV_OBJ_FLAG_FLOATING);
+    lv_obj_add_flag(edge, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(edge, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(edge, 48, SCR_H);
+    lv_obj_align(edge, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_opa(edge, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_move_foreground(edge);
 }
 
 } // namespace

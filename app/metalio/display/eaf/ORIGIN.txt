@@ -1,0 +1,5 @@
+Upstream: https://github.com/espressif/esp-iot-solution/tree/master/components/display/tools/esp_lv_eaf_player
+Retrieved 2026-10-21; Apache-2.0 (see LICENSE).
+Original source tree: 9d3f5382984d79fae63691779afdc12422d735d2
+NuttX changes: allocation/error shims, LVGL TJpgDec JPEG blocks, file and buffer bounds, bytewise header reads.
+lv_sjpg.c reads the container defined by CloudZao/MetalioClaw4 sd_images/jpg_to_sjpg.py at ca3aa3fa027ff7dad2adf0c2d03c4f24aa838950.

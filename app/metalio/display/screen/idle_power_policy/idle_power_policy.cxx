@@ -18,15 +18,26 @@
 #include "home_screen/home_screen.h"
 #include "standby_screen/standby_screen.h"
 #include "settings.h"
+#include "system_chrome/system_chrome.h"
+#include "system_chrome/control_center.h"
+#include "call_screen/call_screen.h"
+#include "camera_screen/camera_screen.h"
+#include "recording_screen/recording_screen.h"
+#include "application.h"
+#include "device_state.h"
+#include "usb_virtual_disk.h"
+#include "video_player.h"
 
 #include <cstdio>
+#include <metalio/metalio.h>
+#include <unistd.h>
 
 namespace {
 
 constexpr const char *TAG = "IdlePower";
 
 constexpr int kDefaultShutdownMin = 5;
-constexpr int kDefaultStandbyMin = 1;
+constexpr int kDefaultStandbyMin = 2;
 constexpr int kMaxMinutes = 60;
 constexpr const char *kShutdownNvsKey = "idle_off_min";
 constexpr const char *kStandbyNvsKey = "idle_stby_min";
@@ -86,7 +97,28 @@ void OnIdleTick(lv_timer_t * /*timer*/)
         return;
     }
 
-    const uint32_t idle_ms = lv_tick_elaps(s.last_activity_tick);
+    // Work is activity even when the user does not touch the glass. Merely
+    // leaving a chat open (Listening with no detected speech) is not activity.
+    auto &app=Application::GetInstance();
+    const auto voice=app.GetDeviceState();
+    const bool conversation=app.IsVoiceUiActive() &&
+        (voice==kDeviceStateSpeaking || (voice==kDeviceStateListening && app.IsVoiceDetected()));
+    // An active external-display session is real use without local touch,
+    // including a paused/static desktop. Ending/disconnecting it restores
+    // the normal idle timeout; a USB storage session is not exempted.
+    const bool external_display=UsbVirtualDisk::GetInstance().IsDisplayActive();
+    if(conversation || CameraScreen::IsCapturing() || RecordingScreen::IsCapturing() || external_display || HiApp::VideoPlayer::KeepsAwake()) {
+        IdlePower_NotifyActivity();
+        return;
+    }
+
+    // LVGL tracks input for every screen, including apps without a swipe
+    // binding. Redrawing clocks, playback and AI animation is not input.
+    uint32_t idle_ms = lv_tick_elaps(s.last_activity_tick);
+    if(auto *display=lv_display_get_default()){
+        const uint32_t input_idle=lv_display_get_inactive_time(display);
+        if(input_idle<idle_ms){s.last_activity_tick=lv_tick_get()-input_idle;idle_ms=input_idle;s.standby_triggered=false;s.shutdown_triggered=false;}
+    }
     const uint32_t standby_ms = MinutesToMs(IdlePower_GetStandbyMinutes());
     const uint32_t shutdown_ms = MinutesToMs(IdlePower_GetShutdownMinutes());
 
@@ -111,12 +143,14 @@ void OnIdleTick(lv_timer_t * /*timer*/)
             std::snprintf(reason, sizeof(reason),
                           I18n::T("无操作 %u 分钟自动关机"),
                           static_cast<unsigned>(shutdown_ms / (60U * 1000U)));
+            SystemChrome_DismissOverlays();
+            CallScreen::PrepareSystemPowerOff();
             HomeScreen::RequestSystemShutdown(reason);
         }
         return;
     }
 
-    if (s.session == IdlePowerSession::Home && standby_ms > 0 &&
+    if (s.session != IdlePowerSession::Standby && !StandbyScreen::IsVisible() && standby_ms > 0 &&
         idle_ms >= standby_ms) {
         if (!s.standby_triggered) {
             s.standby_triggered = true;
@@ -125,6 +159,7 @@ void OnIdleTick(lv_timer_t * /*timer*/)
             write(1, "IDLE_STANDBY_TRIGGER\n",
                   sizeof("IDLE_STANDBY_TRIGGER\n") - 1);
             IdlePower_PrepareAutoStandby();
+            SystemChrome_DismissOverlays();
             StandbyScreen::Show();
         }
         return;
@@ -137,7 +172,7 @@ void OnIdleTick(lv_timer_t * /*timer*/)
 
     uint32_t next_ms = 0;
     const char *next_action = "none";
-    if (s.session == IdlePowerSession::Home && standby_ms > 0 &&
+    if (s.session != IdlePowerSession::Standby && !StandbyScreen::IsVisible() && standby_ms > 0 &&
         (shutdown_ms == 0 || standby_ms < shutdown_ms)) {
         next_ms = standby_ms;
         next_action = "standby";
@@ -191,7 +226,8 @@ void IdlePower_Attach(IdlePowerSession session, bool reset_activity)
 
     const bool keep_activity = s.preserve_activity_on_detach &&
                                session == IdlePowerSession::Standby;
-    s.preserve_activity_on_detach = false;
+    if (session == IdlePowerSession::Standby || reset_activity)
+        s.preserve_activity_on_detach = false;
     s.session = session;
 
     if (reset_activity && !keep_activity) {
@@ -219,14 +255,14 @@ void IdlePower_Detach(IdlePowerSession session)
     if (s.session != session) {
         return;
     }
-    s.session = IdlePowerSession::None;
+    s.session = IdlePowerSession::App;
 
     if (s.preserve_activity_on_detach) {
         ESP_LOGI(TAG, "detach home -> preserving idle for standby");
         return;
     }
 
-    StopTimer();
+    EnsureTimer();
     ESP_LOGI(TAG, "detach session=%d", static_cast<int>(session));
 }
 
@@ -274,3 +310,17 @@ void IdlePower_SetShutdownMinutes(int minutes)
     s.thresholds_cached = true;
     ESP_LOGI(TAG, "shutdown timeout updated to %d min", minutes);
 }
+
+IdlePowerSession IdlePower_CurrentSession() { return s.session; }
+
+#ifdef HI_VIDEO_TARGET_TEST
+// Called under the display lock. No settings are persisted by this check.
+bool IdlePower_TestVideoHold(){
+ if(!HiApp::VideoPlayer::KeepsAwake())return false;
+ const State original=s;s.session=IdlePowerSession::App;s.thresholds_cached=true;
+ s.standby_minutes=1;s.shutdown_minutes=1;s.last_activity_tick=lv_tick_get()-10*60*1000;
+ s.standby_triggered=false;s.shutdown_triggered=false;OnIdleTick(nullptr);
+ bool held=lv_tick_elaps(s.last_activity_tick)<1000&&!s.standby_triggered&&!s.shutdown_triggered;
+ s=original;s.last_activity_tick=lv_tick_get();return held;
+}
+#endif

@@ -312,10 +312,10 @@ lv_obj_t *TestUiCreateMenuRow(lv_obj_t *parent, const char *title,
     lv_obj_remove_flag(label, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t *arrow = lv_label_create(row);
-    lv_label_set_text(arrow, LV_SYMBOL_RIGHT);
+    lv_label_set_text(arrow, "> ");
     lv_obj_set_style_text_color(arrow, lv_color_hex(kTestColorTextDim),
                                 LV_PART_MAIN);
-    lv_obj_set_style_text_font(arrow, &font_puhui_20_4, LV_PART_MAIN);
+    lv_obj_set_style_text_font(arrow, &font_puhui_30_4, LV_PART_MAIN);
     lv_obj_align(arrow, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_remove_flag(arrow, LV_OBJ_FLAG_CLICKABLE);
 
@@ -336,7 +336,11 @@ void TestUiNavigateTo(lv_obj_t *(*create_screen)()) {
     }
     lv_obj_t *old_scr = lv_screen_active();
     lv_obj_t *new_scr = create_screen();
-    lv_screen_load(new_scr);
+    if (new_scr == nullptr) {
+        return;
+    }
+    lv_obj_set_style_text_font(new_scr, &font_puhui_20_4, LV_PART_MAIN);
+    screen_load_safe(new_scr);
     if (old_scr != nullptr && old_scr != new_scr) {
         lv_obj_delete_async(old_scr);
     }

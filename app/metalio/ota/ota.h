@@ -25,6 +25,7 @@
 #include <vector>
 #include <memory>
 #include <map>
+#include <cstdint>
 
 /* ------------------------------------------------------------------ */
 /* Minimal HTTP client over BSD sockets                               */
@@ -40,6 +41,10 @@ public:
 
     void SetHeader(const std::string &name, const std::string &value);
     void SetContent(std::string content);
+    // Stream a multipart file without retaining the recording in RAM.
+    void SetContentFile(std::string path, std::string prefix, std::string suffix);
+    // Opt-in per-request budget. Other HTTP callers retain existing waits.
+    void SetDeadlineMs(uint32_t milliseconds);
 
     bool Open(const std::string &method, const std::string &url);
     void Close();
@@ -47,6 +52,9 @@ public:
     int  GetStatusCode() const { return status_code_; }
     size_t GetBodyLength() const { return content_length_; }
     int  GetLastError() const { return last_error_; }
+    const std::string &GetResponseLocation() const { return response_location_; }
+    const std::string &GetResponseType() const { return response_type_; }
+    const std::string &GetResponseEncoding() const { return response_encoding_; }
 
     /* Read up to `len` bytes into `buf`. Returns bytes read, 0 on EOF,
      * or -1 on error. */
@@ -61,6 +69,7 @@ private:
     size_t content_length_ = 0;
     size_t body_read_ = 0;
     int last_error_ = 0;
+    int64_t deadline_us_ = 0;
     std::string method_;
     std::string host_;
     int port_ = 80;
@@ -72,8 +81,11 @@ private:
 
     std::map<std::string, std::string> headers_;
     std::string request_body_;
+    std::string request_file_;
+    std::string request_suffix_;
     /* Buffered response body bytes (read ahead while parsing headers). */
     std::string body_buffer_;
+    std::string response_location_, response_type_, response_encoding_;
 
     bool ParseUrl(const std::string &url);
     bool SendRequest();
@@ -98,6 +110,8 @@ public:
     ~Ota();
 
     esp_err_t CheckVersion();
+    /* True when mqtt/websocket keys exist in NVS (from a prior OTA). */
+    bool LoadPersistedProtocolConfig();
     esp_err_t Activate();
     bool HasActivationChallenge() const { return has_activation_challenge_; }
     bool HasNewVersion() const { return has_new_version_; }

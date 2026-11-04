@@ -390,3 +390,33 @@ void *__wrap_dl_nn_memcpy(void *dst, const void *src, size_t n)
 {
     return metalio_wn_memcpy(dst, src, n);
 }
+
+/* The MN7 exp-table getter calls the P4 optimized copy directly, bypassing
+ * dl_nn_memcpy. It hard-locks while copying flash tables to PSRAM on this
+ * board. Keep the adaptation local to ESP-SR; global libc remains unchanged. */
+void *__wrap_dl_esp32p4_sr_memcpy(void *dst, const void *src, size_t n)
+{
+    return metalio_wn_memcpy(dst, src, n);
+}
+
+/* Newlib C-locale ABI used by the prebuilt ESP-SR FST normalizer.
+ * Index zero is EOF; indexes 1..256 classify unsigned bytes. */
+const unsigned char _ctype_[257] = {
+  0, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 40, 40, 40, 40, 32,
+  32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+  32, 136, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+  16, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 16, 16, 16, 16, 16,
+  16, 16, 65, 65, 65, 65, 65, 65, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 16, 16, 16, 16,
+  16, 16, 66, 66, 66, 66, 66, 66, 2, 2, 2, 2, 2, 2, 2, 2,
+  2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 16, 16, 16, 16,
+  32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0
+};

@@ -7,166 +7,226 @@
  */
 
 #include "screen_util.h"
+#include "standby_screen/standby_screen.h"
+#include "idle_power_policy/idle_power_policy.h"
+#include "system_chrome/system_chrome.h"
+#include "system_chrome/control_center.h"
+#include "system_chrome/recents_overlay.h"
+#include "hi_input_method.h"
 
+#include <cmath>
+#include <algorithm>
 #include <cstdlib>
 
 #include "esp_log_shim.h"
 
 namespace {
-
-// 720x720 panel -> use a slightly larger threshold than the 480p source.
 constexpr int16_t kSwipeBackThreshold = 100;
-
-struct SwipeState {
-    int16_t start_x = 0;
-    int16_t start_y = 0;
-    bool tracking = false;
-    bool from_edge = false;
-};
-
-/* Only treat right-swipes that begin near the left edge as "back". Mid-screen
- * horizontal noise (list scroll, icon press release after navigation) was
- * falsely leaving chat and stopping voice wake. */
-constexpr int16_t kSwipeEdgePx = 36;
-
-// One in-flight gesture at a time -- only one screen is loaded at any
-// moment, so a single global is sufficient.
-SwipeState s_swipe;
-
-// Use an unused LVGL object flag bit to mark "this widget owns horizontal
-// drag semantics; don't count its events as swipe-back candidates."  LVGL
-// reserves USER_1..USER_4 for application use, which is exactly what we
-// want here.
+constexpr int16_t kSwipeEdgePx = 32;
+constexpr int kDefaultEdgeTopInset = 90;
 constexpr lv_obj_flag_t kSwipeBackIgnoreFlag = LV_OBJ_FLAG_USER_1;
 
-// Walk from `from` up to `top` (exclusive) and return true if any ancestor
-// (including `from`) is one of the widget types that intrinsically eat
-// horizontal touch drags -- LVGL's built-in slider/arc/roller -- or has
-// been explicitly marked by screen_swipe_back_ignore().
-bool event_originates_in_drag_owner(lv_obj_t* from, lv_obj_t* top) {
-    for (lv_obj_t* obj = from; obj != nullptr && obj != top;
-         obj = lv_obj_get_parent(obj)) {
-        if (lv_obj_has_flag(obj, kSwipeBackIgnoreFlag)) {
-            return true;
-        }
+struct SwipeBinding {
+    lv_obj_t *screen;
+    screen_swipe_back_cb_t callback;
+    int top_inset;
+    uint32_t generation;
+    SwipeBinding *next;
+    int edge_width = kSwipeEdgePx;
+    int distance = kSwipeBackThreshold;
+};
+struct SwipeSession {
+    lv_indev_t *input = nullptr;
+    lv_obj_t *screen = nullptr;
+    int x = 0;
+    int y = 0;
+    bool tracking = false;
+    lv_obj_t *target = nullptr;
+};
+struct PendingBack {
+    lv_obj_t *screen;
+    screen_swipe_back_cb_t callback;
+    uint32_t generation;
+};
+SwipeBinding *s_bindings;
+SwipeSession s_swipe;
+uint32_t s_binding_generation;
+lv_timer_t *s_swipe_timer;
+
+SwipeBinding *FindBinding(lv_obj_t *screen) {
+    for (auto *b = s_bindings; b; b = b->next)
+        if (b->screen == screen) return b;
+    return nullptr;
+}
+
+bool OwnsHorizontalDrag(lv_obj_t *target, lv_obj_t *screen) {
+    auto *obj = target;
+    for (; obj && obj != screen; obj = lv_obj_get_parent(obj)) {
         if (lv_obj_check_type(obj, &lv_slider_class) ||
             lv_obj_check_type(obj, &lv_arc_class) ||
-            lv_obj_check_type(obj, &lv_roller_class)) {
-            return true;
-        }
+            lv_obj_check_type(obj, &lv_roller_class) ||
+            lv_obj_check_type(obj, &lv_textarea_class) ||
+            lv_obj_check_type(obj, &lv_keyboard_class)) return true;
     }
-    return false;
+    // Top-layer dialogs and keyboards own their pointer stream too.
+    return obj != screen;
 }
 
-/* Must not SwitchToHome()/delete the active screen from inside GESTURE or
- * RELEASED: the screen is still the event target, and sync-delete corrupts
- * the LVGL heap on this port (solid blue). Match StandbyScreen::ReturnHome. */
-void invoke_swipe_back_cb(void* user_data) {
-    auto on_back = reinterpret_cast<screen_swipe_back_cb_t>(user_data);
-    if (on_back != nullptr) {
-        on_back();
-    }
+void InvokeBack(void *data) {
+    auto *pending = static_cast<PendingBack *>(data);
+    auto *binding = FindBinding(pending->screen);
+    if (binding && binding->generation == pending->generation &&
+        lv_screen_active() == pending->screen) pending->callback();
+    std::free(pending);
 }
 
-void fire_swipe_back(screen_swipe_back_cb_t on_back, lv_indev_t* indev) {
-    if (on_back == nullptr) {
+void ProcessSwipe(lv_indev_t *input, lv_event_code_t code, lv_obj_t *event_target) {
+    if (lv_indev_get_type(input) != LV_INDEV_TYPE_POINTER) return;
+    if (code == LV_EVENT_PRESSED && !StandbyScreen::IsVisible())
+        IdlePower_NotifyActivity();
+    if (SystemChrome_ObservePointer(input, code, event_target)) {
+        s_swipe = SwipeSession{};
         return;
     }
-    if (indev != nullptr) {
-        lv_indev_wait_release(indev);
-    }
-    s_swipe.tracking = false;
-    s_swipe.from_edge = false;
-    if (lv_async_call(invoke_swipe_back_cb,
-                      reinterpret_cast<void*>(on_back)) != LV_RESULT_OK) {
-        on_back();
-    }
-}
-
-void swipe_back_event_cb(lv_event_t* e) {
-    auto on_back = reinterpret_cast<screen_swipe_back_cb_t>(
-        lv_event_get_user_data(e));
-    const lv_event_code_t code = lv_event_get_code(e);
-
-    lv_indev_t* indev = lv_indev_active();
-    if (indev == nullptr) {
+    auto *screen = lv_screen_active();
+    auto *binding = FindBinding(screen);
+    if (!binding || StandbyScreen::IsVisible() || ControlCenter_IsOpen() || Recents_IsOpen()) {
+        s_swipe = SwipeSession{};
         return;
     }
-
-    lv_obj_t* scr_obj = lv_event_get_current_target_obj(e);
-    lv_obj_t* press_target = lv_event_get_target_obj(e);
-    if (event_originates_in_drag_owner(press_target, scr_obj)) {
-        s_swipe.tracking = false;
-        s_swipe.from_edge = false;
-        return;
-    }
-
     lv_point_t point;
-    lv_indev_get_point(indev, &point);
-
+    lv_indev_get_point(input, &point);
     if (code == LV_EVENT_PRESSED) {
-        s_swipe.start_x = point.x;
-        s_swipe.start_y = point.y;
-        s_swipe.from_edge = (point.x <= kSwipeEdgePx);
-        s_swipe.tracking = s_swipe.from_edge;
-        return;
-    }
-
-    // LVGL gesture path: only honor right-swipe that began on the left edge
-    // AND traveled far enough — bare GESTURE without dx falsely left chat.
-    if (code == LV_EVENT_GESTURE) {
-        const lv_dir_t dir = lv_indev_get_gesture_dir(indev);
-        if (dir == LV_DIR_RIGHT && s_swipe.from_edge && on_back != nullptr) {
-            const int16_t dx = point.x - s_swipe.start_x;
-            const int16_t dy = point.y - s_swipe.start_y;
-            if (dx > kSwipeBackThreshold && std::abs(dy) < std::abs(dx)) {
-                fire_swipe_back(on_back, indev);
-            }
+        // LVGL can retarget a held pointer when it leaves a button. Keep
+        // the original edge origin until release instead of restarting it.
+        if (s_swipe.tracking && s_swipe.input == input && s_swipe.screen == screen) {
+            s_swipe.target = event_target;
+            return;
         }
+        s_swipe = SwipeSession{};
+        auto *target = event_target;
+        if (point.x < 0 || point.x > binding->edge_width || point.y < binding->top_inset ||
+            point.y >= lv_obj_get_height(screen) - 60 || OwnsHorizontalDrag(target, screen)) return;
+        // No hit strip or synthetic press: the original control receives
+        // its normal press, click and long-press events without delay.
+        s_swipe.input = input;
+        s_swipe.screen = screen;
+        s_swipe.x = point.x;
+        s_swipe.y = point.y;
+        s_swipe.tracking = true;
+        s_swipe.target = target;
         return;
     }
-
-    // Manual press/release tracker for swipes that start on the bare
-    // screen background, where LVGL's built-in gesture detector wouldn't
-    // run (no widget was pressed).
-    if (code != LV_EVENT_RELEASED || !s_swipe.tracking) {
+    if (s_swipe.input != input || s_swipe.screen != screen) return;
+    if (code == LV_EVENT_DELETE || code == LV_EVENT_INDEV_RESET) {
+        s_swipe = SwipeSession{};
         return;
     }
-
-    s_swipe.tracking = false;
-    const bool from_edge = s_swipe.from_edge;
-    s_swipe.from_edge = false;
-    if (!from_edge) {
+    if ((code != LV_EVENT_PRESSING && code != LV_EVENT_RELEASED) || !s_swipe.tracking) return;
+    const int dx = point.x - s_swipe.x;
+    const int dy = std::abs(point.y - s_swipe.y);
+    if (dx < binding->distance || dx < dy * 2) {
+        if (code == LV_EVENT_RELEASED || dy > 40 || dx < -20)
+            s_swipe = SwipeSession{};
         return;
     }
+    lv_obj_t *target = s_swipe.target;
+    s_swipe = SwipeSession{};
+    auto *pending = static_cast<PendingBack *>(std::malloc(sizeof(PendingBack)));
+    if (!pending) return;
+    *pending = PendingBack{screen, binding->callback, binding->generation};
+    if (lv_async_call(InvokeBack, pending) != LV_RESULT_OK) {
+        std::free(pending);
+        return;
+    }
+    // Commit once horizontal intent is clear, before scrolling or retargeting
+    // can consume RELEASED. Ordinary taps and stationary holds remain intact.
+    if (target && lv_obj_is_valid(target)) {
+        lv_obj_remove_state(target, LV_STATE_PRESSED);
+        lv_obj_send_event(target, LV_EVENT_PRESS_LOST, input);
+    }
+    lv_indev_reset(input, nullptr);
+    lv_indev_wait_release(input);
+}
 
-    const int16_t dx = point.x - s_swipe.start_x;
-    const int16_t dy = point.y - s_swipe.start_y;
-    if (dx > kSwipeBackThreshold && std::abs(dy) < std::abs(dx)) {
-        fire_swipe_back(on_back, indev);
+void OnPointerEvent(lv_event_t *e) {
+    auto *input = static_cast<lv_indev_t *>(lv_event_get_target(e));
+    if (lv_indev_get_type(input) != LV_INDEV_TYPE_POINTER) return;
+    HiInputMethod_ObservePointer(e);
+    ProcessSwipe(input, lv_event_get_code(e), static_cast<lv_obj_t *>(lv_event_get_param(e)));
+}
+
+void InstallPointerObserver() {
+    if (!s_swipe_timer) {
+        // LVGL sends PRESSING to widgets, not to input-device observers.
+        // Sample the real held contact so retargeting and long holds cannot
+        // swallow an edge swipe before RELEASED reaches the original widget.
+        s_swipe_timer = lv_timer_create([](lv_timer_t *) {
+            if (!s_swipe.tracking || !s_swipe.input) return;
+            auto *input = s_swipe.input;
+            if (lv_indev_get_state(input) != LV_INDEV_STATE_PRESSED) return;
+            ProcessSwipe(input, LV_EVENT_PRESSING, s_swipe.target);
+        }, 30, nullptr);
+    }
+    for (auto *input = lv_indev_get_next(nullptr); input; input = lv_indev_get_next(input)) {
+        if (lv_indev_get_type(input) != LV_INDEV_TYPE_POINTER) continue;
+        bool installed = false;
+        for (uint32_t i = 0; i < lv_indev_get_event_count(input); ++i)
+            if (lv_event_dsc_get_cb(lv_indev_get_event_dsc(input, i)) == OnPointerEvent)
+                installed = true;
+        if (!installed) lv_indev_add_event_cb(input, OnPointerEvent, LV_EVENT_ALL, nullptr);
     }
 }
 
-// Recursively flag every descendant so LV_EVENT_GESTURE bubbles up to the
-// screen, regardless of which widget was the press target.
-void enable_gesture_bubble(lv_obj_t* obj) {
-    if (obj == nullptr) {
+void OnSwipeScreenLoaded(lv_event_t *e) {
+    if (lv_event_get_target_obj(e) != lv_event_get_current_target_obj(e)) return;
+    s_swipe = SwipeSession{};
+    InstallPointerObserver();
+}
+void OnSwipeScreenDeleted(lv_event_t *e) {
+    auto *screen = lv_event_get_current_target_obj(e);
+    if (lv_event_get_target_obj(e) != screen) return;
+    if (s_swipe.screen == screen) s_swipe = SwipeSession{};
+    for (auto **slot = &s_bindings; *slot; slot = &(*slot)->next) {
+        if ((*slot)->screen != screen) continue;
+        auto *binding = *slot;
+        *slot = binding->next;
+        std::free(binding);
+        break;
+    }
+}
+
+void AttachSwipe(lv_obj_t *screen, int top_inset, screen_swipe_back_cb_t on_back) {
+    if (!screen || !on_back) return;
+    // Empty screen margins need an input target too. Children remain above
+    // their root and continue to receive their own touches normally.
+    lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
+    if (auto *binding = FindBinding(screen)) {
+        if (top_inset < binding->top_inset) binding->top_inset = top_inset;
+        InstallPointerObserver();
         return;
     }
-    lv_obj_add_flag(obj, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE);
-    const uint32_t count = lv_obj_get_child_count(obj);
-    for (uint32_t i = 0; i < count; ++i) {
-        enable_gesture_bubble(lv_obj_get_child(obj, i));
-    }
+    auto *binding = static_cast<SwipeBinding *>(std::malloc(sizeof(SwipeBinding)));
+    if (!binding) return;
+    *binding = SwipeBinding{screen, on_back, top_inset, ++s_binding_generation, s_bindings};
+    s_bindings = binding;
+    lv_obj_add_event_cb(screen, OnSwipeScreenLoaded, LV_EVENT_SCREEN_LOADED, nullptr);
+    lv_obj_add_event_cb(screen, OnSwipeScreenDeleted, LV_EVENT_DELETE, nullptr);
+    InstallPointerObserver();
 }
-
-void swipe_back_screen_loaded_cb(lv_event_t* e) {
-    lv_obj_t* scr = lv_event_get_current_target_obj(e);
-    enable_gesture_bubble(scr);
-}
-
 }  // namespace
+
+void screen_load_safe(lv_obj_t* scr) {
+    if (scr == nullptr) {
+        return;
+    }
+    InstallPointerObserver();
+    if (lv_display_t* disp = lv_display_get_default()) {
+        lv_display_enable_invalidation(disp, true);
+    }
+    lv_screen_load(scr);
+    lv_obj_invalidate(scr);
+}
 
 void screen_make_input_passive(lv_obj_t* obj) {
     if (obj == nullptr) {
@@ -186,8 +246,48 @@ void screen_strip_obj_chrome(lv_obj_t* obj) {
     lv_obj_set_style_pad_all(obj, 0, LV_PART_MAIN);
     lv_obj_set_style_margin_all(obj, 0, LV_PART_MAIN);
     lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_outline_width(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_outline_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(obj, 0, LV_PART_MAIN);
     lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_OFF);
+}
+
+namespace {
+
+void kill_chrome_selector(lv_obj_t* obj, lv_style_selector_t sel) {
+    lv_obj_set_style_border_width(obj, 0, sel);
+    lv_obj_set_style_border_opa(obj, LV_OPA_TRANSP, sel);
+    lv_obj_set_style_outline_width(obj, 0, sel);
+    lv_obj_set_style_outline_opa(obj, LV_OPA_TRANSP, sel);
+    lv_obj_set_style_shadow_width(obj, 0, sel);
+    lv_obj_set_style_shadow_opa(obj, LV_OPA_TRANSP, sel);
+}
+
+}  // namespace
+
+void screen_kill_theme_chrome(lv_obj_t* obj) {
+    if (obj == nullptr) {
+        return;
+    }
+    const lv_style_selector_t sels[] = {
+        LV_PART_MAIN,
+        LV_PART_ITEMS,
+        LV_PART_INDICATOR,
+        LV_PART_SCROLLBAR,
+        static_cast<lv_style_selector_t>(LV_PART_MAIN | LV_STATE_PRESSED),
+        static_cast<lv_style_selector_t>(LV_PART_MAIN | LV_STATE_CHECKED),
+        static_cast<lv_style_selector_t>(LV_PART_ITEMS | LV_STATE_CHECKED),
+        static_cast<lv_style_selector_t>(LV_PART_ITEMS | LV_STATE_PRESSED),
+    };
+    for (lv_style_selector_t sel : sels) {
+        kill_chrome_selector(obj, sel);
+    }
+    const uint32_t count = lv_obj_get_child_count(obj);
+    for (uint32_t i = 0; i < count; ++i) {
+        screen_kill_theme_chrome(lv_obj_get_child(obj, i));
+    }
 }
 
 void screen_swipe_back_ignore(lv_obj_t* obj, bool recursive) {
@@ -204,27 +304,35 @@ void screen_swipe_back_ignore(lv_obj_t* obj, bool recursive) {
     }
 }
 
-void screen_attach_swipe_back(lv_obj_t* scr, screen_swipe_back_cb_t on_back) {
-    if (scr == nullptr) return;
-    lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
-    void* user_data = reinterpret_cast<void*>(on_back);
-    lv_obj_add_event_cb(scr, swipe_back_event_cb, LV_EVENT_PRESSED,
-                        user_data);
-    lv_obj_add_event_cb(scr, swipe_back_event_cb, LV_EVENT_RELEASED,
-                        user_data);
-    lv_obj_add_event_cb(scr, swipe_back_event_cb, LV_EVENT_GESTURE,
-                        user_data);
-    lv_obj_add_event_cb(scr, swipe_back_screen_loaded_cb,
-                        LV_EVENT_SCREEN_LOADED, nullptr);
+void screen_attach_swipe_back(lv_obj_t *scr, screen_swipe_back_cb_t on_back) {
+    AttachSwipe(scr, kDefaultEdgeTopInset, on_back);
+}
+
+void screen_ensure_swipe_back(lv_obj_t *scr, screen_swipe_back_cb_t on_back) {
+    AttachSwipe(scr, kDefaultEdgeTopInset, on_back);
+}
+
+void screen_attach_left_edge_back(lv_obj_t *scr, int top_inset,
+                                  screen_swipe_back_cb_t on_back) {
+    AttachSwipe(scr, top_inset < 0 ? 0 : top_inset, on_back);
+}
+
+void screen_set_back_sensitivity(lv_obj_t *scr, int edge_width, int distance) {
+    if (auto *binding = FindBinding(scr)) {
+        binding->edge_width = std::max(16, std::min(80, edge_width));
+        binding->distance = std::max(48, std::min(160, distance));
+    }
 }
 
 namespace {
 
 void lifecycle_loaded_cb(lv_event_t* e) {
+    InstallPointerObserver();
     auto cb = reinterpret_cast<screen_lifecycle_cb_t>(lv_event_get_user_data(e));
     if (cb != nullptr) {
         cb(SCREEN_LIFECYCLE_LOAD);
     }
+    SystemChrome_Attach(lv_event_get_current_target_obj(e), false);
 }
 
 void lifecycle_unloaded_cb(lv_event_t* e) {
@@ -245,4 +353,5 @@ void screen_attach_lifecycle(lv_obj_t* scr, screen_lifecycle_cb_t cb) {
                         user_data);
     lv_obj_add_event_cb(scr, lifecycle_unloaded_cb, LV_EVENT_SCREEN_UNLOADED,
                         user_data);
+    SystemChrome_Attach(scr, false);
 }

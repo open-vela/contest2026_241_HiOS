@@ -52,10 +52,17 @@ esp_gmf_err_t esp_gmf_audio_helper_get_audio_type_by_uri(const char *uri, uint32
         *format_id = ESP_FOURCC_TS;
     } else if ((strncasecmp(ext, "m3u8", 4) == 0) ||
                (strncasecmp(ext, "m3u", 3) == 0)) {
-        /* HLS playlist. The real audio codec is unknown from the URL alone and
-         * is reported by the HLS IO's file_seg_cb once the first media segment
-         * is demuxed; the CNR feeds are MPEG-TS segments. */
-        *format_id = ESP_FOURCC_TS;
+        /* Qingting / ximalaya playlists are ADTS AAC. CNR / CRI / satellite
+         * playlists are MPEG-TS.  TS on an AAC feed yields silence. */
+        if (strstr(uri, "qingting") != NULL ||
+            strstr(uri, "Qingting") != NULL ||
+            strstr(uri, "qtfm") != NULL ||
+            strstr(uri, "xmcdn") != NULL ||
+            strstr(uri, "format=aac") != NULL) {
+            *format_id = ESP_FOURCC_AAC;
+        } else {
+            *format_id = ESP_FOURCC_TS;
+        }
     } else if (strncasecmp(ext, "flac", 4) == 0) {
         *format_id = ESP_FOURCC_FLAC;
     } else if (strncasecmp(ext, "ogg", 3) == 0) {

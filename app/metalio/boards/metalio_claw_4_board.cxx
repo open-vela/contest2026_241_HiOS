@@ -1,3 +1,4 @@
+#include "hi_task_cpp.h"
 /*
  * SPDX-FileCopyrightText: 2024 openvela port
  * SPDX-License-Identifier: Apache-2.0
@@ -51,6 +52,8 @@
 
 #define TAG "METALIO_CLAW_4"
 
+extern "C" int metalio_app_restore_saved_network(void);
+
 /* ================================================================== */
 /* PwmBacklight                                                       */
 /*                                                                    */
@@ -89,6 +92,12 @@ void PwmBacklight::SetBrightness(uint8_t brightness, bool fade)
 
     if (brightness > 100)
         brightness = 100;
+
+    /* A second SETCHARACTERISTICS at the same duty restarts the LEDC
+     * timer and flashes the panel. Boot, restore, and motor-stop all
+     * hit this with the value already on screen. */
+    if (started_ && brightness_ == brightness)
+        return;
 
     brightness_ = brightness;
 
@@ -213,10 +222,9 @@ void MetalioClaw4Board::InitializeDisplay()
         return;
     }
 
-    /* Do NOT RestoreBrightness here. MetalioClaw4 turns the backlight on
-     * only after LVGL+LCD are ready; lighting the panel before the first
-     * boot frame is flushed shows a blank/garbage FB flash (闪屏).
-     * Application::Start restores brightness after StartDisplayThread(). */
+    /* Do NOT RestoreBrightness here. The boot guide is flushed inside
+     * SetupUI, which then lights the panel and runs the power-on buzz.
+     * Lighting any earlier shows a black frame during the vibration. */
 }
 
 /* ------------------------------------------------------------------ */
@@ -253,46 +261,16 @@ void MetalioClaw4Board::InitializeNetwork()
     }
 
     network_started_ = true;
-
-#ifdef CONFIG_METALIO_ESP_HOSTED
-    /* esp-hosted (WiFi) was already initialized in the NuttX board bringup
-     * (esp32p4_bringup.c → metalio_esp_hosted_initialize), which registers
-     * the eth0 netdev.  Bring up the STA link and obtain a DHCP lease using
-     * UI-saved credentials when present, else Kconfig defaults (C5 non-split:
-     * DHCP is host-side on eth0). */
-    static NetworkService network;
-    Settings wifi("wifi", false);
-    std::string saved_ssid = wifi.GetString("ssid");
-    std::string saved_pass = wifi.GetString("password");
-
-    const char *ssid;
-    const char *pass;
-    if (!saved_ssid.empty())
-    {
-        ssid = saved_ssid.c_str();
-        pass = saved_pass.empty() ? nullptr : saved_pass.c_str();
-        ESP_LOGE(TAG, "InitializeNetwork: using saved WiFi '%s'", ssid);
-    }
-    else
-    {
-        ssid = CONFIG_METALIO_WIFI_SSID;
-        pass = CONFIG_METALIO_WIFI_PASSWORD;
-        if (pass != nullptr && pass[0] == '\0')
-        {
-            pass = nullptr;
-        }
-        if (ssid == nullptr || ssid[0] == '\0')
-        {
-            ssid = nullptr;
-            pass = nullptr;
-            ESP_LOGE(TAG, "InitializeNetwork: no saved/default SSID — WiFi up for scan only");
-        }
-    }
-
-    int ret = network.StartWifi(ssid, pass);
-    ESP_LOGI(TAG, "InitializeNetwork: StartWifi('%s') = %d, ip=%s",
-             ssid ? ssid : "(null)", ret, network.GetIpAddress().c_str());
-#endif
+    Settings network_settings("network", false);
+    const bool airplane = network_settings.GetBool("airplane", false);
+    const bool cellular = network_settings.GetBool("cellular",
+                              network_settings.GetInt("type", 0) == 1);
+    const bool wifi = network_settings.GetBool("wifi_enabled", !cellular);
+    const bool bluetooth = network_settings.GetBool("bt_enabled", true);
+    const int bt_ret = metalio_bt_power(bluetooth && !airplane);
+    const int ret = metalio_app_restore_saved_network();
+    ESP_LOGI(TAG, "InitializeNetwork: airplane=%d wifi=%d cellular=%d result=%d bt=%d",
+             airplane, wifi, cellular, ret, bt_ret);
 }
 
 /* ------------------------------------------------------------------ */
@@ -304,6 +282,8 @@ void MetalioClaw4Board::InitializeBacklight()
     if (backlight_ != nullptr)
         return;
 
+    /* Open /dev/pwm0 only. Duty stays off until the boot guide is in
+     * the framebuffer — SetBrightness here lights an empty panel. */
     backlight_ = new PwmBacklight(DISPLAY_BACKLIGHT_PIN,
                                   DISPLAY_BACKLIGHT_OUTPUT_INVERT);
 }
@@ -388,7 +368,7 @@ void MetalioClaw4Board::StartMonitorTask()
 {
     ESP_LOGI(TAG, "Starting system monitor task");
 
-    std::thread([this]() {
+    HiTask::LegacyThread([this]() {
         constexpr int kIntervalMs = 1000;
         while (true)
         {
@@ -413,6 +393,8 @@ void MetalioClaw4Board::StartMonitorTask()
             bool charging = false, discharging = false;
             if (GetBatteryLevel(level, charging, discharging))
             {
+                metalio_board_note_battery(level, charging ? 1 : 0,
+                                           discharging ? 1 : 0);
                 ESP_LOGI("系统监控",
                          "@@@电池  | 电量: %3d%% | 充电: %s | 放电: %s",
                          level, charging ? "是" : "否",

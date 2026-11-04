@@ -98,7 +98,9 @@ int s_active_preset = 0;
 lv_timer_t *s_pattern_timer = nullptr;
 int64_t s_pattern_t0_us = 0;
 
-constexpr uint32_t kMotorFreqHz = 5000;
+/* 25 kHz matches the backlight timer. 5 kHz retunes the shared LEDC
+ * clock and the panel flashes on every pattern tick. */
+constexpr uint32_t kMotorFreqHz = 25000;
 constexpr uint32_t kPatternTickMs = 30;
 
 int g_pwm_fd = -1;
@@ -286,9 +288,10 @@ void on_preset_clicked(lv_event_t *e)
     if (p.target_pct >= 0) {
         s_slider_pct = p.target_pct;
         if (s_ui.slider != nullptr) {
-            lv_slider_set_value(s_ui.slider, s_slider_pct, LV_ANIM_ON);
+            lv_slider_set_value(s_ui.slider, s_slider_pct, LV_ANIM_OFF);
         }
     }
+    if(p.target_pct<0&&s_slider_pct==0){s_slider_pct=60;if(s_ui.slider)lv_slider_set_value(s_ui.slider,s_slider_pct,LV_ANIM_OFF);}
     s_mode = p.target_mode;
     s_active_preset = idx;
 

@@ -1,0 +1,13 @@
+{
+  "source": "LVGL bundled AnimatedGIF (BitBank), Apache-2.0",
+  "altered": true,
+  "files": {
+    "AnimatedGIF.h": "397abf20ccc4b9a03d36e2fa0c991a4109c2c04dcf0c2876237a1402e1c9af4e",
+    "gif.c": "e54b86dbece08e7cd1593b0f4078deb66755c89dd9772d218354ffd0727bc582"
+  },
+  "local_modifications": [
+    "Private HiOS-prefixed API, enabled only in the browser image unit.",
+    "Increase the bounded line buffer from 480 to 1024 pixels.",
+    "Use unsigned byte shifts for portable 32-bit LZW reads."
+  ]
+}

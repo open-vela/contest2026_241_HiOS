@@ -51,4 +51,30 @@ config ESP32P4_SELECTS_REV_LESS_V3
 	---help---
 		Metalio units may ship with P4 rev < 3.0. Enable to bypass bootloader pin.
 
+config METALIO_HPWORKER
+	bool "Use HP CPU1 for isolated image computation"
+	default n
+	depends on !SMP
+	---help---
+		Keep NuttX and all device drivers on CPU0. CPU1 executes only the
+		bounded internal-SRAM integer worker, with timeout and CPU0 fallback.
+
+config METALIO_FLASH32
+	bool "32 MiB flash addressing and protected high settings area"
+	default n
+	depends on ESPRESSIF_FLASH_32M
+	select ESPRESSIF_SPI_FLASH_USE_32BIT_ADDRESS
+	---help---
+		Use source-based four-byte commands and experimental cache mapping.
+		Requires validated 32 MiB GD25Q256-class hardware and layout-aware
+		installer. Never enable this only to bypass a binary size check.
+
+config METALIO_SMP_IMAGEWORKER
+	bool "NuttX CPU1 image conversion worker"
+	default n
+	depends on SMP && METALIO_FLASH32
+	---help---
+		Run the bounded RGB565 conversion as a real NuttX kernel task
+		on CPU1. Existing peripherals remain bound to CPU0 during rollout.
+
 endif # ARCH_BOARD_METALIO_CLAW_4
